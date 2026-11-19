@@ -1,0 +1,19 @@
+{
+  "port": 5174,
+  "hosts": [
+    {
+      "id": "local",
+      "label": "Claude и Codex",
+      "url": "ws://127.0.0.1:8089",
+      "tokenFile": "../.local/host-token",
+      "providers": ["claude", "codex"]
+    },
+    {
+      "id": "gemini",
+      "label": "Gemini",
+      "url": "ws://127.0.0.1:8091",
+      "tokenFile": "../.local/gemini-host-token",
+      "providers": ["codex"]
+    }
+  ]
+}

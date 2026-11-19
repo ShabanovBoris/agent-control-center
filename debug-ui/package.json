@@ -1,0 +1,14 @@
+{
+  "name": "agent-control-center-debug-ui",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@microsoft/agent-host-protocol": "1.1.0"
+  }
+}

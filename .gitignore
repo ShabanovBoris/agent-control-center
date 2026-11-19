@@ -1,0 +1,10 @@
+.local/
+node_modules/
+dist/
+.DS_Store
+
+*.env
+.env.*
+!.env.example
+
+/scripts/.acc-*.tmp.ts

@@ -1,0 +1,9 @@
+include_collaboration_mode_instructions = false  # tokeneconomizer:collaboration
+
+[agents]  # tokeneconomizer:collaboration
+enabled = false  # tokeneconomizer:collaboration
+
+[features]  # tokeneconomizer:collaboration
+view_image = false  # tokeneconomizer:image_media
+goals = false  # tokeneconomizer:goals
+multi_agent = false  # tokeneconomizer:collaboration

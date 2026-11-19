@@ -1,0 +1,9 @@
+{
+  "listen": { "host": "127.0.0.1", "port": 8090 },
+  "agents": ["claude", "codex", "mock"],
+  "hosts": [
+    { "id": "local", "label": "Claude · cheapvibecode + Codex · ChatGPT", "url": "ws://127.0.0.1:8089", "tokenFile": ".local/host-token", "localFilesystem": true, "defaultModels": { "claude": "@provider=anthropic:opus" } },
+    { "id": "gemini", "label": "Gemini · cheapvibecode", "url": "ws://127.0.0.1:8091", "tokenFile": ".local/gemini-host-token", "localFilesystem": true },
+    { "id": "mock", "label": "Учебный хост", "url": "ws://127.0.0.1:8189" }
+  ]
+}

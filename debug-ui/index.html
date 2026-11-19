@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Резервная панель агентов</title>
+  <link rel="stylesheet" href="/panel.css">
+  <script src="/panel.js" defer></script>
+</head>
+<body>
+  <header class="top">
+    <div>
+      <h1>Резервная панель агентов</h1>
+      <p id="connection" class="muted" role="status">Проверяем хосты…</p>
+    </div>
+    <button id="refresh" type="button">Обновить</button>
+  </header>
+  <div class="layout">
+    <aside aria-label="Сессии и хосты">
+      <label>Текущие сессии
+        <select id="sessions">
+          <option value="">Выберите сессию</option>
+        </select>
+      </label>
+      <ul id="host-status" class="hosts"></ul>
+      <details id="create-details">
+        <summary>Новая сессия</summary>
+        <form id="create">
+          <label>Хост<select id="create-host" required></select></label>
+          <label>Агент<select id="create-provider" required></select></label>
+          <label>Рабочая папка на хосте<input id="directory" placeholder="/путь/к/проекту" required></label>
+          <button id="create-button" type="submit" disabled>Создать сессию</button>
+        </form>
+      </details>
+    </aside>
+    <main>
+      <p id="notice" role="status" hidden></p>
+      <p id="empty" class="muted">Выберите сессию агента.</p>
+      <section id="session" aria-label="Открытая сессия" hidden>
+        <div class="session-head">
+          <div><h2 id="title"></h2><p id="session-status" role="status" class="muted"></p></div>
+          <label id="chat-picker" hidden>Чат<select id="chats"></select></label>
+        </div>
+        <section id="requests" aria-label="Запросы агента" hidden></section>
+        <div id="transcript" tabindex="0" aria-label="Последние сообщения"></div>
+        <form id="composer">
+          <label class="message-label">Сообщение агенту
+            <textarea id="text" rows="3" autocomplete="off"></textarea>
+          </label>
+          <div class="actions">
+            <button id="send" type="submit" class="primary" disabled>Отправить</button>
+            <button id="stop" type="button" disabled hidden>Остановить ход</button>
+          </div>
+        </form>
+      </section>
+    </main>
+  </div>
+</body>
+</html>
