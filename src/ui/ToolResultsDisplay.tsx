@@ -5,6 +5,8 @@ interface ToolResultsDisplayProps {
   content: ToolResultContent[];
 }
 
+const IMAGE_CONTENT_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
+
 export function ToolResultsDisplay({ content }: ToolResultsDisplayProps): ReactNode {
   if (!content.length) {
     return null;
@@ -20,24 +22,23 @@ export function ToolResultsDisplay({ content }: ToolResultsDisplayProps): ReactN
                 <pre>{item.text}</pre>
               </div>
             );
-          case ToolResultContentType.Image:
-            return (
+          case ToolResultContentType.EmbeddedResource:
+            return IMAGE_CONTENT_TYPES.has(item.contentType.toLowerCase()) ? (
               <div key={index} className="tool-result-image">
                 <img
-                  src={`data:${item.mimeType};base64,${item.data}`}
+                  src={`data:${item.contentType};base64,${item.data}`}
                   alt="Tool result image"
                   style={{ maxWidth: '100%', maxHeight: '400px' }}
                 />
               </div>
+            ) : (
+              <div key={index} className="tool-result-label">{item.contentType}</div>
             );
-          case ToolResultContentType.File:
-            return (
-              <div key={index} className="tool-result-file">
-                <a href={`data:${item.mimeType};base64,${item.data}`} download={item.name}>
-                  📄 {item.name}
-                </a>
-              </div>
-            );
+          case ToolResultContentType.Resource:
+            return <div key={index} className="tool-result-label">{item.uri}</div>;
+          case ToolResultContentType.FileEdit:
+          case ToolResultContentType.Terminal:
+          case ToolResultContentType.Subagent:
           default:
             return null;
         }
