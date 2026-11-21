@@ -27,7 +27,7 @@ function setup(models: SessionModelInfo[] = [model], request?: (method: string, 
   const events = new EventEmitter();
   const states = new Map<string, SessionState | ChatState>();
   let serverSeq = 0;
-  const host = { id: 'h', clientId: 'browser-backend', label: 'Host', state: { status: 'connected' }, agents: [{
+  const host = { id: 'h', clientId: 'browser-backend', label: 'Host', completionTriggerCharacters: ['/'], state: { status: 'connected' }, agents: [{
     provider: 'codex', displayName: 'Codex', models, capabilities: { multipleChats: { fork: true, sideChat: true } },
   }] };
   const multi = {
@@ -183,6 +183,43 @@ const sessionState: SessionState = {
   title: 'Тема', status: 1, provider: 'codex',
   lifecycle: SessionLifecycle.Ready, activeClients: [], chats: [chatSummary], defaultChat: chatUri,
 };
+
+test('slash-подсказки: sessionUri только для defaultChat, отправка всегда в выбранный чат', async () => {
+  const side = 'ahp-chat:/side';
+  const attachment = { type: MessageAttachmentKind.Simple, label: '/rename', _meta: { command: 'rename', extra: { example: true } } } as const;
+  const items = [{ insertText: '/rename ', attachment }];
+  const fixture = setup([model], () => ({ items }));
+  const { hub, host, states, requests, actions, targets, echo } = fixture;
+  const call = { op: 'slashCompletions', hostId: host.id, sessionUri, chatUri, text: '/ren', offset: 4 } as const;
+  await watchHistory(fixture);
+  try {
+    assert.deepEqual(await hub.call(call), { items });
+    await assert.rejects(hub.call({ ...call, chatUri: side }), /не принадлежит/);
+    const sideSummary = { ...chatSummary, resource: side };
+    states.set(sessionUri, { ...sessionState, chats: [chatSummary, sideSummary] });
+    states.set(side, { ...sideSummary, turns: [] });
+    hub.watch(host.id, side);
+    await hub.call({ op: 'refreshSession', hostId: host.id, sessionUri });
+    await setImmediate();
+    assert.deepEqual(await hub.call({ ...call, chatUri: side }), { items });
+    assert.deepEqual(requests, [sessionUri, side].map(channel => ({
+      method: 'completions', params: { channel, kind: 'userMessage', text: '/ren', offset: 4 },
+    })));
+    host.completionTriggerCharacters = ['@'];
+    assert.deepEqual(await hub.call(call), { items: [] });
+    assert.equal(requests.length, 2);
+    for (const target of [chatUri, side]) {
+      const sending = hub.call({ op: 'sendMessage', hostId: host.id, chatUri: target, text: '/rename Новое имя', attachments: [attachment], waitForHost: true });
+      const action = actions.at(-1);
+      if (action?.type !== ActionType.ChatTurnStarted) assert.fail('Ожидался ход');
+      assert.equal(targets.at(-1), target);
+      assert.equal(action.message.text, '/rename Новое имя');
+      assert.deepEqual(action.message.attachments, [attachment]);
+      echo(target, action, { clientId: host.clientId, clientSeq: actions.length }, 'test refusal');
+      await assert.rejects(sending, /test refusal/);
+    }
+  } finally { await hub.stop(); }
+});
 
 async function watchHistory(fixture: ReturnType<typeof setup>, chat?: Partial<ChatState>) {
   fixture.states.set(sessionUri, sessionState);

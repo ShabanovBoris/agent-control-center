@@ -20,7 +20,7 @@ interface ConfigPanelProps {
   onChange(scope: 'chat' | 'session', key: string, value: string): void;
 }
 
-export function ConfigPanel({ sessionConfig, chatConfig, isDefaultChat, supportsChatConfig, disabled, pending, onChange }: ConfigPanelProps) {
+export function modeFields({ sessionConfig, chatConfig, isDefaultChat, supportsChatConfig }: Pick<ConfigPanelProps, 'sessionConfig' | 'chatConfig' | 'isDefaultChat' | 'supportsChatConfig'>) {
   const schema = chatConfig?.schema ?? sessionConfig?.schema;
   const fields = FIELDS.flatMap(({ key, label, options: labels }) => {
     const property = schema?.properties[key];
@@ -37,15 +37,21 @@ export function ConfigPanel({ sessionConfig, chatConfig, isDefaultChat, supports
     const usesSession = !chatConfig?.schema && (!property.chatMutable || isDefaultChat);
     const value = chatValue ?? (usesSession ? sessionConfig?.values[key] : undefined) ?? property.default;
     const current = options.find(option => option.value === value);
-    const scope = property.chatMutable && supportsChatConfig ? 'chat' : 'session';
+    const scope: 'chat' | 'session' = property.chatMutable && supportsChatConfig ? 'chat' : 'session';
     const mutable = !property.readOnly && (scope === 'chat' || (usesSession && property.sessionMutable && chatValue === undefined));
 
-    return [(
+    return [{ key, label, options, scope, mutable, current, value, description: property.description }];
+  });
+  return fields;
+}
+
+export function ConfigPanel({ disabled, pending, onChange, fields }: Pick<ConfigPanelProps, 'disabled' | 'pending' | 'onChange'> & { fields: ReturnType<typeof modeFields> }) {
+  return fields.map(({ key, label, options, scope, mutable, current, value, description }) => (
       <label className="session-mode" key={key}>
         {label}
         <select
           value={current?.value ?? ''}
-          title={current?.description ?? property.description}
+          title={current?.description ?? description}
           disabled={disabled || pending || !mutable}
           onChange={event => onChange(scope, key, event.currentTarget.value)}
         >
@@ -53,7 +59,5 @@ export function ConfigPanel({ sessionConfig, chatConfig, isDefaultChat, supports
           {options.map(option => <option key={option.value} value={option.value} title={option.description}>{option.label}</option>)}
         </select>
       </label>
-    )];
-  });
-  return fields;
+  ));
 }

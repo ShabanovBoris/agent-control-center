@@ -8,6 +8,7 @@ import {
   ChatOriginKind,
   ChatSourceKind,
   ConfirmationOptionKind,
+  CompletionItemKind,
   ContentEncoding,
   MessageKind,
   ToolCallCancellationReason,
@@ -39,6 +40,7 @@ import {
   type HostOverview,
   type Overview,
   type ServerMessage,
+  type SlashCompletions,
 } from '../shared/protocol.js';
 import { channelKey, isSupportedChannel } from '../shared/reduce.js';
 import { ChannelMirror } from './mirror.js';
@@ -212,6 +214,19 @@ export class Hub {
       case 'fetchTurns':
         await this.client(call.hostId).request('fetchTurns', { channel: call.chatUri, cursor: call.cursor });
         return undefined;
+      case 'slashCompletions': {
+        const { session } = this.historyChat(call);
+        if (!this.multi.host(call.hostId)?.completionTriggerCharacters?.includes('/')) return { items: [] } satisfies SlashCompletions;
+        if (typeof call.text !== 'string' || !call.text.trimStart().startsWith('/') ||
+            !Number.isInteger(call.offset) || call.offset < 0 || call.offset > call.text.length) {
+          throw new CallFailure('Некорректный запрос подсказок команд.');
+        }
+        // VS Code exposes default-chat completions on the session URI; peer chats stay chat-addressed.
+        return this.client(call.hostId).request('completions', {
+          channel: session.defaultChat === call.chatUri ? call.sessionUri : call.chatUri,
+          kind: CompletionItemKind.UserMessage, text: call.text, offset: call.offset,
+        });
+      }
       case 'createChat': {
         if (!call.sessionUri.startsWith('ahp-session:') || !call.chatUri.startsWith('ahp-chat:')) throw new CallFailure('Ожидались сессия и чат');
         await this.client(call.hostId).request('createChat', {
@@ -652,6 +667,7 @@ export class Hub {
     return {
       id: host.id,
       label: host.label,
+      slashCompletions: host.completionTriggerCharacters?.includes('/') ?? false,
       status: host.state.status,
       ...(host.lastError ? { error: host.lastError.message } : {}),
       ...(host.protocolVersion ? { protocolVersion: host.protocolVersion } : {}),

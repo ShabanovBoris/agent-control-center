@@ -28,7 +28,7 @@ import {
   type ToolCallState,
   type Turn,
 } from '@microsoft/agent-host-protocol';
-import { SIDE_CHAT_FIRST_EDIT_UNAVAILABLE, type HostOverview, type ModelOverview } from '../shared/protocol';
+import { SIDE_CHAT_FIRST_EDIT_UNAVAILABLE, type HostOverview, type ModelOverview, type SlashCompletions } from '../shared/protocol';
 import { PhaseBadge } from './App';
 import { copyableResponseText } from './copy-response';
 import { collectFileEdits, resolveTurnChangeset } from './file-edits';
@@ -39,6 +39,8 @@ import { describeError, store, useChannel } from './store';
 import { ChatSourceMenu, ConfigPanel, FileEditDisplay, MessageView, ReasoningBlock, ToolResultsDisplay } from './ui';
 import { attachmentLabel, MAX_ATTACHMENT_FILE_BYTES, readFileAttachment } from './ui/AttachmentUpload';
 import { EditMessageDialog } from './ui/EditMessageDialog';
+import { modeFields } from './ui/ConfigPanel';
+import { applySlashItem, requestSlashItems, sendSlashDraft, slashCommand, slashItems } from './slash-commands';
 
 interface ChatTarget {
   hostId: string;
@@ -103,12 +105,18 @@ export function SessionView(props: {
     props.onOpenChat(createdChat);
   };
   const supportsChatConfig = !!host?.protocolVersion && compareProtocolVersions(host.protocolVersion, '1.1.0') >= 0;
+  const fields = modeFields({
+    sessionConfig: session.state?.config, chatConfig: chat.state?.config,
+    isDefaultChat: chatUri === session.state?.defaultChat, supportsChatConfig,
+  });
+  const planKey = provider === 'claude' ? 'permissionMode' : provider === 'codex' || provider === 'gemini' ? 'mode' : undefined;
+  const plan = fields.find(field => field.key === planKey && field.mutable && field.options.some(option => option.value === 'plan'));
   const changeMode = async (scope: 'chat' | 'session', key: string, value: string) => {
-    if (!canWrite || !chatUri || configPending || chat.state?.activeTurn) return;
+    if (!canWrite || !chatUri || configPending || chat.state?.activeTurn) return false;
     const config = { [key]: value };
     setConfigPending(true);
     try {
-      await store.run(scope === 'chat'
+      return await store.run(scope === 'chat'
         ? { op: 'updateChatConfig', hostId, chatUri, config, waitForHost: true }
         : { op: 'updateSessionConfig', hostId, sessionUri, config, waitForHost: true });
     } finally { setConfigPending(false); }
@@ -206,7 +214,7 @@ export function SessionView(props: {
             onForked={props.onForked}
           />
           <Composer
-            key={JSON.stringify([chatUri, provider])}
+            key={JSON.stringify([hostId, sessionUri, chatUri, provider])}
             chat={chat.state}
             target={{ hostId, chatUri }}
             provider={provider}
@@ -214,15 +222,15 @@ export function SessionView(props: {
             defaultModelId={agent?.defaultModelId}
             disabled={!canWrite || chat.missing === true}
             configPending={configPending}
+            sessionUri={sessionUri}
+            supportsSlash={!!host?.slashCompletions && !!session.state}
+            enablePlan={plan ? () => changeMode(plan.scope, plan.key, 'plan') : undefined}
             modeControls={(
               <ConfigPanel
-                sessionConfig={session.state?.config}
-                chatConfig={chat.state.config}
-                isDefaultChat={chatUri === session.state?.defaultChat}
-                supportsChatConfig={supportsChatConfig}
+                fields={fields}
                 disabled={!canWrite || !!chat.state.activeTurn}
                 pending={configPending}
-                onChange={changeMode}
+                onChange={(...args) => { void changeMode(...args); }}
               />
             )}
           />
@@ -366,6 +374,8 @@ function TurnView({ turn, target, workingDirectory, changesetTemplate, active, c
   forkPending: boolean;
 }) {
   const finished = 'state' in turn ? turn.state : undefined;
+  const compact = slashCommand(turn.message.text) === '/compact';
+  const compactFailed = compact && (finished === TurnState.Error || turn.responseParts.some(part => part.kind === ResponsePartKind.Error));
   const responseToCopy = copyableResponseText(finished, turn.responseParts);
   const { files, hasFileEditCall } = useMemo(() => collectFileEdits(turn.responseParts), [turn.responseParts]);
   const changesetUri = !active && files.size === 0 && hasFileEditCall
@@ -399,7 +409,10 @@ function TurnView({ turn, target, workingDirectory, changesetTemplate, active, c
       {(files.size > 0 || changesetUri) && (
         <FileEditDisplay files={files} hostId={target.hostId} workingDirectory={workingDirectory} changesetUri={changesetUri} />
       )}
-      {active && <p className="muted working">Агент работает…</p>}
+      {active && !compactFailed && <p className="muted working">{compact ? 'Хост сжимает контекст…' : 'Агент работает…'}</p>}
+      {compact && finished === TurnState.Complete && !compactFailed &&
+        <p className="muted">Сжатие контекста завершено.</p>}
+      {compactFailed && <p className="muted">Не удалось сжать контекст.</p>}
       {finished === TurnState.Cancelled && <p className="muted">Ход остановлен.</p>}
       {!active && (responseToCopy !== undefined || onFork || turn.usage?.model) && (
         <div className="turn-footer">
@@ -732,10 +745,21 @@ function Composer(props: {
   defaultModelId: string | undefined;
   disabled: boolean;
   configPending: boolean;
+  sessionUri: string;
+  supportsSlash: boolean;
+  enablePlan?: () => Promise<boolean>;
   modeControls: ReactNode;
 }) {
   const { chat, target, provider, models, defaultModelId, disabled, configPending, modeControls } = props;
   const [text, setText] = useState('');
+  const [chosenSlash, setChosenSlash] = useState<SlashCompletions['items'][number]>();
+  const [suggestions, setSuggestions] = useState<{ draft: string; items: SlashCompletions['items'] }>();
+  const textarea = useRef<HTMLTextAreaElement>(null);
+  const mounted = useRef(false);
+  useLayoutEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; };
+  }, []);
   const [draftFiles, setDraftFiles] = useState<{ id: number; file: File }[]>([]);
   const nextFileId = useRef(0);
   const fileInput = useRef<HTMLInputElement>(null);
@@ -749,6 +773,23 @@ function Composer(props: {
     catch { return undefined; }
   });
   const activeTurn = chat.activeTurn;
+  const { hostId, chatUri } = target;
+  const { sessionUri, supportsSlash, enablePlan } = props;
+  const slashPrefix = /^\/[\w.-]*$/u.test(text);
+  useLayoutEffect(() => {
+    setSuggestions(undefined);
+    if (!supportsSlash || disabled || activeTurn || !slashPrefix || chosenSlash) return;
+    return requestSlashItems(store.call<SlashCompletions>({
+      op: 'slashCompletions', hostId, sessionUri, chatUri, text, offset: text.length,
+    }), result => setSuggestions({ draft: text, items: slashItems(result.items) }));
+  }, [supportsSlash, disabled, activeTurn, slashPrefix, chosenSlash, hostId, sessionUri, chatUri, text]);
+  const slashMenu = !disabled && !activeTurn && !sendPending && slashPrefix && !chosenSlash;
+  const showPlan = slashMenu && !!enablePlan && '/plan'.startsWith(text.trimStart());
+  const items = slashMenu && suggestions?.draft === text ? suggestions.items : [];
+  const updateText = (value: string) => {
+    if (slashCommand(value) !== chosenSlash?.insertText.trim() || value.trimStart() !== value) setChosenSlash(undefined);
+    setText(value);
+  };
   const { currentModel, defaultModel, model, choice } = composerModelOf(chat, models, defaultModelId, preferredModelId, pickedModelId);
   const thinking = model?.configSchema?.properties.thinkingLevel;
   const levels = thinking?.type === 'string' ? thinking.enum?.flatMap((value, index) => typeof value === 'string'
@@ -791,16 +832,33 @@ function Composer(props: {
     sending.current = true;
     setSendPending(true);
     try {
-      const attachments = draftFiles.length ? await Promise.all(draftFiles.map(({ file }) => readFileAttachment(file))) : undefined;
-      const sent = await store.run({
-        op: 'sendMessage', ...target, text, waitForHost: true,
-        ...(attachments ? { attachments } : {}),
-        ...(model ? { modelId: model.id, ...(Object.keys(modelConfig).length ? { modelConfig } : {}) } : {}),
-      });
-      if (sent) {
-        setText(current => current === text ? '' : current);
-        setDraftFiles(current => current.filter(attachment => !draftFiles.includes(attachment)));
+      const command = slashCommand(text);
+      if (command === '/plan') {
+        if (!enablePlan) store.notify('Режим планирования недоступен для этого чата.');
+        else if (text.trim() !== command || draftFiles.length) store.notify('Введите /plan без аргументов и вложений.');
+        else if (await enablePlan()) setText(current => current === text ? '' : current);
+        return;
       }
+      await sendSlashDraft(text, chosenSlash, async command => {
+        if (!supportsSlash) return [];
+        const { items } = await store.call<SlashCompletions>({
+          op: 'slashCompletions', ...target, sessionUri, text: command, offset: command.length,
+        });
+        return items;
+      }, async (text, slashItem) => {
+        const attachments: NonNullable<Message['attachments']> = await Promise.all(draftFiles.map(({ file }) => readFileAttachment(file)));
+        if (slashItem) attachments.unshift(slashItem.attachment);
+        if (!mounted.current) return false;
+        return store.run({
+          op: 'sendMessage', ...target, text, waitForHost: true,
+          ...(attachments.length ? { attachments } : {}),
+          ...(model ? { modelId: model.id, ...(Object.keys(modelConfig).length ? { modelConfig } : {}) } : {}),
+        });
+      }, () => {
+        setText(current => current === text ? '' : current);
+        setChosenSlash(current => current === chosenSlash ? undefined : current);
+        setDraftFiles(current => current.filter(attachment => !draftFiles.includes(attachment)));
+      });
     } catch (failure) {
       if (!(failure instanceof DOMException && failure.name === 'AbortError')) store.notify(describeError(failure));
     } finally {
@@ -843,8 +901,10 @@ function Composer(props: {
         />
         <button type="button" disabled={disabled} onClick={() => fileInput.current?.click()} title="Прикрепить файлы" aria-label="Прикрепить файлы" className="icon-button">+</button>
         <textarea
+          ref={textarea}
           value={text}
-          onChange={event => setText(event.target.value)}
+          onChange={event => updateText(event.target.value)}
+          readOnly={sendPending}
           onKeyDown={onKeyDown}
           onPaste={event => {
             const files = Array.from(event.clipboardData.files);
@@ -874,6 +934,20 @@ function Composer(props: {
           </button>
         )}
       </div>
+      {(showPlan || items.length > 0) && (
+        <div className="composer-attachments" role="group" aria-label="Команды и навыки">
+          {showPlan && <button type="button" onClick={() => { setText('/plan'); textarea.current?.focus(); }}>/plan · Планирование</button>}
+          {items.map((item, index) => (
+            <button key={index} type="button" onClick={() => {
+              const next = applySlashItem(text, text.length, item);
+              if (next === undefined) return;
+              setChosenSlash(item);
+              setText(next);
+              textarea.current?.focus();
+            }}>{item.insertText.trim()}{item.attachment.label !== item.insertText.trim() ? ` · ${item.attachment.label}` : ''}</button>
+          ))}
+        </div>
+      )}
       {draftFiles.length > 0 && (
         <div className="composer-attachments">
           {draftFiles.map(attachment => (

@@ -5,6 +5,7 @@ import type {
   ChatInputAnswer,
   ChatState,
   ChatSource,
+  CompletionsResult,
   ChangesetState,
   Message,
   ModelSelection,
@@ -16,6 +17,7 @@ import type {
 } from '@microsoft/agent-host-protocol';
 
 export type HostStatus = 'disconnected' | 'connecting' | 'connected' | 'reconnecting' | 'failed';
+export type SlashCompletions = CompletionsResult;
 
 /** Готовность SDK агента на хосте. Приходит из служебных ключей VS Code в root config. */
 export type AgentSdkDownload = 'notDownloaded' | 'downloadOnUse' | 'downloading' | 'ready';
@@ -40,6 +42,7 @@ export interface HostOverview {
   status: HostStatus;
   error?: string;
   protocolVersion?: string;
+  slashCompletions?: boolean;
   defaultDirectory?: string;
   canPickDirectory?: boolean;
   agents: AgentOverview[];
@@ -75,6 +78,7 @@ export type HostCall =
   | { op: 'archiveSession'; hostId: string; sessionUri: string; archived: boolean }
   | { op: 'refreshSession'; hostId: string; sessionUri: string }
   | { op: 'fetchTurns'; hostId: string; chatUri: string; cursor: string }
+  | { op: 'slashCompletions'; hostId: string; sessionUri: string; chatUri: string; text: string; offset: number }
   | { op: 'createChat'; hostId: string; sessionUri: string; chatUri: string; source?: ChatSource; title?: string }
   | { op: 'forkSession'; hostId: string; sessionUri: string; chatUri: string; turnId: string }
   | { op: 'editMessage'; hostId: string; sessionUri: string; chatUri: string; turnId: string; lastTurnId: string; text: string; replacementId: string }
