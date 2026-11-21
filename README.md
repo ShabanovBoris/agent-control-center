@@ -251,10 +251,11 @@ npm test
 - **ConfigPanel** — выбор режима работы (default/acceptEdits/plan/auto)
 - **ChatSourceMenu** — боковой чат от текущего или последнего завершённого хода и форк переписки до последнего завершённого хода
 - **ReasoningBlock** — свёрнутый блок рассуждений агента (вместо старого встроенного)
-- **ToolResultsDisplay** — отображает результат типа `Text` как текст. Остальные типы результата
-  AHP 1.1.0 (`EmbeddedResource`, `Resource`, `FileEdit`, `Terminal`, `Subagent`) этот компонент
-  пропускает; `FileEdit` для правок хода отдельно обрабатывает `FileEditDisplay`. Типов `Image` и
-  `File` в модели `ToolResultContent` SDK 1.1.0 нет.
+- **ToolResultsDisplay** — отображает `Text` как текст, для `EmbeddedResource` показывает превью
+  PNG/JPEG/GIF/WebP, а для остальных форматов — только MIME-тип. `Resource` показывает URI обычным
+  текстом, не открывая и не скачивая ресурс. В SDK 1.1.0 в `ToolResultContent` нет отдельных типов
+  `Image` и `File`; `FileEdit` обрабатывается отдельно от карточки результата компонентом
+  `FileEditDisplay`. Типы `Terminal` и `Subagent` эта карточка также не отображает.
 
 ### Вспомогательные компоненты
 - **AttachmentUpload** — загрузка изображений через file input
