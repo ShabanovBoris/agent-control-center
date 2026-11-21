@@ -31,6 +31,10 @@ export async function loadConfig(path: string): Promise<AppConfig> {
   if (!listen || typeof listen.host !== 'string' || !Number.isInteger(listen.port)) {
     throw new Error(`${path}: нужен listen { host, port }`);
   }
+  const listenHost = listen.host === 'localhost' ? '127.0.0.1' : listen.host;
+  if (listenHost !== '127.0.0.1' && listenHost !== '::1') {
+    throw new Error(`${path}: listen.host должен быть 127.0.0.1, ::1 или localhost`);
+  }
   if (!Array.isArray(config.hosts) || config.hosts.length === 0) {
     throw new Error(`${path}: нужен непустой список hosts`);
   }
@@ -54,7 +58,7 @@ export async function loadConfig(path: string): Promise<AppConfig> {
   }
   const baseDir = dirname(resolve(path));
   return {
-    listen,
+    listen: { ...listen, host: listenHost },
     ...(config.agents ? { agents: config.agents } : {}),
     hosts: config.hosts.map(host => ({
       ...host,

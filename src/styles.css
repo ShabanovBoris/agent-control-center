@@ -441,7 +441,7 @@ a { color: var(--accent); }
   align-items: center;
   justify-content: center;
 }
-.tool-result-file {
+.tool-result-label {
   padding: 8px;
   background: var(--soft);
   border-radius: 6px;

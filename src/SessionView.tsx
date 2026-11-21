@@ -30,6 +30,7 @@ import {
 } from '@microsoft/agent-host-protocol';
 import { SIDE_CHAT_FIRST_EDIT_UNAVAILABLE, type HostOverview, type ModelOverview } from '../shared/protocol';
 import { PhaseBadge } from './App';
+import { copyableResponseText } from './copy-response';
 import { collectFileEdits, resolveTurnChangeset } from './file-edits';
 import { inputOutcome, isArchived, pathOf, phaseOf, plain } from './format';
 import { composerModelOf, readPreferredModel, savePreferredModel } from './model';
@@ -365,9 +366,20 @@ function TurnView({ turn, target, workingDirectory, changesetTemplate, active, c
   forkPending: boolean;
 }) {
   const finished = 'state' in turn ? turn.state : undefined;
+  const responseToCopy = copyableResponseText(finished, turn.responseParts);
   const { files, hasFileEditCall } = useMemo(() => collectFileEdits(turn.responseParts), [turn.responseParts]);
   const changesetUri = !active && files.size === 0 && hasFileEditCall
     ? resolveTurnChangeset(changesetTemplate, turn.id) : undefined;
+  const copyResponse = async () => {
+    if (responseToCopy === undefined) return;
+    try {
+      if (!navigator.clipboard?.writeText) throw new Error('Буфер обмена недоступен');
+      await navigator.clipboard.writeText(responseToCopy);
+      store.notify('Ответ скопирован');
+    } catch (error) {
+      store.notify(`Не удалось скопировать ответ: ${describeError(error)}`);
+    }
+  };
   return (
     <article className="turn">
       <div className="user-message-row">
@@ -389,8 +401,16 @@ function TurnView({ turn, target, workingDirectory, changesetTemplate, active, c
       )}
       {active && <p className="muted working">Агент работает…</p>}
       {finished === TurnState.Cancelled && <p className="muted">Ход остановлен.</p>}
-      {!active && (onFork || turn.usage?.model) && (
+      {!active && (responseToCopy !== undefined || onFork || turn.usage?.model) && (
         <div className="turn-footer">
+          {responseToCopy !== undefined && (
+            <button type="button" className="turn-action" aria-label="Скопировать ответ" title="Скопировать ответ" onClick={() => void copyResponse()}>
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                <rect x="8" y="8" width="13" height="13" rx="2" />
+                <path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3" />
+              </svg>
+            </button>
+          )}
           {onFork && (
             <button type="button" className="turn-action" aria-label="Форк в отдельную сессию" title="Форк в отдельную сессию" disabled={forkPending} onClick={onFork}>
               <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
