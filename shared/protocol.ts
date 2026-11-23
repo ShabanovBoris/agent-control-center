@@ -66,7 +66,48 @@ export interface UpdateCheck {
   restartBlocked?: string;
 }
 
-export type Call = HostCall | { op: 'checkUpdates' } | { op: 'applyUpdates' } | { op: 'restartServices' };
+export type Call = HostCall | { op: 'checkUpdates' } | { op: 'applyUpdates' } | { op: 'restartServices' } | { op: 'searchHistory'; query: string; limit?: number };
+
+/** Поле хода, по которому нашлось совпадение. */
+export type TurnFieldKind = 'message' | 'response' | 'reasoning' | 'notification' | 'error';
+/** Поле overview, по которому нашлось совпадение. */
+export type MetadataFieldKind = 'title' | 'chat' | 'provider' | 'host' | 'path';
+export type SearchFieldKind = TurnFieldKind | MetadataFieldKind;
+
+/** Почему backend-поиск не проверил всю историю. */
+export type SearchStopReason = 'chat-budget' | 'page-budget' | 'deadline' | 'hit-budget' | 'text-budget';
+
+export interface SearchIssue {
+  hostId: string;
+  uri?: string;
+  message: string;
+  /** JSON-RPC код хоста, если отказ пришёл от него. */
+  code?: number;
+}
+
+export interface SearchHit {
+  hostId: string;
+  sessionUri: string;
+  chatUri: string;
+  turnId: string;
+  score: number;
+  field: TurnFieldKind;
+  snippet: string;
+  /** Диапазоны совпадений в координатах `snippet`. */
+  ranges: readonly (readonly [number, number])[];
+  startedAt?: string;
+}
+
+export interface SearchHistoryResult {
+  hits: SearchHit[];
+  /** Сколько видимых чатов у подключённых хостов было доступно. */
+  candidateChats: number;
+  scannedChats: number;
+  scannedTurns: number;
+  reasons: SearchStopReason[];
+  issues: SearchIssue[];
+}
+
 
 export type EditMessageResult =
   | { status: 'sent' }
@@ -95,6 +136,7 @@ export type HostCall =
 
 export type ClientMessage =
   | { t: 'cancelDirectoryPicker' }
+  | { t: 'cancelSearch'; id: number }
   | { t: 'watch'; hostId: string; uri: string }
   | { t: 'unwatch'; hostId: string; uri: string }
   | { t: 'call'; id: number; call: Call };
@@ -124,6 +166,14 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+/** Понятный текст ошибки вызова; коды AHP не теряются. */
+export function describeCallError(detail: CallError): string {
+  if (detail.code === AUTH_REQUIRED_CODE) {
+    return 'Агент не готов на этом хосте: скачайте его SDK и выполните вход (блок «Хосты и агенты»).';
+  }
+  return detail.message;
+}
+
 function parseObject(raw: string): Record<string, unknown> | undefined {
   try {
     const value: unknown = JSON.parse(raw);
@@ -150,6 +200,8 @@ export function parseClientMessage(raw: string): ClientMessage | undefined {
       break;
     }
     case 'cancelDirectoryPicker':
+    case 'cancelSearch':
+      if (message.t === 'cancelSearch' && (typeof message.id !== 'number' || !Number.isFinite(message.id))) return undefined;
       break;
     default:
       return undefined;

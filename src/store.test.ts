@@ -12,8 +12,9 @@ class FakeSocket {
   onopen?: () => void;
   onmessage?: (event: { data: string }) => void;
   onclose?: () => void;
+  readonly sent: string[] = [];
   constructor(_url: string) { socket = this; }
-  send(_message: string) {}
+  send(message: string) { this.sent.push(String(message)); }
 }
 const runtime = globalThis as unknown as { WebSocket: unknown; location: unknown };
 const original = { WebSocket: runtime.WebSocket, location: runtime.location };
@@ -63,4 +64,39 @@ test('отсутствующая при открытии сессия отлич
   assert.equal(store.getState().channels.get(channelKey('one', uri))?.missing, undefined);
   assert.equal(store.getState().channels.get(channelKey('one', uri))?.error, 'Authentication required');
   releaseAgain();
+});
+
+
+test('поиск уходит отдельным вызовом и возвращает результат', async () => {
+  const running = store.search('deploy', new AbortController().signal);
+  const call = JSON.parse(socket.sent.at(-1)!) as { id: number; call: { op: string; query: string } };
+  assert.equal(call.call.op, 'searchHistory');
+  assert.equal(call.call.query, 'deploy');
+  const result = { hits: [], candidateChats: 0, scannedChats: 0, scannedTurns: 0, reasons: [], issues: [] };
+  receive({ t: 'result', id: call.id, ok: true, data: result });
+  assert.deepEqual(await running, result);
+});
+
+test('отмена поиска шлёт cancelSearch и режет ожидание, поздний результат игнорируется', async () => {
+  const controller = new AbortController();
+  const running = store.search('deploy', controller.signal);
+  const call = JSON.parse(socket.sent.at(-1)!) as { id: number };
+  controller.abort();
+  await assert.rejects(running, (error: Error) => error.name === 'CallCancelled');
+  assert.deepEqual(JSON.parse(socket.sent.at(-1)!), { t: 'cancelSearch', id: call.id });
+  // Поздний ответ не должен воскресить отменённый pending или сломать следующий поиск.
+  receive({ t: 'result', id: call.id, ok: true, data: { hits: [] } });
+  const next = store.search('redis', new AbortController().signal);
+  const nextCall = JSON.parse(socket.sent.at(-1)!) as { id: number };
+  assert.notEqual(nextCall.id, call.id);
+  receive({ t: 'result', id: nextCall.id, ok: true, data: { hits: ['ok'] } });
+  assert.deepEqual(await next, { hits: ['ok'] });
+});
+
+test('ошибка поиска приходит как CallRejected с кодом хоста', async () => {
+  const { CallRejected } = await import('./store.js');
+  const running = store.search('deploy', new AbortController().signal);
+  const call = JSON.parse(socket.sent.at(-1)!) as { id: number };
+  receive({ t: 'result', id: call.id, ok: false, error: { message: 'Нужна авторизация', code: -32007 } });
+  await assert.rejects(running, (error: unknown) => error instanceof CallRejected && error.detail.code === -32007);
 });

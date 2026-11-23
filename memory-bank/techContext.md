@@ -8,8 +8,25 @@ React, TypeScript, Vite, Node.js 22+, `ws` и официальный TypeScript 
 | `npm run host:gemini` | Отдельный `code agent host` на `127.0.0.1:8091` для Gemini |
 | `npm run server` | Backend на `127.0.0.1:8090`, конфигурация из `hosts.json` |
 | `npm run web` | Панель на `http://localhost:5173` |
-| `npm run mock-host`, `npm run server:dev` | Учебный хост на `8189` и backend с `hosts.dev.json` |
+| `npm run mock-host` | Учебный AHP-хост на `ws://127.0.0.1:8189` без реальных агентов |
+| `npm run server:dev` | Backend на `127.0.0.1:8095` с mock-only `hosts.dev.json` |
+| `npm run server:e2e` | Backend на `127.0.0.1:8095` с `hosts.e2e.json` |
+| `npm run web:dev` | Панель на `http://127.0.0.1:5173` с прокси `/ws` на 8095 |
 | `npm run typecheck`, `npm test`, `npm run build` | Проверка типов, тесты и production-сборка |
+
+Mock-контур не требует VS Code CLI, AHP-токенов и `.local`: `hosts.dev.json` и `hosts.e2e.json`
+содержат только хост `mock` (`ws://127.0.0.1:8189`), без `tokenFile`, `localFilesystem`, `local`
+и `gemini`; production `hosts.json` они не меняют. `server:dev`/`server:e2e` выставляют
+`ACC_PHONE_ACCESS=0`, поэтому не занимают production-порт 8092 и не читают
+`.local/phone-access.json`. Порты переопределяются: `MOCK_HOST_PORT=8190 npm run mock-host` или
+`npm run mock-host -- 8190` (позиционный аргумент важнее env), `ACC_PORT=8096` и
+`ACC_MOCK_HOST_URL=ws://127.0.0.1:8190` для backend, `ACC_BACKEND=127.0.0.1:8096 npm run web:dev`
+для прокси. При смене порта mock задавайте пару `MOCK_HOST_PORT` + `ACC_MOCK_HOST_URL`.
+
+Учебный хост отвечает эхом с markdown-стримингом, на слово `tool` просит подтвердить `mock_shell`,
+на слово `input` показывает карточку `InputRequest`, создаёт боковой чат через `createChat` и
+держит историю в памяти: снимок чата отдаёт последние 6 ходов, остальное грузится через
+`fetchTurns` (курсор `older:<index>`). После перезапуска mock-host история и чаты теряются.
 
 GitHub Actions [workflow](../.github/workflows/ci.yml) на pull request и push в `main` (Node.js 22)
 выполняет `npm ci`, `npm ci --prefix debug-ui`, `npm run typecheck`, `npm test`,

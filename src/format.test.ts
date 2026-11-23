@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { ChatInputRequest } from '@microsoft/agent-host-protocol';
-import { inputOutcome, selectionFromHash } from './format.js';
+import { inputOutcome, selectionFromHash, selectionToHash } from './format.js';
 
 test('ссылка на сессию восстанавливает обе части адреса', () => {
   assert.deepEqual(selectionFromHash('#a|b'), { hostId: 'a', sessionUri: 'b' });
@@ -93,4 +93,17 @@ test('запрос без вопросов (только сообщение ил
 test('неизвестный идентификатор варианта показывается как есть', () => {
   const request = { ...colorRequest, answers: { Color: { state: 'submitted', value: { kind: 'selected', value: 'green-id' } } } };
   assert.equal(outcome(request, 'accept'), 'Color: green-id');
+});
+
+
+test('ход в адресе переживает перезагрузку и не ломает старые ссылки', () => {
+  const selection = { hostId: 'local', sessionUri: 'ahp-session:/session', chatUri: 'ahp-chat:/child', turnId: 'turn|1' };
+  const hash = selectionToHash(selection);
+  assert.equal(hash, '#local|ahp-session%3A%2Fsession|ahp-chat%3A%2Fchild|turn%7C1');
+  assert.deepEqual(selectionFromHash(hash), selection);
+  assert.deepEqual(selectionFromHash('#local|ahp-session%3A%2Fsession'), { hostId: 'local', sessionUri: 'ahp-session:/session' });
+  assert.deepEqual(selectionFromHash('#local|ahp-session%3A%2Fsession|ahp-chat%3A%2Fchild|'), { hostId: 'local', sessionUri: 'ahp-session:/session', chatUri: 'ahp-chat:/child' });
+  assert.deepEqual(selectionFromHash('#local|ahp-session%3A%2Fsession||turn'), { hostId: 'local', sessionUri: 'ahp-session:/session' }, 'ход без чата игнорируется');
+  assert.equal(selectionFromHash('#local|ahp-session%3A%2Fsession|ahp-chat%3A%2Fchild|%ZZ'), null);
+  assert.equal(selectionToHash(null), '');
 });
