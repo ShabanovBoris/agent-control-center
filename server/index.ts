@@ -52,6 +52,8 @@ interface Browser {
   watching: Set<string>;
   abort: AbortController;
   pickerAbort?: AbortController;
+  /** Текущий поиск по истории: новый запрос отменяет предыдущий. */
+  search?: { id: number; abort: AbortController };
   updatePlan?: UpdatePlan;
 }
 const browsers = new Set<Browser>();
@@ -160,6 +162,9 @@ async function onMessage(browser: Browser, message: ClientMessage): Promise<void
     case 'cancelDirectoryPicker':
       browser.pickerAbort?.abort();
       return;
+    case 'cancelSearch':
+      if (browser.search?.id === message.id) browser.search.abort.abort();
+      return;
     case 'watch': {
       const { hostId, uri } = message;
       const key = channelKey(hostId, uri);
@@ -182,6 +187,7 @@ async function onMessage(browser: Browser, message: ClientMessage): Promise<void
     }
     case 'call': {
       let pickerAbort: AbortController | undefined;
+      let searchAbort: AbortController | undefined;
       try {
         const call = message.call;
         if (backendRestarting) throw new Error('Backend перезапускается после обновления.');
@@ -205,7 +211,7 @@ async function onMessage(browser: Browser, message: ClientMessage): Promise<void
           send(browser, { t: 'result', id: message.id, ok: true, data: { restartBackend: true } }, () => void shutdown());
           return;
         }
-        if (updates.isRestarting(call.hostId) && (
+        if ('hostId' in call && updates.isRestarting(call.hostId) && (
           call.op === 'sendMessage' || call.op === 'createSession' || call.op === 'createChat'
           || call.op === 'forkSession' || call.op === 'editMessage' || call.op === 'retryEditedMessage'
         )) {
@@ -216,13 +222,22 @@ async function onMessage(browser: Browser, message: ClientMessage): Promise<void
           pickerAbort = new AbortController();
           browser.pickerAbort = pickerAbort;
         }
-        const signal = pickerAbort ? AbortSignal.any([browser.abort.signal, pickerAbort.signal]) : browser.abort.signal;
+        if (call.op === 'searchHistory') {
+          // Смена запроса и закрытие палитры не должны оставлять прежние воркеры.
+          browser.search?.abort.abort();
+          searchAbort = new AbortController();
+          browser.search = { id: message.id, abort: searchAbort };
+        }
+        const signals = [browser.abort.signal, pickerAbort?.signal, searchAbort?.signal].filter((value): value is AbortSignal => value !== undefined);
+        const signal = signals.length === 1 ? signals[0]! : AbortSignal.any(signals);
         const data = await hub.call(call, signal);
         send(browser, { t: 'result', id: message.id, ok: true, ...(data !== undefined ? { data } : {}) });
       } catch (error) {
         send(browser, { t: 'result', id: message.id, ok: false, error: toCallError(error) });
       } finally {
         if (pickerAbort) browser.pickerAbort = undefined;
+        // Новая поисковая команда могла уже заменить этот controller.
+        if (searchAbort && browser.search?.id === message.id) browser.search = undefined;
       }
       return;
     }

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { ActionType, SessionLifecycle, SessionStatus } from '@microsoft/agent-host-protocol';
-import { parseClientMessage, parseServerMessage, type ClientMessage, type ServerMessage } from '../shared/protocol.js';
+import { describeCallError, parseClientMessage, parseServerMessage, type ClientMessage, type ServerMessage } from '../shared/protocol.js';
 
 const hostId = 'test';
 const uri = 'ahp-session:/test';
@@ -57,4 +57,19 @@ test('парсер сервера проверяет обязательные п
     const raw = JSON.stringify(message);
     assert.equal(parseServerMessage(raw), undefined, raw);
   }
+});
+
+test('поиск по истории проходит парсер вызова, а отмена проверяет id', () => {
+  const call = { t: 'call', id: 7, call: { op: 'searchHistory', query: 'deploy', limit: 10 } } as const;
+  assert.deepEqual(parseClientMessage(JSON.stringify(call)), call);
+  assert.deepEqual(parseClientMessage('{"t":"cancelSearch","id":7}'), { t: 'cancelSearch', id: 7 });
+  for (const raw of ['{"t":"cancelSearch"}', '{"t":"cancelSearch","id":"7"}', '{"t":"cancelSearch","id":null}']) {
+    assert.equal(parseClientMessage(raw), undefined, raw);
+  }
+});
+
+test('describeCallError сохраняет авторизационное указание и код обычной ошибки', () => {
+  assert.match(describeCallError({ message: 'Authentication required', code: -32007 }), /скачайте его SDK/);
+  assert.equal(describeCallError({ message: 'Хост недоступен', code: -32001 }), 'Хост недоступен');
+  assert.equal(describeCallError({ message: 'Без кода' }), 'Без кода');
 });

@@ -7,6 +7,7 @@ import {
   type ActionEnvelope, type ChatState, type MessageEmbeddedResourceAttachment, type SessionModelInfo, type SessionState, type StateAction, type Turn,
 } from '@microsoft/agent-host-protocol';
 import type { MultiHostClient } from '@microsoft/agent-host-protocol/hosts';
+import type { SessionOverview } from '../shared/protocol.js';
 import { Hub } from './hub.js';
 
 const model: SessionModelInfo = {
@@ -26,6 +27,8 @@ function setup(models: SessionModelInfo[] = [model], request?: (method: string, 
   const requests: { method: string; params: unknown }[] = [];
   const events = new EventEmitter();
   const states = new Map<string, SessionState | ChatState>();
+  const sessions: SessionOverview[] = [];
+  const unsubscribed: string[] = [];
   let serverSeq = 0;
   const host = { id: 'h', clientId: 'browser-backend', label: 'Host', completionTriggerCharacters: ['/'], state: { status: 'connected' }, agents: [{
     provider: 'codex', displayName: 'Codex', models, capabilities: { multipleChats: { fork: true, sideChat: true } },
@@ -40,9 +43,9 @@ function setup(models: SessionModelInfo[] = [model], request?: (method: string, 
       },
     }),
     subscribe: async (_hostId: string, uri: string) => ({ snapshot: { resource: uri, state: states.get(uri), fromSeq: serverSeq } }),
-    async unsubscribe() {},
+    async unsubscribe(_hostId: string, uri: string) { unsubscribed.push(uri); },
     hostsSnapshot: () => [host],
-    aggregatedSessions: () => [],
+    aggregatedSessions: () => sessions,
     async *hostEvents() {},
     async *events() { for await (const [event] of on(events, 'action', { close: ['shutdown'] })) yield event; },
     async shutdown() { events.emit('shutdown'); },
@@ -51,7 +54,7 @@ function setup(models: SessionModelInfo[] = [model], request?: (method: string, 
   const echo = (channel: string, action: StateAction, origin: ActionEnvelope['origin'], rejectionReason?: string) => {
     events.emit('action', { hostId: host.id, channel, event: { type: 'action', params: { channel, action, origin, serverSeq: ++serverSeq, rejectionReason } } });
   };
-  return { hub, actions, targets, requests, host, echo, states };
+  return { hub, actions, targets, requests, host, echo, states, sessions, unsubscribed };
 }
 
 const message = { op: 'sendMessage', hostId: 'h', chatUri: 'ahp-chat:/test', text: 'Task', modelId: model.id } as const;
@@ -336,4 +339,101 @@ test('подтверждённая правка доходит до нового
     echo(chatUri, actions[1]!, { clientId: host.clientId, clientSeq: 2 });
     assert.deepEqual(await editing, { status: 'sent' });
   } finally { await hub.stop(); }
+});
+
+
+const searchSummary = {
+  resource: sessionUri, createdAt: startedAt, modifiedAt: startedAt,
+  title: 'Тема', status: 1, provider: 'codex', chats: [chatSummary],
+};
+
+test('поиск по истории догружает страницы, находит ход и освобождает чат', async () => {
+  const fixture = setup([model], async (method, params) => {
+    if (method !== 'fetchTurns') return null;
+    assert.deepEqual(params, { channel: chatUri, cursor: 'older-turns' });
+    fixture.echo(chatUri, { type: ActionType.ChatTurnsLoaded, turns: [history[0]!] }, undefined);
+    await setImmediate();
+    return {};
+  });
+  const { hub, requests, sessions, states } = fixture;
+  states.set(sessionUri, sessionState);
+  states.set(chatUri, { ...chatSummary, turns: history.slice(1), turnsNextCursor: 'older-turns' });
+  sessions.push({ hostId: 'h', hostLabel: 'Host', summary: searchSummary });
+  await hub.start([]);
+  try {
+    const first = await hub.call({ op: 'searchHistory', query: 'first' }) as { hits: { turnId: string }[]; scannedTurns: number; issues: unknown[] };
+    assert.deepEqual(first.hits.map(hit => hit.turnId), ['first']);
+    assert.equal(first.scannedTurns, 3);
+    assert.deepEqual(first.issues, []);
+    assert.equal(requests.filter(request => request.method === 'fetchTurns').length, 1);
+    assert.equal(hub.mirrorChat('h', chatUri), undefined, 'подписка поиска освобождена');
+
+    const second = await hub.call({ op: 'searchHistory', query: 'second' }) as { hits: { turnId: string }[] };
+    assert.deepEqual(second.hits.map(hit => hit.turnId), ['second']);
+    assert.equal(requests.filter(request => request.method === 'fetchTurns').length, 1, 'повторный поиск берёт корпус из кэша');
+  } finally { await hub.stop(); }
+});
+
+test('отмена поиска прекращает страницы и освобождает канал', async () => {
+  const fixture = setup([model], async (method) => {
+    if (method === 'fetchTurns') return new Promise(() => {});
+    return null;
+  });
+  const { hub, requests, sessions, states, unsubscribed } = fixture;
+  states.set(sessionUri, sessionState);
+  states.set(chatUri, { ...chatSummary, turns: [], turnsNextCursor: 'older-turns' });
+  sessions.push({ hostId: 'h', hostLabel: 'Host', summary: searchSummary });
+  await hub.start([]);
+  try {
+    const controller = new AbortController();
+    const running = hub.call({ op: 'searchHistory', query: 'deploy' }, controller.signal);
+    for (let tick = 0; tick < 20 && !requests.some(request => request.method === 'fetchTurns'); tick += 1) await setImmediate();
+    assert.ok(requests.some(request => request.method === 'fetchTurns'));
+    controller.abort();
+    await assert.rejects(running, /Поиск отменён/);
+    assert.ok(unsubscribed.includes(chatUri), 'канал поиска отписан');
+  } finally { await hub.stop(); }
+});
+
+test('ошибка одного чата попадает в issues, результаты другого остаются', async () => {
+  const goodChat = 'ahp-chat:/good';
+  const badChat = 'ahp-chat:/bad';
+  const fixture = setup([model], async (method, params) => {
+    if (method !== 'fetchTurns') return null;
+    if ((params as { channel: string }).channel === badChat) throw new Error('host refused');
+    fixture.echo(goodChat, { type: ActionType.ChatTurnsLoaded, turns: [] }, undefined);
+    return {};
+  });
+  const { hub, sessions, states } = fixture;
+  states.set(sessionUri, { ...sessionState, chats: [
+    { ...chatSummary, resource: badChat },
+    { ...chatSummary, resource: goodChat },
+  ] });
+  states.set(badChat, { ...chatSummary, resource: badChat, turns: [], turnsNextCursor: 'bad' });
+  states.set(goodChat, { ...chatSummary, resource: goodChat, turns: [{ ...history[0]!, message: { ...history[0]!.message, text: 'deploy good' } }] });
+  sessions.push({ hostId: 'h', hostLabel: 'Host', summary: { ...searchSummary, chats: [
+    { ...chatSummary, resource: badChat },
+    { ...chatSummary, resource: goodChat },
+  ] } });
+  await hub.start([]);
+  try {
+    const result = await hub.call({ op: 'searchHistory', query: 'deploy' }) as { hits: unknown[]; issues: { message: string }[] };
+    assert.equal(result.hits.length, 1);
+    assert.match(result.issues[0]!.message, /host refused/);
+  } finally { await hub.stop(); }
+});
+
+test('одновременные запросы одной страницы не дублируются', async () => {
+  const fixture = setup([model], async (method) => {
+    if (method !== 'fetchTurns') return null;
+    fixture.echo(chatUri, { type: ActionType.ChatTurnsLoaded, turns: [history[0]!] }, undefined);
+    await setImmediate();
+    return {};
+  });
+  await watchHistory(fixture, { turns: history.slice(1), turnsNextCursor: 'older-turns' });
+  try {
+    const call = { op: 'fetchTurns', hostId: 'h', chatUri, cursor: 'older-turns' } as const;
+    await Promise.all([fixture.hub.call(call), fixture.hub.call(call)]);
+    assert.equal(fixture.requests.filter(request => request.method === 'fetchTurns').length, 1);
+  } finally { await fixture.hub.stop(); }
 });
