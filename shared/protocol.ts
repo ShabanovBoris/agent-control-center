@@ -66,7 +66,7 @@ export interface UpdateCheck {
   restartBlocked?: string;
 }
 
-export type Call = HostCall | { op: 'checkUpdates' } | { op: 'applyUpdates' };
+export type Call = HostCall | { op: 'checkUpdates' } | { op: 'applyUpdates' } | { op: 'restartServices' };
 
 export type EditMessageResult =
   | { status: 'sent' }

@@ -28,7 +28,7 @@ export interface LocalHost {
   agents: Agent[];
 }
 
-interface Instance {
+export interface HostInstance {
   id: string;
   pid: number;
   roots: AgentRoots;
@@ -71,7 +71,7 @@ async function jsonFile(path: string) {
   }
 }
 
-export async function localInstance(host: LocalHost): Promise<Instance | undefined> {
+export async function localInstance(host: LocalHost): Promise<HostInstance | undefined> {
   const token = (await readFile(host.tokenFile, 'utf8')).trim();
   if (!token) return undefined;
   for (const file of await readdir(registryDir)) {
@@ -108,7 +108,7 @@ function inDirectory(path: string, directory: string): boolean {
   return path === directory || path.startsWith(`${directory}${sep}`);
 }
 
-function customRoot(agent: Agent, root: string | undefined, host: LocalHost, instance: Instance): string | undefined {
+function customRoot(agent: Agent, root: string | undefined, host: LocalHost, instance: HostInstance): string | undefined {
   if (!root) return undefined;
   const hostCache = resolve(host.serverData, 'data/agent-host/sdk-cache', agent);
   const sharedCache = resolve(instance.env.AHP_SERVER_DATA_DIR ?? defaultServerData, 'data/agent-host/sdk-cache', agent);
@@ -116,11 +116,11 @@ function customRoot(agent: Agent, root: string | undefined, host: LocalHost, ins
   return root;
 }
 
-export function canUpdateSdk(agent: Agent, host: LocalHost, instance: Instance): boolean {
+export function canUpdateSdk(agent: Agent, host: LocalHost, instance: HostInstance): boolean {
   return instance.env.AHP_USE_BUNDLED_SDK !== '1' && !customRoot(agent, instance.roots[agent], host, instance);
 }
 
-async function runningSdkRoots(host: LocalHost, instance: Instance, build: HostBuild): Promise<AgentRoots> {
+async function runningSdkRoots(host: LocalHost, instance: HostInstance, build: HostBuild): Promise<AgentRoots> {
   const cliData = instance.env.VSCODE_CLI_DATA_DIR ?? resolve(homedir(), '.vscode/cli');
   const product = await jsonFile(resolve(cliData, 'servers', `Stable-${build.commit}`, 'server/product.json'));
   const roots: AgentRoots = { ...instance.roots };
@@ -135,7 +135,7 @@ async function runningSdkRoots(host: LocalHost, instance: Instance, build: HostB
   return roots;
 }
 
-export async function runningSdks(host: LocalHost, instance: Instance, build: HostBuild): Promise<Record<Agent, string | null>> {
+export async function runningSdks(host: LocalHost, instance: HostInstance, build: HostBuild): Promise<Record<Agent, string | null>> {
   const roots = await runningSdkRoots(host, instance, build);
   const versions: Record<Agent, string | null> = { codex: null, claude: null };
   for (const agent of host.agents) {
@@ -146,16 +146,47 @@ export async function runningSdks(host: LocalHost, instance: Instance, build: Ho
   return versions;
 }
 
-async function poll(test: () => boolean | Promise<boolean>, timeout: number): Promise<boolean> {
+async function poll(test: () => boolean | Promise<boolean>, timeout: number, signal?: AbortSignal): Promise<boolean> {
   const deadline = Date.now() + timeout;
-  while (Date.now() < deadline) {
+  while (Date.now() < deadline && !signal?.aborted) {
     if (await test()) return true;
-    await delay(250);
+    await delay(250, undefined, { signal }).catch(() => false);
   }
   return false;
 }
 
-async function startHost(host: LocalHost, instance: Instance, fallback?: { build: HostBuild; roots: AgentRoots }): Promise<ChildProcess> {
+export function defaultHostInstance(host: LocalHost): HostInstance {
+  return {
+    id: '', pid: 0, roots: {},
+    env: {
+      AHP_PROVIDER_ENV_FILE: process.env.AHP_PROVIDER_ENV_FILE,
+      AHP_SERVER_DATA_DIR: process.env.AHP_SERVER_DATA_DIR,
+      AHP_USE_BUNDLED_SDK: process.env.AHP_USE_BUNDLED_SDK,
+      VSCODE_CLI_DATA_DIR: process.env.VSCODE_CLI_DATA_DIR,
+    },
+  };
+}
+
+export async function startLocalHost(host: LocalHost, instance: HostInstance = defaultHostInstance(host)): Promise<ChildProcess> {
+  if (await localInstance(host)) throw new Error(`Хост «${host.label}» уже запущен.`);
+  const main = host.id === 'local';
+  const child = spawn(main ? '/bin/bash' : process.execPath, main
+    ? ['scripts/start-host.sh', '--log']
+    : ['--import', 'tsx', 'scripts/start-gemini-host.ts', '--log'], {
+    cwd: projectRoot, detached: true, stdio: 'ignore',
+    env: {
+      ...process.env, ...instance.env, VSCODE_CLI: nativeCli,
+      [main ? 'AHP_PORT' : 'GEMINI_AHP_PORT']: String(host.port),
+      VSCODE_AGENT_HOST_CODEX_SDK_ROOT: customRoot('codex', instance.roots.codex, host, instance),
+      VSCODE_AGENT_HOST_CLAUDE_SDK_ROOT: customRoot('claude', instance.roots.claude, host, instance),
+    },
+  });
+  await once(child, 'spawn');
+  child.unref();
+  return child;
+}
+
+async function startHost(host: LocalHost, instance: HostInstance, fallback?: { build: HostBuild; roots: AgentRoots }): Promise<ChildProcess> {
   const main = host.id === 'local';
   const child = spawn(main ? '/bin/bash' : process.execPath, main
     ? ['scripts/start-host.sh', '--log']
@@ -174,9 +205,16 @@ async function startHost(host: LocalHost, instance: Instance, fallback?: { build
   return child;
 }
 
-export async function restartLocalHost(host: LocalHost, instance: Instance, build: HostBuild, ready: () => boolean): Promise<void> {
+export async function restartLocalHost(
+  host: LocalHost,
+  instance: HostInstance,
+  build: HostBuild,
+  ready: () => boolean,
+  beforeStop?: () => Promise<void>,
+): Promise<void> {
   const previousRoots = await runningSdkRoots(host, instance, build);
   if ((await localInstance(host))?.id !== instance.id) throw new Error(`Хост «${host.label}» изменился. Проверьте обновления заново.`);
+  await beforeStop?.();
   process.kill(instance.pid, 'SIGINT');
   if (!await poll(async () => (await localInstance(host))?.id !== instance.id, 15_000)) {
     throw new Error(`Хост «${host.label}» не завершил работу.`);
@@ -196,4 +234,18 @@ export async function restartLocalHost(host: LocalHost, instance: Instance, buil
     }
   }
   throw new Error(`Обновлённый хост «${host.label}» не подключился. Проверьте журнал хоста.`);
+}
+
+export async function waitForLocalHost(
+  host: LocalHost,
+  ready: () => boolean,
+  child: ChildProcess,
+  signal?: AbortSignal,
+): Promise<void> {
+  if (await poll(() => ready() || child.exitCode != null || child.signalCode != null, 180_000, signal) && ready()) return;
+  if (signal?.aborted) throw signal.reason;
+  if (await localInstance(host)) {
+    throw new Error(`Хост «${host.label}» запущен, но не подключился к backend. Проверьте его настройки.`);
+  }
+  throw new Error(`Хост «${host.label}» не запустился. Проверьте .local/${host.id === 'local' ? 'host' : 'gemini-host'}.log.`);
 }

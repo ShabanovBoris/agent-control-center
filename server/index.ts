@@ -14,6 +14,7 @@ import { DirectoryPicker } from './directory-picker.js';
 import { createPhoneAccess, PHONE_ACCESS_PORT } from './phone-access.js';
 import { localHosts } from './local-hosts.js';
 import { ProjectUpdates, type UpdatePlan } from './updates.js';
+import { restartServices } from './restart-services.js';
 
 const previousBackend = Number(process.env.ACC_PREVIOUS_BACKEND_PID);
 delete process.env.ACC_PREVIOUS_BACKEND_PID;
@@ -60,6 +61,12 @@ const hub = new Hub(new MultiHostClient({ clientIdStore: new FileClientIdStore('
 }, config.agents, new DirectoryPicker(config.hosts.filter(host => host.localFilesystem).map(host => host.id)), defaultModels);
 const updates = new ProjectUpdates(localHosts(config.hosts), hub, await installedAhpVersion());
 let backendRestarting = false;
+
+function restartAllServices(): Promise<void> {
+  return restartServices({
+    hosts: localHosts(config.hosts), hub, updates, restartBackend: startReplacementBackend,
+  });
+}
 
 async function startReplacementBackend(): Promise<void> {
   backendRestarting = true;
@@ -177,6 +184,11 @@ async function onMessage(browser: Browser, message: ClientMessage): Promise<void
           const restartBackend = await updates.apply(plan);
           if (restartBackend) await startReplacementBackend();
           send(browser, { t: 'result', id: message.id, ok: true, data: { restartBackend } }, restartBackend ? () => void shutdown() : undefined);
+          return;
+        }
+        if (call.op === 'restartServices') {
+          await restartAllServices();
+          send(browser, { t: 'result', id: message.id, ok: true, data: { restartBackend: true } }, () => void shutdown());
           return;
         }
         if (updates.isRestarting(call.hostId) && (

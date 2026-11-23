@@ -4,9 +4,9 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { HostConnection, RequestError, describe } from './ahp.mjs';
 
-const configPath = process.env.ACC_DEBUG_CONFIG ? resolve(process.env.ACC_DEBUG_CONFIG) : fileURLToPath(new URL('hosts.json', import.meta.url));
+const configPath = process.env.ACC_DEBUG_CONFIG ? resolve(process.env.ACC_DEBUG_CONFIG) : fileURLToPath(new URL('../hosts.json', import.meta.url));
 const config = JSON.parse(await readFile(configPath, 'utf8'));
-const port = config.port ?? 5174;
+const port = config.debugPort ?? 5174;
 if (!Number.isInteger(port) || port < 0 || port > 65535 || !Array.isArray(config.hosts) || config.hosts.length === 0) {
   throw new Error('Проверьте port и список hosts в конфигурации резервной панели');
 }

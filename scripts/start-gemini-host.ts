@@ -17,23 +17,27 @@ interface VendorModel {
   input_modalities?: string[];
 }
 
-export function geminiCatalog(payload: unknown, defaultModel: string) {
+export function providerCatalog(payload: unknown, requestedModel?: string) {
   const data = (payload as { data?: unknown } | null)?.data;
   if (!Array.isArray(data)) throw new Error('API провайдера: в ответе /models нет массива data');
   const models = data.filter((row): row is VendorModel =>
-    row !== null && typeof row === 'object' && typeof row.id === 'string' && row.id.startsWith('gemini-') && row.supports_tools === true);
-  if (!models.some(model => model.id === defaultModel)) throw new Error(`Gemini ${defaultModel} отсутствует среди моделей с инструментами`);
+    row !== null && typeof row === 'object' && typeof row.id === 'string' && row.id.length > 0);
+  if (models.length === 0) throw new Error('API провайдера: каталог /models не содержит моделей');
+  if (requestedModel !== undefined && !models.some(model => model.id === requestedModel)) {
+    throw new Error(`Модель ${requestedModel} отсутствует в каталоге провайдера`);
+  }
+  const defaultModel = requestedModel ?? (models.find(model => model.id === 'gemini-3.8-flash')?.id ?? models[0]!.id);
   // Хост выбирает первый элемент каталога, если у новой сессии ещё нет модели.
   models.sort((a, b) => Number(b.id === defaultModel) - Number(a.id === defaultModel));
   return {
     models: models.map((model, index) => ({
       slug: model.id,
       display_name: model.display_name ?? model.id,
-      description: 'Gemini через cheapvibecode; инструменты Codex',
-      // Общие уровни Gemini: https://ai.google.dev/gemini-api/docs/thinking
-      supported_reasoning_levels: model.supports_reasoning === true
+      description: 'CheapVibeCode · Codex',
+      // Подтверждённые уровни Gemini: https://ai.google.dev/gemini-api/docs/thinking
+      supported_reasoning_levels: model.id.startsWith('gemini-') && model.supports_reasoning === true
         ? ['low', 'medium', 'high'].map(effort => ({ effort, description: '' })) : [],
-      ...(model.supports_reasoning === true ? { default_reasoning_level: 'medium' } : {}),
+      ...(model.id.startsWith('gemini-') && model.supports_reasoning === true ? { default_reasoning_level: 'medium' } : {}),
       shell_type: 'unified_exec',
       visibility: 'list',
       supported_in_api: true,
@@ -60,14 +64,14 @@ export function geminiCatalog(payload: unknown, defaultModel: string) {
   };
 }
 
-export function geminiArgs(baseUrl: string, catalogPath: string, model: string) {
+export function providerArgs(baseUrl: string, catalogPath: string, model: string) {
   const config = {
     model_provider: 'cheapvibecode',
     model,
     model_catalog_json: catalogPath,
-    'model_providers.cheapvibecode.name': 'Gemini · cheapvibecode',
+    'model_providers.cheapvibecode.name': 'CheapVibeCode',
     'model_providers.cheapvibecode.base_url': baseUrl,
-    'model_providers.cheapvibecode.env_key': 'AHP_GEMINI_API_KEY',
+    'model_providers.cheapvibecode.env_key': 'AHP_CHEAPVIBECODE_API_KEY',
     'model_providers.cheapvibecode.wire_api': 'responses',
     'model_providers.cheapvibecode.requires_openai_auth': false,
   };
@@ -90,12 +94,12 @@ async function main() {
     signal: AbortSignal.timeout(20000),
   });
   if (!response.ok) throw new Error(`API провайдера: GET /models вернул HTTP ${response.status}`);
-  const model = provider.GEMINI_MODEL ?? 'gemini-3.8-flash';
-  const catalog = geminiCatalog(await response.json(), model);
+  const catalog = providerCatalog(await response.json(), provider.CHEAPVIBECODE_MODEL ?? provider.GEMINI_MODEL);
+  const model = catalog.models[0]!.slug;
   const catalogPath = resolve('.local/gemini-models.json');
   const tokenPath = resolve('.local/gemini-host-token');
-  const geminiHome = resolve('.local/gemini-codex');
-  await mkdir(geminiHome, { recursive: true });
+  const codexHome = resolve('.local/gemini-codex');
+  await mkdir(codexHome, { recursive: true });
   await writeFile(catalogPath, `${JSON.stringify(catalog, null, 2)}\n`);
   try { await writeFile(tokenPath, randomBytes(32).toString('hex'), { mode: 0o600, flag: 'wx' }); }
   catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error; }
@@ -105,16 +109,16 @@ async function main() {
   const env = {
     ...process.env,
     // Отдельное хранилище Codex: основной вход ChatGPT и его сессии сюда не попадают.
-    CODEX_HOME: geminiHome,
-    AHP_GEMINI_API_KEY: provider.API_KEY,
+    CODEX_HOME: codexHome,
+    AHP_CHEAPVIBECODE_API_KEY: provider.API_KEY,
     VSCODE_AGENT_HOST_CLAUDE_AGENT_ENABLED: 'false',
     VSCODE_AGENT_HOST_CODEX_AGENT_ENABLED: 'true',
-    VSCODE_AGENT_HOST_CODEX_APP_SERVER_ARGS: JSON.stringify(geminiArgs(base, catalogPath, model)),
+    VSCODE_AGENT_HOST_CODEX_APP_SERVER_ARGS: JSON.stringify(providerArgs(base, catalogPath, model)),
     ...(sdkRoot ? { VSCODE_AGENT_HOST_CODEX_SDK_ROOT: sdkRoot } : {}),
   };
   const cli = process.env.VSCODE_CLI ?? '/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code';
   const port = process.env.GEMINI_AHP_PORT ?? '8091';
-  console.log(`[gemini] ${url.host}: ${catalog.models.length} моделей, по умолчанию ${model}`);
+  console.log(`[cheapvibecode] ${url.host}: ${catalog.models.length} моделей, по умолчанию ${model}`);
   const log = process.argv[2] === '--log'
     ? await open('.local/gemini-host.log', constants.O_WRONLY | constants.O_CREAT | constants.O_APPEND | constants.O_NOFOLLOW, 0o600)
     : undefined;
@@ -149,7 +153,7 @@ async function main() {
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   main().catch(error => {
-    console.error(`[gemini] ${error instanceof Error ? error.message : String(error)}`);
+    console.error(`[cheapvibecode] ${error instanceof Error ? error.message : String(error)}`);
     process.exitCode = 1;
   });
 }

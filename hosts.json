@@ -3,6 +3,6 @@
   "agents": ["claude", "codex"],
   "hosts": [
     { "id": "local", "label": "Claude · cheapvibecode + Codex · ChatGPT", "url": "ws://127.0.0.1:8089", "tokenFile": ".local/host-token", "localFilesystem": true, "defaultModels": { "claude": "@provider=anthropic:opus" } },
-    { "id": "gemini", "label": "Gemini · cheapvibecode", "url": "ws://127.0.0.1:8091", "tokenFile": ".local/gemini-host-token", "localFilesystem": true }
+    { "id": "gemini", "label": "CheapVibeCode · Codex", "url": "ws://127.0.0.1:8091", "tokenFile": ".local/gemini-host-token", "localFilesystem": true }
   ]
 }

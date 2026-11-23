@@ -2,15 +2,14 @@ import type { UpdateCheck } from '../shared/protocol.js';
 import { agentPackages, compareVersions, resolveAgentSdk, stableVersion } from '../scripts/agent-sdks.mjs';
 import { installedAhpVersion, installVersion, latestVersion, type UpdateComponent, type UpdateVersions } from '../scripts/update-agents.mjs';
 import type { Hub } from './hub.js';
-import { canUpdateSdk, localInstance, restartLocalHost, runningSdks, type HostBuild, type LocalHost } from './local-hosts.js';
+import { canUpdateSdk, localInstance, restartLocalHost, runningSdks, type HostBuild, type HostInstance, type LocalHost } from './local-hosts.js';
 
 const agentNames = { codex: 'Codex', claude: 'Claude SDK' };
 type Agent = keyof typeof agentPackages;
-type Instance = NonNullable<Awaited<ReturnType<typeof localInstance>>>;
 
 interface HostState {
   host: LocalHost;
-  instance: Instance;
+  instance: HostInstance;
   build: HostBuild;
   active: number | undefined;
   versions: Record<Agent, string | null>;
@@ -60,6 +59,18 @@ export class ProjectUpdates {
 
   isRestarting(hostId: string): boolean { return this.restarting.has(hostId); }
 
+  async exclusive<T>(run: () => Promise<T>): Promise<T> {
+    if (this.applying) throw new Error('Обновление или перезапуск уже выполняется.');
+    this.applying = true;
+    try { return await run(); }
+    finally {
+      this.restarting.clear();
+      this.applying = false;
+    }
+  }
+
+  beginRestart(hostId: string): void { this.restarting.add(hostId); }
+
   private async inspect(host: LocalHost): Promise<HostState> {
     const instance = await localInstance(host);
     if (!instance) throw new Error(`Хост «${host.label}» должен быть запущен скриптом этого проекта через VS Code Stable.`);
@@ -84,7 +95,7 @@ export class ProjectUpdates {
 
     for (const state of states) {
       const { host, instance, build, versions } = state;
-      const label = host.id === 'gemini' ? 'Gemini' : 'Основной хост';
+      const label = host.id === 'gemini' ? 'CheapVibeCode' : 'Основной хост';
       const target: RestartTarget = { state, versions: {} };
       if (release.commit !== build.commit && compareVersions(release.version, build.version) >= 0) {
         target.build = release;
@@ -115,7 +126,7 @@ export class ProjectUpdates {
     return { preview: { changes, restartBlocked: blocked(restartBackend ? states : targets.map(target => target.state)) }, install, targets, restartBackend };
   }
 
-  private async ensureIdle(host: LocalHost, expected?: Instance): Promise<HostState> {
+  private async ensureIdle(host: LocalHost, expected?: HostInstance): Promise<HostState> {
     const state = await this.inspect(host);
     if (expected && state.instance.id !== expected.id) throw new Error(`Хост «${host.label}» изменился. Проверьте обновления заново.`);
     const reason = blocked([state]);
@@ -125,9 +136,7 @@ export class ProjectUpdates {
 
   async apply(plan: UpdatePlan): Promise<boolean> {
     if (!plan.preview.changes.length) throw new Error('Доступных обновлений нет.');
-    if (this.applying) throw new Error('Обновление уже выполняется.');
-    this.applying = true;
-    try {
+    return this.exclusive(async () => {
       const backendHosts = plan.restartBackend ? this.hosts.filter(host => this.hub.hostGeneration(host.id) !== undefined) : [];
       for (const target of plan.targets) await this.ensureIdle(target.state.host, target.state.instance);
       for (const host of backendHosts) await this.ensureIdle(host);
@@ -147,7 +156,7 @@ export class ProjectUpdates {
         await restartLocalHost(host, instance, build, () => {
           const generation = this.hub.hostGeneration(host.id);
           return generation !== undefined && generation !== previous;
-        });
+        }, () => this.ensureIdle(host, instance).then(() => undefined));
         const updated = await this.inspect(host);
         for (const agent of host.agents) {
           const expected = target.versions[agent];
@@ -163,9 +172,6 @@ export class ProjectUpdates {
         throw new Error('Новая версия клиента AHP не установлена. Проверьте обновления снова.');
       }
       return plan.restartBackend;
-    } finally {
-      this.restarting.clear();
-      this.applying = false;
-    }
+    });
   }
 }

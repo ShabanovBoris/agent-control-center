@@ -159,12 +159,26 @@ export async function installVersion(component, version) {
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   /** @type {UpdateComponent[]} */
   const components = ['codex', 'claude', 'ahp'];
-  await Promise.all(components.map(async component => {
+  const results = await Promise.allSettled(components.map(async component => {
     try {
       await installVersion(component, await latestVersion(component));
     } catch (error) {
       console.error(`[${component}] ${error instanceof Error ? error.message : String(error)}`);
-      process.exitCode = 1;
+      throw error;
     }
   }));
+  if (results.some(result => result.status === 'rejected')) {
+    process.exitCode = 1;
+    console.error('[updates] Не все компоненты обновлены. Службы не перезапускались.');
+  } else {
+    try {
+      const restartTimeout = Number(process.env.ACC_RESTART_TIMEOUT_MS ?? 600_000);
+      const timeout = Number.isSafeInteger(restartTimeout) && restartTimeout >= 30_000 && restartTimeout <= 1_800_000
+        ? restartTimeout + 30_000 : 1_830_000;
+      await run(process.execPath, ['--import', 'tsx', 'scripts/restart-services.ts'], { cwd: projectRoot, timeout });
+    } catch (error) {
+      process.exitCode = 1;
+      console.error(`[updates] Пакеты обновлены, но службы не перезапущены: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
 }
