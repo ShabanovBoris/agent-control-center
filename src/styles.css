@@ -494,7 +494,14 @@ a { color: var(--accent); }
 .subagent-name { font-weight: 600; font-size: 13px; }
 .subagent-type { font-size: 12px; color: var(--muted); }
 .subagent-label { font-size: 11px; color: var(--muted); }
-.subagent-content { margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--line); }
+.subagent-content {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+}
 
 .file-edits {
   min-width: 0;
@@ -573,13 +580,15 @@ a { color: var(--accent); }
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 12px;
 }
-.terminal-command {
+.terminal-head {
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
+  align-items: baseline;
   margin-bottom: 8px;
-  color: var(--muted);
 }
-.terminal-prompt { color: var(--muted); font-weight: 600; }
+.terminal-title { font-weight: 600; overflow-wrap: anywhere; }
+.terminal-exit { margin-inline-start: auto; font-size: 11px; color: var(--muted); }
 .terminal-content {
   margin: 0;
   padding: 0;
@@ -588,13 +597,8 @@ a { color: var(--accent); }
   color: var(--text);
 }
 .terminal-error { color: var(--error); }
-.terminal-exit {
-  margin-top: 8px;
-  padding-top: 8px;
-  border-top: 1px solid var(--line);
-  font-size: 11px;
-  color: var(--muted);
-}
+.terminal-long > summary { cursor: pointer; color: var(--muted); }
+.terminal-long[open] > summary { margin-bottom: 8px; }
 .exit-success { color: var(--running); }
 .exit-error { color: var(--error); }
 

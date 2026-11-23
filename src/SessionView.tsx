@@ -37,6 +37,7 @@ import { completedResponseText, layoutParts, type NonMarkdownPart } from './mark
 import { composerModelOf, readPreferredModel, savePreferredModel } from './model';
 import { SessionUsage } from './SessionUsage';
 import { describeError, store, useChannel } from './store';
+import type { SubagentNavigation } from './tool-results';
 import { ChatSourceMenu, ConfigPanel, FileEditDisplay, MarkdownMessage, MessageView, ReasoningBlock, ToolResultsDisplay } from './ui';
 import { attachmentLabel, MAX_ATTACHMENT_FILE_BYTES, readFileAttachment } from './ui/AttachmentUpload';
 import { EditMessageDialog } from './ui/EditMessageDialog';
@@ -71,6 +72,15 @@ export function SessionView(props: {
   const actionsId = useId();
   const actions = useRef<HTMLDivElement>(null);
   const chats = session.state?.chats ?? summary?.chats ?? [];
+  // Тот же фильтр, что у SessionChatTree: переходить из карточки подагента можно только в видимый чат.
+  const subagentNavigation = useMemo<SubagentNavigation>(() => ({
+    availableChats: new Set(
+      chats
+        .filter(chat => chat.interactivity !== ChatInteractivity.Hidden)
+        .map(chat => chat.resource),
+    ),
+    onOpenChat: props.onOpenChat,
+  }), [chats, props.onOpenChat]);
   const defaultChat = session.state?.defaultChat ?? summary?.defaultChat ?? chats.find(chat => chat.interactivity !== ChatInteractivity.Hidden)?.resource;
   const requestedChat = selectedChatUri && chats.find(chat => chat.resource === selectedChatUri);
   const chatRemoved = !!selectedChatUri && !!session.state && !requestedChat;
@@ -217,6 +227,7 @@ export function SessionView(props: {
               ? originChat?.title ? `Ответвление от «${originChat.title}»` : 'Боковой чат · ответвление от исходного чата'
               : undefined}
             onOpenSource={originChat ? () => props.onOpenChat(originChat.resource) : undefined}
+            subagentNavigation={subagentNavigation}
             onForked={props.onForked}
             revealTurnId={props.revealTurnId}
             revealSeq={props.revealSeq}
@@ -262,7 +273,7 @@ export function SessionView(props: {
   );
 }
 
-function Transcript({ chat, target, sessionUri, workingDirectory, commandsAvailable, canWrite, supportsFork, sourceLabel, onOpenSource, onForked, revealTurnId, revealSeq, onRevealMissing }: {
+function Transcript({ chat, target, sessionUri, workingDirectory, commandsAvailable, canWrite, supportsFork, sourceLabel, onOpenSource, subagentNavigation, onForked, revealTurnId, revealSeq, onRevealMissing }: {
   chat: ChatState;
   target: ChatTarget;
   sessionUri: string;
@@ -272,6 +283,7 @@ function Transcript({ chat, target, sessionUri, workingDirectory, commandsAvaila
   supportsFork: boolean;
   sourceLabel?: string;
   onOpenSource?(): void;
+  subagentNavigation?: SubagentNavigation;
   onForked(sessionUri: string): void;
   revealTurnId?: string;
   revealSeq?: number;
@@ -437,7 +449,7 @@ function Transcript({ chat, target, sessionUri, workingDirectory, commandsAvaila
               && completedResponseText(completed.state, completed.responseParts) !== undefined
               ? () => void fork(completed.id)
               : undefined}
-            forkPending={forkingTurn !== undefined}
+            forkPending={forkingTurn !== undefined} subagentNavigation={subagentNavigation}
             highlighted={turn.id === highlighted} />
         );
       })}
@@ -456,7 +468,7 @@ function Transcript({ chat, target, sessionUri, workingDirectory, commandsAvaila
   );
 }
 
-function TurnView({ turn, target, workingDirectory, changesetTemplate, active, commandsAvailable, onEdit, editBlockedReason, onFork, forkPending, highlighted }: {
+function TurnView({ turn, target, workingDirectory, changesetTemplate, active, commandsAvailable, onEdit, editBlockedReason, onFork, forkPending, subagentNavigation, highlighted }: {
   turn: Turn | ActiveTurn;
   target: ChatTarget;
   workingDirectory: string | undefined;
@@ -467,6 +479,7 @@ function TurnView({ turn, target, workingDirectory, changesetTemplate, active, c
   editBlockedReason?: string;
   onFork?(): void;
   forkPending: boolean;
+  subagentNavigation?: SubagentNavigation;
   highlighted: boolean;
 }) {
   const finished = 'state' in turn ? turn.state : undefined;
@@ -502,7 +515,7 @@ function TurnView({ turn, target, workingDirectory, changesetTemplate, active, c
       {layoutParts(turn.responseParts).map(item => (
         item.kind === 'markdown'
           ? <MarkdownMessage key={item.block.key} content={item.block.content} />
-          : <PartView key={partKey(item.part, item.index)} part={item.part} turnId={turn.id} target={target} active={active} commandsAvailable={commandsAvailable} />
+          : <PartView key={partKey(item.part, item.index)} part={item.part} turnId={turn.id} target={target} active={active} commandsAvailable={commandsAvailable} subagentNavigation={subagentNavigation} />
       ))}
       {(files.size > 0 || changesetUri) && (
         <FileEditDisplay files={files} hostId={target.hostId} workingDirectory={workingDirectory} changesetUri={changesetUri} />
@@ -542,12 +555,12 @@ function partKey(part: ResponsePart, index: number): string {
   return `${part.kind}:${index}`;
 }
 
-function PartView({ part, turnId, target, active, commandsAvailable }: { part: NonMarkdownPart; turnId: string; target: ChatTarget; active: boolean; commandsAvailable: boolean }) {
+function PartView({ part, turnId, target, active, commandsAvailable, subagentNavigation }: { part: NonMarkdownPart; turnId: string; target: ChatTarget; active: boolean; commandsAvailable: boolean; subagentNavigation?: SubagentNavigation }) {
   switch (part.kind) {
     case ResponsePartKind.Reasoning:
       return <ReasoningBlock content={part.content} />;
     case ResponsePartKind.ToolCall:
-      return <ToolCallCard call={part.toolCall} turnId={turnId} target={target} active={active} commandsAvailable={commandsAvailable} />;
+      return <ToolCallCard call={part.toolCall} turnId={turnId} target={target} active={active} commandsAvailable={commandsAvailable} subagentNavigation={subagentNavigation} />;
     case ResponsePartKind.InputRequest:
       return <InputRequestCard request={part.request} answered={part.response} target={target} active={active} commandsAvailable={commandsAvailable} />;
     case ResponsePartKind.Error:
@@ -569,7 +582,7 @@ const TOOL_STATUS_LABEL: Record<ToolCallStatus, string> = {
   [ToolCallStatus.Cancelled]: 'Отменён',
 };
 
-function ToolCallCard({ call, turnId, target, active, commandsAvailable }: { call: ToolCallState; turnId: string; target: ChatTarget; active: boolean; commandsAvailable: boolean }) {
+function ToolCallCard({ call, turnId, target, active, commandsAvailable, subagentNavigation }: { call: ToolCallState; turnId: string; target: ChatTarget; active: boolean; commandsAvailable: boolean; subagentNavigation?: SubagentNavigation }) {
   const pending = call.status === ToolCallStatus.PendingConfirmation;
   const failed = call.status === ToolCallStatus.Completed && !call.success;
   const description = call.status === ToolCallStatus.Completed
@@ -599,7 +612,7 @@ function ToolCallCard({ call, turnId, target, active, commandsAvailable }: { cal
           <div className="tool-details">
             {description && !showErrorDescription && <p className="tool-text">{description}</p>}
             {input && <div><span className="muted">Параметры</span><pre className="tool-input">{input}</pre></div>}
-            {resultContent.length > 0 && <div><span className="muted">Результат</span><ToolResultsDisplay content={resultContent} /></div>}
+            {resultContent.length > 0 && <div><span className="muted">Результат</span><ToolResultsDisplay content={resultContent} subagentNavigation={subagentNavigation} /></div>}
           </div>
         )}
       </details>
