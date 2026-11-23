@@ -41,6 +41,23 @@ export async function createPhoneAccess(configPath: string, buildDir: string) {
       files.set(`/assets/${entry.name}`, { content: await readFile(join(buildDir, 'assets', entry.name)), type });
     }
   }
+  // PWA: без service worker, manifest и иконок телефон не установит приложение и не получит push.
+  const pwaFiles = new Map([
+    ['/sw.js', 'text/javascript; charset=utf-8'],
+    ['/manifest.webmanifest', 'application/manifest+json; charset=utf-8'],
+    ['/icons/icon-192.png', 'image/png'],
+    ['/icons/icon-512.png', 'image/png'],
+    ['/icons/apple-touch-icon.png', 'image/png'],
+  ]);
+  for (const [route, type] of pwaFiles) {
+    try {
+      files.set(route, { content: await readFile(join(buildDir, route)), type });
+    } catch (error) {
+      // Старый dist не должен отключать доступ с телефона целиком; предупреждаем и пропускаем.
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      console.warn(`[acc] В dist нет ${route}: PWA может не установиться. Пересоберите панель.`);
+    }
+  }
 
   // Этот listener доступен только на 127.0.0.1. Serve подставляет сведения о пользователе
   // сам, предварительно удаляя одноимённые заголовки с входящего запроса.

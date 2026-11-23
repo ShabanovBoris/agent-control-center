@@ -17,7 +17,13 @@ test('парсер клиента проверяет обязательные п
   const valid: ClientMessage[] = [
     { t: 'watch', hostId, uri },
     { t: 'unwatch', hostId, uri },
+    { t: 'presence', visible: true, selection: { hostId, sessionUri: uri } },
+    { t: 'presence', visible: false },
     { t: 'call', id: 1, call: { op: 'fetchTurns', hostId, chatUri: 'ahp-chat:/test', cursor: 'opaque/+=' } },
+    { t: 'call', id: 2, call: { op: 'pushConfig' } },
+    { t: 'call', id: 3, call: { op: 'pushSubscribe', origin: 'https://mac.ts.net', subscription: { endpoint: 'https://push.example/e', keys: { p256dh: 'a', auth: 'b' } } } },
+    { t: 'call', id: 4, call: { op: 'pushUnsubscribe', endpoint: 'https://push.example/e' } },
+    { t: 'call', id: 5, call: { op: 'pushTest', origin: 'https://mac.ts.net' } },
     { t: 'cancelDirectoryPicker' },
   ];
   for (const message of valid) assert.deepEqual(parseClientMessage(JSON.stringify(message)), message);
@@ -27,6 +33,11 @@ test('парсер клиента проверяет обязательные п
     { t: 'unwatch', hostId: 42, uri },
     { t: 'call', call: { op: 'reconnectHost', hostId } },
     { t: 'call', id: 1, call: null },
+    { t: 'presence', visible: 'yes' },
+    { t: 'presence' },
+    { t: 'presence', visible: true, selection: { hostId } },
+    { t: 'presence', visible: true, selection: { hostId: 42, sessionUri: uri } },
+    { t: 'presence', visible: true, selection: 'x' },
   ]) {
     const raw = JSON.stringify(message);
     assert.equal(parseClientMessage(raw), undefined, raw);

@@ -1,38 +1,23 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import type { ChatInputRequest } from '@microsoft/agent-host-protocol';
-import { inputOutcome, selectionFromHash, selectionToHash } from './format.js';
+import { SessionStatus, type ChatInputRequest } from '@microsoft/agent-host-protocol';
+import { inputOutcome, isArchived, phaseOf } from './format.js';
 
-test('ссылка на сессию восстанавливает обе части адреса', () => {
-  assert.deepEqual(selectionFromHash('#a|b'), { hostId: 'a', sessionUri: 'b' });
-  assert.deepEqual(selectionFromHash('#host%20id|ahp-session%3A%2Fa%7Cb'), {
-    hostId: 'host id',
-    sessionUri: 'ahp-session:/a|b',
-  });
+test('фаза сессии определяется по битам активности и игнорирует флаги прочтения и архива', () => {
+  assert.equal(phaseOf(SessionStatus.Idle), 'idle');
+  assert.equal(phaseOf(SessionStatus.Error), 'error');
+  assert.equal(phaseOf(SessionStatus.InProgress), 'running');
+  assert.equal(phaseOf(SessionStatus.InputNeeded), 'input');
+  assert.equal(phaseOf(SessionStatus.Idle | SessionStatus.IsRead | SessionStatus.IsArchived), 'idle');
+  assert.equal(phaseOf(SessionStatus.Error | SessionStatus.IsRead | SessionStatus.IsArchived), 'error');
+  assert.equal(phaseOf(SessionStatus.InProgress | SessionStatus.IsRead | SessionStatus.IsArchived), 'running');
+  assert.equal(phaseOf(SessionStatus.InputNeeded | SessionStatus.IsArchived), 'input');
 });
 
-test('ссылка с закодированным разделителем сохраняет адрес сессии и значения с вертикальной чертой', () => {
-  assert.deepEqual(selectionFromHash('#local%7Cahp-session%3A%2Fsession'), {
-    hostId: 'local',
-    sessionUri: 'ahp-session:/session',
-  });
-  assert.deepEqual(selectionFromHash('#host%7Cdev%7cahp-session%3a%2Fa%7Cb'), {
-    hostId: 'host|dev',
-    sessionUri: 'ahp-session:/a|b',
-  });
-  assert.equal(selectionFromHash('#local%7Cahp-session%3A%2F%ZZ'), null);
-});
-
-test('пустая, неполная или повреждённая ссылка не выбирает сессию', () => {
-  for (const hash of ['', '#', '#host', '#|uri', '#host|', '#host|%E0%A4%A', '#%ZZ|uri']) {
-    assert.equal(selectionFromHash(hash), null, hash);
-  }
-});
-
-test('ссылка восстанавливает вложенный чат вместе с его сессией', () => {
-  const expected = { hostId: 'local', sessionUri: 'ahp-session:/session', chatUri: 'ahp-chat:/child' };
-  assert.deepEqual(selectionFromHash('#local|ahp-session%3A%2Fsession|ahp-chat%3A%2Fchild'), expected);
-  assert.deepEqual(selectionFromHash('#local%7Cahp-session%3A%2Fsession%7Cahp-chat%3A%2Fchild'), expected);
+test('архивный флаг проверяется отдельно от фазы', () => {
+  assert.equal(isArchived(SessionStatus.Idle), false);
+  assert.equal(isArchived(SessionStatus.Idle | SessionStatus.IsRead), false);
+  assert.equal(isArchived(SessionStatus.Idle | SessionStatus.IsArchived), true);
 });
 
 // Форма запроса снята с настоящего хоста: так Claude задаёт вопрос через AskUserQuestion.
@@ -93,17 +78,4 @@ test('запрос без вопросов (только сообщение ил
 test('неизвестный идентификатор варианта показывается как есть', () => {
   const request = { ...colorRequest, answers: { Color: { state: 'submitted', value: { kind: 'selected', value: 'green-id' } } } };
   assert.equal(outcome(request, 'accept'), 'Color: green-id');
-});
-
-
-test('ход в адресе переживает перезагрузку и не ломает старые ссылки', () => {
-  const selection = { hostId: 'local', sessionUri: 'ahp-session:/session', chatUri: 'ahp-chat:/child', turnId: 'turn|1' };
-  const hash = selectionToHash(selection);
-  assert.equal(hash, '#local|ahp-session%3A%2Fsession|ahp-chat%3A%2Fchild|turn%7C1');
-  assert.deepEqual(selectionFromHash(hash), selection);
-  assert.deepEqual(selectionFromHash('#local|ahp-session%3A%2Fsession'), { hostId: 'local', sessionUri: 'ahp-session:/session' });
-  assert.deepEqual(selectionFromHash('#local|ahp-session%3A%2Fsession|ahp-chat%3A%2Fchild|'), { hostId: 'local', sessionUri: 'ahp-session:/session', chatUri: 'ahp-chat:/child' });
-  assert.deepEqual(selectionFromHash('#local|ahp-session%3A%2Fsession||turn'), { hostId: 'local', sessionUri: 'ahp-session:/session' }, 'ход без чата игнорируется');
-  assert.equal(selectionFromHash('#local|ahp-session%3A%2Fsession|ahp-chat%3A%2Fchild|%ZZ'), null);
-  assert.equal(selectionToHash(null), '');
 });

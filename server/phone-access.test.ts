@@ -23,9 +23,15 @@ test('страница, ресурсы и WebSocket требуют учётну�
   const origin = 'https://mac.personal.ts.net';
   const login = 'owner@example.com';
   await mkdir(join(dir, 'assets'));
+  await mkdir(join(dir, 'icons'));
   await writeFile(configPath, JSON.stringify({ origin, login }));
   await writeFile(join(dir, 'index.html'), 'Test page');
   await writeFile(join(dir, 'assets', 'app.js'), 'export {};');
+  await writeFile(join(dir, 'sw.js'), 'self.addEventListener("install", () => {});');
+  await writeFile(join(dir, 'manifest.webmanifest'), '{"name":"Test"}');
+  for (const icon of ['icon-192.png', 'icon-512.png', 'apple-touch-icon.png']) {
+    await writeFile(join(dir, 'icons', icon), `not really ${icon}`);
+  }
   const phone = await createPhoneAccess(configPath, dir);
   assert.ok(phone);
 
@@ -49,24 +55,40 @@ test('страница, ресурсы и WebSocket требуют учётну�
   assert.ok(address && typeof address !== 'string');
   const { port } = address;
   function read(path: string, headers: IncomingHttpHeaders) {
-    return new Promise<{ status?: number; body: string }>((resolve, reject) => {
+    return new Promise<{ status?: number; body: string; type?: string }>((resolve, reject) => {
       get({ hostname: '127.0.0.1', port, path, headers }, response => {
         response.setEncoding('utf8');
         let body = '';
         response.on('data', (chunk: string) => { body += chunk; });
-        response.on('end', () => resolve({ status: response.statusCode, body }));
+        response.on('end', () => resolve({ status: response.statusCode, body, type: response.headers['content-type'] }));
         response.on('error', reject);
       }).on('error', reject);
     });
   }
   for (const headers of invalid) {
     assert.equal((await read('/', headers)).status, 403);
+    assert.equal((await read('/sw.js', headers)).status, 403, 'service worker закрыт так же, как страница');
     assert.equal(phone.isTrustedUpgrade({ headers: { ...headers, origin } }), false);
   }
-  assert.deepEqual(await read('/', trusted), { status: 200, body: 'Test page' });
-  assert.deepEqual(await read('/assets/app.js', trusted), { status: 200, body: 'export {};' });
+  assert.deepEqual(await read('/', trusted), { status: 200, body: 'Test page', type: 'text/html; charset=utf-8' });
+  assert.deepEqual(await read('/assets/app.js', trusted), {
+    status: 200, body: 'export {};', type: 'text/javascript; charset=utf-8',
+  });
+  assert.deepEqual(await read('/sw.js', trusted), {
+    status: 200, body: 'self.addEventListener("install", () => {});', type: 'text/javascript; charset=utf-8',
+  });
+  assert.deepEqual(await read('/manifest.webmanifest', trusted), {
+    status: 200, body: '{"name":"Test"}', type: 'application/manifest+json; charset=utf-8',
+  });
+  for (const icon of ['icon-192.png', 'icon-512.png', 'apple-touch-icon.png']) {
+    assert.deepEqual(await read(`/icons/${icon}`, trusted), {
+      status: 200, body: `not really ${icon}`, type: 'image/png',
+    }, icon);
+  }
   assert.equal((await read('/phone-access.json', trusted)).status, 404);
+  assert.equal((await read('/package.json', trusted)).status, 404);
   assert.equal((await read('/assets/../phone-access.json', trusted)).status, 404);
+  assert.equal((await read('/icons/../package.json', trusted)).status, 404);
   assert.equal(phone.isTrustedUpgrade({ headers: trusted }), false);
   assert.equal(phone.isTrustedUpgrade({ headers: { ...trusted, origin: 'https://another.example.com' } }), false);
   assert.equal(phone.isTrustedUpgrade({ headers: { ...trusted, origin } }), true);

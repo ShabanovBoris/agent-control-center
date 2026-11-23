@@ -111,8 +111,10 @@ a { color: var(--accent); }
 }
 
 .brand { display: flex; flex-direction: column; gap: 6px; }
-.brand-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.brand-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+.brand-actions { display: flex; gap: 4px; }
 .updates-button { min-height: 30px; padding: 4px 8px; font-size: 12px; }
+.notifications-dialog { max-height: 85dvh; overflow-y: auto; }
 .update-changes { padding-inline-start: 20px; margin-block: 0 12px; }
 .update-changes li + li { margin-top: 6px; }
 

@@ -2,6 +2,20 @@
 
 React, TypeScript, Vite, Node.js 22+, `ws` и официальный TypeScript SDK `@microsoft/agent-host-protocol`. В [package.json](../package.json) объявлен `^1.1.0`, в [lockfile](../package-lock.json) закреплён `1.1.0`.
 
+Web Push отправляет backend через `web-push@4.0.0` (ESM, типы `@types/web-push`). Слои:
+[server/push.ts](../server/push.ts) — VAPID, подписки, доставка и prune;
+[server/push-transitions.ts](../server/push-transitions.ts) — переходы по `Overview` без подписки на чаты;
+[server/presence.ts](../server/presence.ts) — подавление push на origin, где сессия видима;
+[server/index.ts](../server/index.ts) перехватывает `HubSink.broadcast` и передаёт сводку наблюдателю.
+Общие чистые функции вынесены в [shared/routing.ts](../shared/routing.ts) и
+[shared/status.ts](../shared/status.ts), их же использует [public/sw.js](../public/sw.js) через готовый
+`url` в payload. Service worker статический, без Vite-входа и без кешей; PWA-ассеты отдаёт
+[server/phone-access.ts](../server/phone-access.ts) по allowlist. VAPID-ключи и подписки лежат в
+`.local/push-vapid.json` и `.local/push-subscriptions.json` с правами 0600 (temp + rename), в Git и
+браузер не попадают. Проверка: `npm test` (174), `npm run typecheck`, `npm run build`,
+`node --check public/sw.js`. Ограничения: iOS только PWA с домашнего экрана (16.4+), Mac должен
+бодрствовать, offline-режима нет.
+
 | Команда | Назначение |
 | --- | --- |
 | `npm run host` | `code agent host` на `127.0.0.1:8089` для Claude и Codex |

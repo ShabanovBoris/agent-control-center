@@ -66,7 +66,15 @@ export interface UpdateCheck {
   restartBlocked?: string;
 }
 
-export type Call = HostCall | { op: 'checkUpdates' } | { op: 'applyUpdates' } | { op: 'restartServices' } | { op: 'searchHistory'; query: string; limit?: number };
+export type Call = HostCall
+  | { op: 'checkUpdates' }
+  | { op: 'applyUpdates' }
+  | { op: 'restartServices' }
+  | { op: 'searchHistory'; query: string; limit?: number }
+  | { op: 'pushConfig' }
+  | { op: 'pushSubscribe'; origin: string; subscription: PushSubscriptionPayload }
+  | { op: 'pushUnsubscribe'; endpoint: string }
+  | { op: 'pushTest'; origin: string };
 
 /** Поле хода, по которому нашлось совпадение. */
 export type TurnFieldKind = 'message' | 'response' | 'reasoning' | 'notification' | 'error';
@@ -108,6 +116,16 @@ export interface SearchHistoryResult {
   issues: SearchIssue[];
 }
 
+/** Подмножество PushSubscriptionJSON, которое нужно backend; ключи проверяются на его стороне. */
+export interface PushSubscriptionPayload {
+  endpoint: string;
+  expirationTime?: number | null;
+  keys: { p256dh: string; auth: string };
+}
+
+export interface PushConfigResult { publicKey: string }
+
+export interface PushTestResult { delivered: number }
 
 export type EditMessageResult =
   | { status: 'sent' }
@@ -139,6 +157,7 @@ export type ClientMessage =
   | { t: 'cancelSearch'; id: number }
   | { t: 'watch'; hostId: string; uri: string }
   | { t: 'unwatch'; hostId: string; uri: string }
+  | { t: 'presence'; visible: boolean; selection?: { hostId: string; sessionUri: string } }
   | { t: 'call'; id: number; call: Call };
 
 export interface CallError {
@@ -194,6 +213,13 @@ export function parseClientMessage(raw: string): ClientMessage | undefined {
     case 'unwatch':
       if (!hasChannelAddress(message)) return undefined;
       break;
+    case 'presence': {
+      const { visible, selection } = message;
+      if (typeof visible !== 'boolean') return undefined;
+      if (selection !== undefined && (!isRecord(selection)
+        || typeof selection.hostId !== 'string' || typeof selection.sessionUri !== 'string')) return undefined;
+      break;
+    }
     case 'call': {
       const { id, call } = message;
       if (typeof id !== 'number' || !Number.isFinite(id) || !isRecord(call) || typeof call.op !== 'string') return undefined;
