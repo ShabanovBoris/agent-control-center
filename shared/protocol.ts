@@ -74,7 +74,9 @@ export type Call = HostCall
   | { op: 'pushConfig' }
   | { op: 'pushSubscribe'; origin: string; subscription: PushSubscriptionPayload }
   | { op: 'pushUnsubscribe'; endpoint: string }
-  | { op: 'pushTest'; origin: string };
+  | { op: 'pushTest'; origin: string }
+  | { op: 'health' }
+  | { op: 'readLog'; hostId: string };
 
 /** Поле хода, по которому нашлось совпадение. */
 export type TurnFieldKind = 'message' | 'response' | 'reasoning' | 'notification' | 'error';
@@ -126,6 +128,59 @@ export interface PushSubscriptionPayload {
 export interface PushConfigResult { publicKey: string }
 
 export interface PushTestResult { delivered: number }
+
+/** Диагностика одного хоста: снимок версий и ограниченная история ошибок подключения. */
+export interface HostIssue {
+  /** ISO, время последнего повтора. */
+  at: string;
+  /** Уже без токенов и ключей. */
+  message: string;
+  /** Сколько раз ошибка повторилась подряд. */
+  count: number;
+}
+
+export interface BackendHealth {
+  /** Версия панели из package.json. */
+  version: string;
+  ahpVersion: string;
+  startedAt: string;
+  phoneAccess: boolean;
+}
+
+export type SdkVersions = Partial<Record<'codex' | 'claude', string | null>>;
+
+export interface HostHealth {
+  id: string;
+  label: string;
+  status: HostStatus;
+  error?: string;
+  protocolVersion?: string;
+  hostBuild?: { version: string; commit: string };
+  lastConnectedAt?: string;
+  lastEventAt?: string;
+  activeSessions?: number;
+  /** Версии SDK агентов на запущенном хосте; `null` — SDK не найден. */
+  sdkVersions?: SdkVersions;
+  /** Причина, по которой версии SDK прочитать не удалось. */
+  sdkError?: string;
+  /** С момента запуска backend: история живёт в памяти и сбрасывается рестартом. */
+  recentErrors: HostIssue[];
+  /** Только для локальных хостов проекта, имя файла без абсолютного пути. */
+  logFile?: string;
+}
+
+export interface HealthSnapshot {
+  backend: BackendHealth;
+  hosts: HostHealth[];
+}
+
+/**
+ * Хвост журнала: отсутствие файла и запрет чтения — состояние, а не ошибка транспорта,
+ * поэтому UI показывает их подсказкой.
+ */
+export type LogTail =
+  | { status: 'ok'; hostId: string; fileName: string; lines: string[]; truncated: boolean; updatedAt?: string }
+  | { status: 'missing' | 'unavailable'; hostId: string; fileName: string; message: string };
 
 export type EditMessageResult =
   | { status: 'sent' }

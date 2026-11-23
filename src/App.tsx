@@ -2,7 +2,8 @@ import { useEffect, useId, useMemo, useRef, useState, type FormEvent } from 'rea
 import { ChatInteractivity, ChatOriginKind, type SessionChatSummary, type SessionState } from '@microsoft/agent-host-protocol';
 import type { AgentOverview, HostOverview, SessionOverview, UpdateCheck } from '../shared/protocol';
 import { channelKey } from '../shared/reduce';
-import { PHASE_LABEL, ellipsize, isArchived, pathOf, phaseOf, selectionFromHash, selectionToHash, timeAgo, type Phase, type Selection } from './format';
+import { HOST_STATUS_LABEL, PHASE_LABEL, ellipsize, isArchived, pathOf, phaseOf, selectionFromHash, selectionToHash, timeAgo, type Phase, type Selection } from './format';
+import { HealthView } from './HealthView';
 import { CommandPalette } from './ui/CommandPalette';
 import { SessionView } from './SessionView';
 import { describeError, store, useAppState, usePresence } from './store';
@@ -11,31 +12,33 @@ import { recentDirectories, rememberDirectory } from './recent-directories';
 
 type Filter = 'all' | 'active' | 'input' | 'archived';
 
-const HOST_STATUS_LABEL: Record<HostOverview['status'], string> = {
-  connected: 'Подключён',
-  connecting: 'Подключение…',
-  reconnecting: 'Переподключение…',
-  disconnected: 'Отключён',
-  failed: 'Недоступен',
-};
 
 export function App() {
   const { connection, overview, channels, notices } = useAppState();
   const backendConnected = connection === 'open';
   const [selection, setSelection] = useState(() => selectionFromHash(location.hash));
   const [creating, setCreating] = useState(false);
+  const [showHealth, setShowHealth] = useState(() => location.hash === '#health');
   const [showSessionList, setShowSessionList] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [revealSeq, setRevealSeq] = useState(0);
-  const hasDetail = creating || selection !== null;
+  const hasDetail = creating || selection !== null || showHealth;
   useEffect(() => {
-    history.replaceState(null, '', `${location.pathname}${location.search}${selectionToHash(selection)}`);
-  }, [selection]);
+    const hash = showHealth ? '#health' : selectionToHash(selection);
+    history.replaceState(null, '', `${location.pathname}${location.search}${hash}`);
+  }, [selection, showHealth]);
   // Клик по push-уведомлению в уже открытой вкладке меняет только hash.
   useEffect(() => {
     const onHashChange = () => {
+      if (location.hash === '#health') {
+        setShowHealth(true);
+        setCreating(false);
+        setShowSessionList(false);
+        return;
+      }
       const next = selectionFromHash(location.hash);
       setSelection(next);
+      setShowHealth(false);
       if (next) {
         setCreating(false);
         setShowSessionList(false);
@@ -61,6 +64,7 @@ export function App() {
 
   const navigate = (next: Selection) => {
     setCreating(false);
+    setShowHealth(false);
     setSelection(next);
     setRevealSeq(value => value + 1);
     setShowSessionList(false);
@@ -99,6 +103,12 @@ export function App() {
           <div className="brand-heading">
             <h1>Agent Control Center</h1>
             <div className="brand-actions">
+              <button
+                type="button"
+                className="updates-button"
+                aria-pressed={showHealth}
+                onClick={() => { setShowHealth(true); setShowSessionList(false); }}
+              >Диагностика</button>
               <NotificationsButton connected={backendConnected} />
               <UpdatesButton connected={backendConnected} />
             </div>
@@ -119,9 +129,9 @@ export function App() {
           <button type="button" className="search-button" aria-keyshortcuts="Meta+K Control+K" title="Поиск по сессиям и истории" onClick={() => setPaletteOpen(true)}>
             Поиск <span className="palette-kbd">{navigator.userAgent.includes('Mac') ? '⌘K' : 'Ctrl K'}</span>
           </button>
-          <button className="primary" onClick={() => { setCreating(true); setShowSessionList(false); }}>Новая сессия</button>
+          <button className="primary" onClick={() => { setCreating(true); setShowHealth(false); setShowSessionList(false); }}>Новая сессия</button>
           {hasDetail && showSessionList && (
-            <button className="mobile-return" onClick={() => setShowSessionList(false)}>{creating ? 'К форме' : 'К открытому чату'}</button>
+            <button className="mobile-return" onClick={() => setShowSessionList(false)}>{creating ? 'К форме' : showHealth ? 'К диагностике' : 'К открытому чату'}</button>
           )}
         </div>
 
@@ -140,9 +150,10 @@ export function App() {
                 catalog={live?.chats ?? summary.chats}
                 defaultChat={live?.defaultChat ?? summary.defaultChat}
                 connected={backendConnected && overview.hosts.some(host => host.id === hostId && host.status === 'connected')}
-                selected={!creating && selection?.hostId === hostId && selection.sessionUri === sessionUri ? selection : null}
+                selected={!creating && !showHealth && selection?.hostId === hostId && selection.sessionUri === sessionUri ? selection : null}
                 onSelect={chatUri => {
                   setCreating(false);
+                  setShowHealth(false);
                   setSelection({ hostId, sessionUri, ...(chatUri ? { chatUri } : {}) });
                   setShowSessionList(false);
                 }}
@@ -155,7 +166,9 @@ export function App() {
       </aside>
 
       <main className="detail">
-        {creating ? (
+        {showHealth ? (
+          <HealthView onClose={() => { setShowHealth(false); setShowSessionList(true); }} />
+        ) : creating ? (
           <>
             <button className="mobile-back mobile-form-back" aria-controls="sidebar" onClick={() => setShowSessionList(true)}>‹ Сессии</button>
             <NewSession

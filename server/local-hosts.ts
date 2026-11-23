@@ -7,6 +7,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { promisify } from 'node:util';
 import { agentPackages, defaultServerData, managedCache, platform, projectRoot, stableVersion } from '../scripts/agent-sdks.mjs';
 import type { HostEntry } from './config.js';
+import type { HostBuild } from './host-build.js';
 
 type Agent = keyof typeof agentPackages;
 type AgentRoots = Partial<Record<Agent, string>>;
@@ -34,8 +35,6 @@ export interface HostInstance {
   roots: AgentRoots;
   env: NodeJS.ProcessEnv;
 }
-
-export interface HostBuild { version: string; commit: string }
 
 export function localHosts(entries: HostEntry[]): LocalHost[] {
   if (process.platform !== 'darwin') return [];

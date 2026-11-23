@@ -11,8 +11,10 @@ import { installedAhpVersion } from '../scripts/update-agents.mjs';
 import { FileClientIdStore, loadConfig, toHostConfig } from './config.js';
 import { CallFailure, Hub, toCallError } from './hub.js';
 import { DirectoryPicker } from './directory-picker.js';
+import { collectHealth, readAppVersion, type SdkVersionInspector } from './health.js';
+import { localLogSources, readLogTail } from './logs.js';
 import { createPhoneAccess, PHONE_ACCESS_PORT } from './phone-access.js';
-import { localHosts } from './local-hosts.js';
+import { localHosts, localInstance, runningSdks } from './local-hosts.js';
 import { visibleOrigins } from './presence.js';
 import { createPushService } from './push.js';
 import { ProjectUpdates, type UpdatePlan } from './updates.js';
@@ -45,9 +47,26 @@ const config = await loadConfig(process.env.ACC_CONFIG ?? 'hosts.json', {
   ...(portOverride !== undefined ? { port: portOverride } : {}),
   ...(mockHostUrl ? { hostUrls: { mock: mockHostUrl } } : {}),
 });
+const locals = localHosts(config.hosts);
+const ahpVersion = await installedAhpVersion();
+const appVersion = await readAppVersion();
+const backendStartedAt = Date.now();
+const logSources = localLogSources(locals);
 const phone = process.env.ACC_PHONE_ACCESS === '0' ? undefined : await createPhoneAccess('.local/phone-access.json', 'dist').catch((error: unknown) => {
   console.error('[acc] Доступ с телефона отключён.', error);
 });
+
+/** Версии SDK читаются у запущенного экземпляра; отсутствие экземпляра — не ошибка страницы. */
+const sdkVersions: SdkVersionInspector = async (hostId, build) => {
+  const host = locals.find(candidate => candidate.id === hostId);
+  if (!host || !build) return undefined;
+  const instance = await localInstance(host).catch((error: unknown) => {
+    // Хост ещё не запускали скриптами проекта: файла реестра или токена нет.
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    throw error;
+  });
+  return instance ? runningSdks(host, instance, build) : undefined;
+};
 
 interface Browser {
   socket: WebSocket;
@@ -92,12 +111,12 @@ const hub = new Hub(new MultiHostClient({ clientIdStore: new FileClientIdStore('
     }
   },
 }, config.agents, new DirectoryPicker(config.hosts.filter(host => host.localFilesystem).map(host => host.id)), defaultModels);
-const updates = new ProjectUpdates(localHosts(config.hosts), hub, await installedAhpVersion());
+const updates = new ProjectUpdates(locals, hub, ahpVersion);
 let backendRestarting = false;
 
 function restartAllServices(): Promise<void> {
   return restartServices({
-    hosts: localHosts(config.hosts), hub, updates, restartBackend: startReplacementBackend,
+    hosts: locals, hub, updates, restartBackend: startReplacementBackend,
   });
 }
 
@@ -240,6 +259,26 @@ async function onMessage(browser: Browser, message: ClientMessage): Promise<void
           || call.op === 'pushUnsubscribe' || call.op === 'pushTest') {
           const data = await handlePushCall(browser, call);
           send(browser, { t: 'result', id: message.id, ok: true, ...(data !== undefined ? { data } : {}) });
+          return;
+        }
+        if (call.op === 'health') {
+          send(browser, {
+            t: 'result', id: message.id, ok: true,
+            data: await collectHealth({
+              hosts: hub.overview().hosts,
+              diagnostics: hub.hostDiagnostics(),
+              logs: logSources,
+              backend: { version: appVersion, ahpVersion, startedAt: backendStartedAt, phoneAccess: phone !== undefined },
+              sdkVersions,
+            }),
+          });
+          return;
+        }
+        if (call.op === 'readLog') {
+          if (typeof call.hostId !== 'string') throw new CallFailure('Не указан хост для чтения журнала.');
+          const source = logSources.find(candidate => candidate.hostId === call.hostId);
+          if (!source) throw new CallFailure('Журнал доступен только для локальных хостов проекта.');
+          send(browser, { t: 'result', id: message.id, ok: true, data: await readLogTail(source) });
           return;
         }
         if ('hostId' in call && updates.isRestarting(call.hostId) && (

@@ -26,6 +26,7 @@ function setup(models: SessionModelInfo[] = [model], request?: (method: string, 
   const targets: string[] = [];
   const requests: { method: string; params: unknown }[] = [];
   const events = new EventEmitter();
+  const hostEvents = new EventEmitter();
   const states = new Map<string, SessionState | ChatState>();
   const sessions: SessionOverview[] = [];
   const unsubscribed: string[] = [];
@@ -46,15 +47,16 @@ function setup(models: SessionModelInfo[] = [model], request?: (method: string, 
     async unsubscribe(_hostId: string, uri: string) { unsubscribed.push(uri); },
     hostsSnapshot: () => [host],
     aggregatedSessions: () => sessions,
-    async *hostEvents() {},
+    async *hostEvents() { for await (const [event] of on(hostEvents, 'hostEvent', { close: ['shutdown'] })) yield event; },
     async *events() { for await (const [event] of on(events, 'action', { close: ['shutdown'] })) yield event; },
-    async shutdown() { events.emit('shutdown'); },
+    async shutdown() { hostEvents.emit('shutdown'); events.emit('shutdown'); },
   } as unknown as MultiHostClient;
   const hub = new Hub(multi, { broadcast() {}, toWatchers() {} });
   const echo = (channel: string, action: StateAction, origin: ActionEnvelope['origin'], rejectionReason?: string) => {
     events.emit('action', { hostId: host.id, channel, event: { type: 'action', params: { channel, action, origin, serverSeq: ++serverSeq, rejectionReason } } });
   };
-  return { hub, actions, targets, requests, host, echo, states, sessions, unsubscribed };
+  const emitHostEvent = (event: unknown) => hostEvents.emit('hostEvent', event);
+  return { hub, actions, targets, requests, host, echo, emitHostEvent, states, sessions, unsubscribed };
 }
 
 const message = { op: 'sendMessage', hostId: 'h', chatUri: 'ahp-chat:/test', text: 'Task', modelId: model.id } as const;
@@ -436,4 +438,36 @@ test('одновременные запросы одной страницы не
     await Promise.all([fixture.hub.call(call), fixture.hub.call(call)]);
     assert.equal(fixture.requests.filter(request => request.method === 'fetchTurns').length, 1);
   } finally { await fixture.hub.stop(); }
+});
+
+test('диагностика хоста накапливает ограниченную историю ошибок подключения', async () => {
+  const { hub, emitHostEvent } = setup();
+  const token = 'ef'.repeat(32);
+  const failure = `connect ECONNREFUSED ws://localhost:8089?tkn=${token}`;
+  try {
+    await hub.start([]);
+    await setImmediate();
+    emitHostEvent({ type: 'connected', hostId: 'h', generation: 1 });
+    for (const status of ['reconnecting', 'failed']) {
+      emitHostEvent({ type: 'stateChanged', hostId: 'h', state: { status }, lastError: new Error(failure) });
+    }
+    await setImmediate();
+
+    const [diagnostics] = hub.hostDiagnostics();
+    assert.equal(diagnostics?.id, 'h');
+    assert.equal(diagnostics?.issues.length, 1);
+    assert.equal(diagnostics?.issues[0]?.count, 2);
+    assert.ok(diagnostics?.issues[0]?.message.includes('<redacted>'));
+    assert.ok(!diagnostics?.issues[0]?.message.includes(token));
+    assert.ok(diagnostics?.lastEventAt && !Number.isNaN(Date.parse(diagnostics.lastEventAt)));
+
+    emitHostEvent({ type: 'stateChanged', hostId: 'h', state: { status: 'failed' }, lastError: new Error('другая причина') });
+    await setImmediate();
+    assert.deepEqual(hub.hostDiagnostics()[0]?.issues.map(issue => issue.message), [
+      'connect ECONNREFUSED ws://localhost:8089?tkn=<redacted>',
+      'другая причина',
+    ]);
+  } finally {
+    await hub.stop();
+  }
 });
