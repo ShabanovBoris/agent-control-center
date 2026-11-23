@@ -13,6 +13,7 @@ import {
 } from '../shared/protocol';
 import { channelKey, reduceChannel } from '../shared/reduce';
 import { CallCancelled } from './errors';
+import type { Selection } from '../shared/routing';
 
 export type Connection = 'connecting' | 'open' | 'closed';
 
@@ -61,6 +62,9 @@ class Store {
   private readonly pending = new Map<number, { resolve(data: unknown): void; reject(error: Error): void; cleanup(): void }>();
   private socket: WebSocket | undefined;
   private nextId = 1;
+  // Backend подавляет push на том устройстве, где сессия уже на экране.
+  private presenceVisible = false;
+  private presenceSelection: { hostId: string; sessionUri: string } | undefined;
 
   constructor() {
     this.connect();
@@ -140,6 +144,26 @@ class Store {
     this.send({ t: 'cancelDirectoryPicker' });
   }
 
+  /** Сообщает backend, какая сессия открыта на этом устройстве; чат для подавления не важен. */
+  setPresence(selection: Pick<Selection, 'hostId' | 'sessionUri'> | null): void {
+    this.presenceSelection = selection ? { hostId: selection.hostId, sessionUri: selection.sessionUri } : undefined;
+    this.sendPresence();
+  }
+
+  setPresenceVisible(visible: boolean): void {
+    if (this.presenceVisible === visible) return;
+    this.presenceVisible = visible;
+    this.sendPresence();
+  }
+
+  private sendPresence(): void {
+    this.send({
+      t: 'presence',
+      visible: this.presenceVisible,
+      ...(this.presenceSelection ? { selection: this.presenceSelection } : {}),
+    });
+  }
+
   /** Выполняет команду и показывает ошибку уведомлением. Возвращает true при успехе. */
   async run(call: Call): Promise<boolean> {
     try {
@@ -169,6 +193,7 @@ class Store {
       this.update({ connection: 'open' });
       // Состояние каналов могло устареть за время обрыва — запрашиваем снимки заново.
       for (const { hostId, uri } of this.watches.values()) this.send({ t: 'watch', hostId, uri });
+      this.sendPresence();
     };
     socket.onmessage = event => {
       const message = parseServerMessage(String(event.data));
@@ -264,6 +289,21 @@ export function useAppState(): AppState {
 }
 
 const EMPTY_VIEW: ChannelView = {};
+
+/** Открытая сессия и видимость вкладки; backend использует их, чтобы не дублировать push. */
+export function usePresence(selection: Selection | null): void {
+  const hostId = selection?.hostId;
+  const sessionUri = selection?.sessionUri;
+  useEffect(() => {
+    store.setPresence(hostId && sessionUri ? { hostId, sessionUri } : null);
+  }, [hostId, sessionUri]);
+  useEffect(() => {
+    const update = () => store.setPresenceVisible(document.visibilityState === 'visible');
+    update();
+    document.addEventListener('visibilitychange', update);
+    return () => document.removeEventListener('visibilitychange', update);
+  }, []);
+}
 
 /** Состояние канала хоста; `uri === undefined` означает «пока не знаем, что смотреть». */
 export function useChannel<T extends ChannelState>(hostId: string, uri: string | undefined): { state?: T; error?: string; missing?: boolean } {

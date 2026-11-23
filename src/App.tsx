@@ -5,7 +5,8 @@ import { channelKey } from '../shared/reduce';
 import { PHASE_LABEL, ellipsize, isArchived, pathOf, phaseOf, selectionFromHash, selectionToHash, timeAgo, type Phase, type Selection } from './format';
 import { CommandPalette } from './ui/CommandPalette';
 import { SessionView } from './SessionView';
-import { describeError, store, useAppState } from './store';
+import { describeError, store, useAppState, usePresence } from './store';
+import { NotificationsButton } from './ui/NotificationsButton';
 import { recentDirectories, rememberDirectory } from './recent-directories';
 
 type Filter = 'all' | 'active' | 'input' | 'archived';
@@ -30,6 +31,20 @@ export function App() {
   useEffect(() => {
     history.replaceState(null, '', `${location.pathname}${location.search}${selectionToHash(selection)}`);
   }, [selection]);
+  // Клик по push-уведомлению в уже открытой вкладке меняет только hash.
+  useEffect(() => {
+    const onHashChange = () => {
+      const next = selectionFromHash(location.hash);
+      setSelection(next);
+      if (next) {
+        setCreating(false);
+        setShowSessionList(false);
+      }
+    };
+    window.addEventListener('hashchange', onHashChange);
+    return () => window.removeEventListener('hashchange', onHashChange);
+  }, []);
+  usePresence(selection);
   const [filter, setFilter] = useState<Filter>('all');
 
   useEffect(() => {
@@ -83,7 +98,10 @@ export function App() {
         <header className="brand">
           <div className="brand-heading">
             <h1>Agent Control Center</h1>
-            <UpdatesButton connected={backendConnected} />
+            <div className="brand-actions">
+              <NotificationsButton connected={backendConnected} />
+              <UpdatesButton connected={backendConnected} />
+            </div>
           </div>
           {connection !== 'open' && (
             <span className="badge badge-warn">{connection === 'connecting' ? 'Подключение к backend…' : 'Нет связи с backend'}</span>

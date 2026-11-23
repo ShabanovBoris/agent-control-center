@@ -8,13 +8,14 @@ import { channelKey } from '../shared/reduce.js';
 let socket: FakeSocket;
 class FakeSocket {
   static OPEN = 1;
+  static sent: string[] = [];
   readyState = 1;
   onopen?: () => void;
   onmessage?: (event: { data: string }) => void;
   onclose?: () => void;
   readonly sent: string[] = [];
   constructor(_url: string) { socket = this; }
-  send(message: string) { this.sent.push(String(message)); }
+  send(message: string) { this.sent.push(message); FakeSocket.sent.push(message); }
 }
 const runtime = globalThis as unknown as { WebSocket: unknown; location: unknown };
 const original = { WebSocket: runtime.WebSocket, location: runtime.location };
@@ -99,4 +100,26 @@ test('ошибка поиска приходит как CallRejected с кодо
   const call = JSON.parse(socket.sent.at(-1)!) as { id: number };
   receive({ t: 'result', id: call.id, ok: false, error: { message: 'Нужна авторизация', code: -32007 } });
   await assert.rejects(running, (error: unknown) => error instanceof CallRejected && error.detail.code === -32007);
+});
+
+test('presence сообщает открытую сессию и видимость, переживая переподключение', () => {
+  FakeSocket.sent.length = 0;
+  const sent = () => FakeSocket.sent.map(raw => JSON.parse(raw) as unknown);
+  store.setPresence({ hostId: 'one', sessionUri: 'ahp-session:/visible' });
+  assert.deepEqual(sent(), [{ t: 'presence', visible: false, selection: { hostId: 'one', sessionUri: 'ahp-session:/visible' } }]);
+
+  store.setPresenceVisible(true);
+  assert.deepEqual(sent().at(-1), { t: 'presence', visible: true, selection: { hostId: 'one', sessionUri: 'ahp-session:/visible' } });
+
+  store.setPresenceVisible(true);
+  assert.equal(FakeSocket.sent.length, 2, 'одинаковая видимость не отправляется повторно');
+
+  FakeSocket.sent.length = 0;
+  socket.onopen?.();
+  assert.deepEqual(sent().at(-1), {
+    t: 'presence', visible: true, selection: { hostId: 'one', sessionUri: 'ahp-session:/visible' },
+  }, 'после reconnect presence отправляется заново');
+
+  store.setPresence(null);
+  assert.deepEqual(sent().at(-1), { t: 'presence', visible: true });
 });

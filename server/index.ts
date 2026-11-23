@@ -5,14 +5,16 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { MultiHostClient } from '@microsoft/agent-host-protocol/hosts';
 import { WebSocketServer, type WebSocket } from 'ws';
-import { parseClientMessage, type ClientMessage, type ServerMessage } from '../shared/protocol.js';
+import { parseClientMessage, type Call, type ClientMessage, type ServerMessage } from '../shared/protocol.js';
 import { channelKey } from '../shared/reduce.js';
 import { installedAhpVersion } from '../scripts/update-agents.mjs';
 import { FileClientIdStore, loadConfig, toHostConfig } from './config.js';
-import { Hub, toCallError } from './hub.js';
+import { CallFailure, Hub, toCallError } from './hub.js';
 import { DirectoryPicker } from './directory-picker.js';
 import { createPhoneAccess, PHONE_ACCESS_PORT } from './phone-access.js';
 import { localHosts } from './local-hosts.js';
+import { visibleOrigins } from './presence.js';
+import { createPushService } from './push.js';
 import { ProjectUpdates, type UpdatePlan } from './updates.js';
 import { restartServices } from './restart-services.js';
 
@@ -49,6 +51,10 @@ const phone = process.env.ACC_PHONE_ACCESS === '0' ? undefined : await createPho
 
 interface Browser {
   socket: WebSocket;
+  origin: string;
+  /** Сессия на экране именно этого устройства; источник решения о подавлении push. */
+  visible: boolean;
+  selection?: { hostId: string; sessionUri: string };
   watching: Set<string>;
   abort: AbortController;
   pickerAbort?: AbortController;
@@ -59,6 +65,12 @@ interface Browser {
 const browsers = new Set<Browser>();
 const defaultModels = new Map(config.hosts.map(host => [host.id, host.defaultModels ?? {}]));
 
+const push = await createPushService({ dir: '.local' }).catch((error: unknown) => {
+  console.error('[acc] Push-уведомления отключены.', error instanceof Error ? error.message : String(error));
+  return undefined;
+});
+if (push) console.log(`[acc] Push-уведомления готовы, подписок: ${push.subscriptionCount}`);
+
 function send(browser: Browser, message: ServerMessage, onSent?: () => void): void {
   if (browser.socket.readyState === browser.socket.OPEN) browser.socket.send(JSON.stringify(message), onSent);
   else onSent?.();
@@ -67,6 +79,11 @@ function send(browser: Browser, message: ServerMessage, onSent?: () => void): vo
 const hub = new Hub(new MultiHostClient({ clientIdStore: new FileClientIdStore('.local/client-ids.json') }), {
   broadcast(message) {
     for (const browser of browsers) send(browser, message);
+    if (message.t === 'overview' && push) {
+      // Сбой push не должен ломать обновление сводки в браузерах.
+      void push.observe(message.overview, transition => visibleOrigins(browsers, transition.hostId, transition.sessionUri))
+        .catch(error => console.warn('[acc] Не удалось обработать push-переходы.', error instanceof Error ? error.message : String(error)));
+    }
   },
   toWatchers(hostId, uri, message) {
     const key = channelKey(hostId, uri);
@@ -128,15 +145,15 @@ function acceptBrowserConnections(listener: Server, isTrusted: (request: Incomin
       socket.end('HTTP/1.1 403 Forbidden\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
       return;
     }
-    sockets.handleUpgrade(request, socket, head, webSocket => onBrowser(webSocket));
+    sockets.handleUpgrade(request, socket, head, webSocket => onBrowser(webSocket, request.headers.origin ?? ''));
   });
 }
 
 acceptBrowserConnections(server, isTrustedUpgrade);
 if (phone) acceptBrowserConnections(phone.server, phone.isTrustedUpgrade);
 
-function onBrowser(socket: WebSocket): void {
-  const browser: Browser = { socket, watching: new Set(), abort: new AbortController() };
+function onBrowser(socket: WebSocket, origin: string): void {
+  const browser: Browser = { socket, origin, visible: false, watching: new Set(), abort: new AbortController() };
   browsers.add(browser);
   send(browser, { t: 'overview', overview: hub.overview() });
 
@@ -148,6 +165,7 @@ function onBrowser(socket: WebSocket): void {
     });
   });
   socket.on('close', () => {
+    browser.visible = false;
     browser.abort.abort();
     browsers.delete(browser);
     for (const key of browser.watching) {
@@ -164,6 +182,12 @@ async function onMessage(browser: Browser, message: ClientMessage): Promise<void
       return;
     case 'cancelSearch':
       if (browser.search?.id === message.id) browser.search.abort.abort();
+      return;
+    case 'presence':
+      browser.visible = message.visible;
+      browser.selection = message.selection
+        ? { hostId: message.selection.hostId, sessionUri: message.selection.sessionUri }
+        : undefined;
       return;
     case 'watch': {
       const { hostId, uri } = message;
@@ -211,6 +235,13 @@ async function onMessage(browser: Browser, message: ClientMessage): Promise<void
           send(browser, { t: 'result', id: message.id, ok: true, data: { restartBackend: true } }, () => void shutdown());
           return;
         }
+        // Push не зависит от перезапуска хоста: ключи и подписки живут в backend.
+        if (call.op === 'pushConfig' || call.op === 'pushSubscribe'
+          || call.op === 'pushUnsubscribe' || call.op === 'pushTest') {
+          const data = await handlePushCall(browser, call);
+          send(browser, { t: 'result', id: message.id, ok: true, ...(data !== undefined ? { data } : {}) });
+          return;
+        }
         if ('hostId' in call && updates.isRestarting(call.hostId) && (
           call.op === 'sendMessage' || call.op === 'createSession' || call.op === 'createChat'
           || call.op === 'forkSession' || call.op === 'editMessage' || call.op === 'retryEditedMessage'
@@ -241,6 +272,27 @@ async function onMessage(browser: Browser, message: ClientMessage): Promise<void
       }
       return;
     }
+  }
+}
+
+type PushCall = Extract<Call, { op: 'pushConfig' | 'pushSubscribe' | 'pushUnsubscribe' | 'pushTest' }>;
+
+/** Push-вызовы не относятся к хостам: обрабатываются до проверки перезапуска хоста. */
+async function handlePushCall(browser: Browser, call: PushCall): Promise<unknown> {
+  if (!push) throw new CallFailure('Push-уведомления не настроены на backend.');
+  switch (call.op) {
+    case 'pushConfig':
+      return { publicKey: push.publicKey };
+    case 'pushSubscribe':
+      if (call.origin !== browser.origin) throw new CallFailure('Подписка пришла с другого адреса.');
+      await push.subscribe({ origin: call.origin, subscription: call.subscription });
+      return undefined;
+    case 'pushUnsubscribe':
+      await push.unsubscribe(call.endpoint);
+      return undefined;
+    case 'pushTest':
+      if (call.origin !== browser.origin) throw new CallFailure('Проверка пришла с другого адреса.');
+      return push.test(call.origin);
   }
 }
 
