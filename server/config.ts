@@ -24,7 +24,18 @@ export interface AppConfig {
   hosts: HostEntry[];
 }
 
-export async function loadConfig(path: string): Promise<AppConfig> {
+/** Переопределения из env: параллельный dev/e2e backend не занимает production-адреса. */
+export interface ConfigOverrides {
+  /** Подменяет listen.port. */
+  port?: number;
+  /** Подменяет url хоста по его id. */
+  hostUrls?: Readonly<Record<string, string>>;
+}
+
+export async function loadConfig(path: string, overrides: ConfigOverrides = {}): Promise<AppConfig> {
+  if (overrides.port !== undefined && (!Number.isInteger(overrides.port) || overrides.port < 1 || overrides.port > 65535)) {
+    throw new Error(`${path}: listen.port должен быть целым числом 1..65535`);
+  }
   const raw: unknown = JSON.parse(await readFile(path, 'utf8'));
   const config = raw as Partial<AppConfig>;
   const listen = config.listen;
@@ -57,13 +68,28 @@ export async function loadConfig(path: string): Promise<AppConfig> {
     throw new Error(`${path}: agents должен быть списком строк`);
   }
   const baseDir = dirname(resolve(path));
+  const hostUrls = overrides.hostUrls ?? {};
+  for (const id of Object.keys(hostUrls)) {
+    if (!ids.has(id)) throw new Error(`${path}: переопределение url для неизвестного хоста "${id}"`);
+  }
   return {
-    listen: { ...listen, host: listenHost },
+    listen: { ...listen, host: listenHost, port: overrides.port ?? listen.port },
     ...(config.agents ? { agents: config.agents } : {}),
-    hosts: config.hosts.map(host => ({
-      ...host,
-      ...(host.tokenFile ? { tokenFile: resolve(baseDir, host.tokenFile) } : {}),
-    })),
+    hosts: config.hosts.map(host => {
+      const url = hostUrls[host.id] ?? host.url;
+      if (url !== host.url) {
+        try {
+          new URL(url);
+        } catch {
+          throw new Error(`${path}: hosts.${host.id}.url должен быть абсолютным URL`);
+        }
+      }
+      return {
+        ...host,
+        url,
+        ...(host.tokenFile ? { tokenFile: resolve(baseDir, host.tokenFile) } : {}),
+      };
+    }),
   };
 }
 

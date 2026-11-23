@@ -202,6 +202,11 @@ Codex с входом ChatGPT и Claude с API. Дополнительный х�
 двум AHP-хостам напрямую. После изменения `hosts.json` её нужно перезапустить отдельно.
 Токены читают backend и сервер резервной панели; в браузер они не попадают.
 
+Для разработки есть отдельные mock-only конфиги `hosts.dev.json` и `hosts.e2e.json`: в каждом
+только хост `mock` на `ws://127.0.0.1:8189`, `listen.port` 8095 и `agents: ["mock"]`, без
+`tokenFile` и `localFilesystem`. Их читают `npm run server:dev` и `npm run server:e2e`;
+production `hosts.json` они не меняют.
+
 Удалённый хост проще всего подключить через SSH-проброс порта и добавить в `hosts` как ещё одну запись:
 
 ```bash
@@ -209,6 +214,32 @@ ssh -N -L 8189:127.0.0.1:8089 user@remote
 ```
 
 ## Разработка
+
+Учебный контур без VS Code CLI, токенов и `.local` — три процесса в отдельных терминалах:
+
+```bash
+npm run mock-host     # AHP-хост на ws://127.0.0.1:8189
+npm run server:dev    # backend на 127.0.0.1:8095, конфигурация hosts.dev.json
+npm run web:dev       # панель на http://127.0.0.1:5173, прокси /ws на 8095
+```
+
+`hosts.dev.json` и `hosts.e2e.json` содержат только хост `mock`: без `tokenFile`, без `local` и
+`gemini`, без `.local/host-token` и `.local/gemini-host-token`. Production `hosts.json` и запущенные
+реальные хосты они не меняют. `server:dev` и `server:e2e` выставляют `ACC_PHONE_ACCESS=0`, поэтому
+не занимают порт 8092 и не читают `.local/phone-access.json`.
+
+Mock-хост отвечает эхом с markdown-стримингом, на слово `tool` просит подтвердить `mock_shell`,
+на слово `input` показывает карточку ввода. После завершённого хода в панели доступен боковой чат
+(`createChat`); история живёт в памяти, снимок чата отдаёт последние 6 ходов, а кнопка «Ранние
+сообщения» грузит остальное через `fetchTurns`. После перезапуска mock-host история пропадает.
+
+Порты переопределяются через env: `MOCK_HOST_PORT=8190 npm run mock-host` или
+`npm run mock-host -- 8190` (аргумент важнее env); для backend — `ACC_PORT=8096` и
+`ACC_MOCK_HOST_URL=ws://127.0.0.1:8190`; для панели — `ACC_BACKEND=127.0.0.1:8096 npm run web:dev`.
+При смене порта mock задавайте пару `MOCK_HOST_PORT` + `ACC_MOCK_HOST_URL`, иначе backend продолжит
+искать 8189. `npm run server:e2e` поднимает тот же backend на 8095 с `hosts.e2e.json`.
+
+Проверки:
 
 ```bash
 npm run typecheck
@@ -256,6 +287,8 @@ Check `verify` включён как required для pull request в `main`. Req
 - `shared/` — контракт backend ↔ браузер и общие редьюсеры: браузер получает снимок и actions
   и применяет те же редьюсеры SDK, что и backend.
 - `src/` — интерфейс на React.
+- `scripts/mock-host.ts` — учебный AHP-хост для dev/e2e: эхо, подтверждение инструмента, ввод,
+  боковой чат и постраничная история; запускается через `npm run mock-host`.
 - `scripts/claude-provider.mjs` — настройки API для `query`, `startup` и `prewarm` Claude SDK;
   остальные экспорты, включая историю сессий, делегируются установленному SDK без изменения.
 

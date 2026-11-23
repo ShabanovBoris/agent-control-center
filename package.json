@@ -9,7 +9,11 @@
     "update:agents": "node scripts/update-agents.mjs",
     "restart:services": "node --import tsx scripts/restart-services.ts",
     "server": "tsx server/index.ts",
+    "server:dev": "ACC_CONFIG=hosts.dev.json ACC_PHONE_ACCESS=0 tsx server/index.ts",
+    "server:e2e": "ACC_CONFIG=hosts.e2e.json ACC_PHONE_ACCESS=0 tsx server/index.ts",
+    "mock-host": "tsx scripts/mock-host.ts",
     "web": "vite",
+    "web:dev": "ACC_BACKEND=${ACC_BACKEND:-127.0.0.1:8095} vite",
     "build": "vite build",
     "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.server.json",
     "test": "tsx --test server/*.test.ts src/*.test.ts"

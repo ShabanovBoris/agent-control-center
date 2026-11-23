@@ -28,8 +28,22 @@ if (Number.isSafeInteger(previousBackend) && previousBackend > 1) {
   }
 }
 
-const config = await loadConfig(process.env.ACC_CONFIG ?? 'hosts.json');
-const phone = await createPhoneAccess('.local/phone-access.json', 'dist').catch((error: unknown) => {
+// Параллельный dev/e2e backend не должен занимать production-порты и читать production-настройки,
+// поэтому порт и адрес mock-хоста переопределяются через env, а доступ с телефона отключается.
+function envPort(value: string | undefined, label: string): number | undefined {
+  if (value === undefined || value.trim() === '') return undefined;
+  const port = Number(value);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error(`${label}: ожидается целое число 1..65535`);
+  return port;
+}
+
+const portOverride = envPort(process.env.ACC_PORT, 'ACC_PORT');
+const mockHostUrl = process.env.ACC_MOCK_HOST_URL?.trim() || undefined;
+const config = await loadConfig(process.env.ACC_CONFIG ?? 'hosts.json', {
+  ...(portOverride !== undefined ? { port: portOverride } : {}),
+  ...(mockHostUrl ? { hostUrls: { mock: mockHostUrl } } : {}),
+});
+const phone = process.env.ACC_PHONE_ACCESS === '0' ? undefined : await createPhoneAccess('.local/phone-access.json', 'dist').catch((error: unknown) => {
   console.error('[acc] Доступ с телефона отключён.', error);
 });
 
