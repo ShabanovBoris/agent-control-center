@@ -2,7 +2,7 @@
 
 **Задача:** AGENTHOS-22 — «Спроектировать очередь задач агентов».
 **Статус:** design proposal (не реализация). Решение о реализации принимает владелец после ревью PR.
-**Срез кода:** `main` + ветка `AGENTHOS-22`, HEAD `6cbd5a5`, 24.11.2026.
+**Срез кода:** `main` = `6cbd5a5`; ветка `AGENTHOS-22` добавляет только этот документ (production-код не меняется).
 **Протокол:** `@microsoft/agent-host-protocol` 1.1.0 (`package.json:18`), сверено по `node_modules/@microsoft/agent-host-protocol` в main workspace.
 **Артефакт:** только этот документ. Production-код, зависимости, `hosts.json` и Memory Bank не менялись.
 
@@ -56,6 +56,7 @@
 | S12 | Повторная отправка формы после обрыва связи | `clientRequestId` делает добавление идемпотентным |
 | S13 | Добавление задачи с циклом или несуществующей зависимостью | `queueAdd` отклоняется с понятной ошибкой; очередь не меняется |
 | S14 | Пользователь удаляет задачу, от которой зависят другие | Удаление отклоняется: сначала отменить или переназначить зависимые |
+| S15 | Задача A завершилась `failed`, B стоит в `blocked(dependency_failed)`; пользователь делает `queueRetry(A)`, A завершается `completed` | B автоматически возвращается в `queued` на ближайшем tick и стартует без перезапуска backend |
 
 ### 1.4 Критерии готовности документа
 
@@ -86,11 +87,11 @@
 | Возможность | Что даёт | Чего не даёт | Как использует очередь |
 | --- | --- | --- | --- |
 | `SessionSummary` | `resource`, `status` (битмаска), `chats`, `defaultChat`, `origin`, `changes`, `activity`, `modifiedAt` | Нет причины блокировки, нет результата хода, нет зависимостей | Список и проекция статуса; join по `(hostId, sessionUri)` |
-| `SessionState` | `lifecycle`, `chats: SessionChatSummary[]`, `defaultChat`, `inputNeeded: SessionInputRequest[]`, `activity`, `changesets`, `workingDirectories` | `inputNeeded` host-managed; не все виды запросов панель умеет разрешать | Подписка на сессию активной задачи; источник `blocked` |
+| `SessionState` | `lifecycle`, `chats: ChatSummary[]` (`channels-session/state.ts:193`), `defaultChat`, `inputNeeded: SessionInputRequest[]`, `activity`, `changesets`, `workingDirectories` | `inputNeeded` host-managed; не все виды запросов панель умеет разрешать | Подписка на сессию активной задачи; источник `blocked` |
 | `ChatState` | `activeTurn`, `turns: Turn[]`, `queuedMessages`, `draft`, `changesets`, `interactivity` (проверено, `channels-chat/state.ts:52`) | Очередь сообщений чата — не очередь задач | Мониторинг хода и фиксация результата |
 | `Turn` / `TurnState` | `id`, `state: 'complete' \| 'cancelled' \| 'error'`, `responseParts`, `usage` (`channels-chat/state.ts:751`, `:781`) | Нет структурированного «результата задачи» | Детерминированный settle по `turn.state` |
 | `ChatOrigin` | `user`, `fork`, `sideChat`, `tool` | Не задача; fork/side — ветки контекста | Не используем как primitive задачи |
-| `createSession` | `channel` (URI выбирает клиент), `provider?`, `workingDirectories?`, `config?` (`channels-session/commands.ts:42`) | Нет initial message, нет title; при существующем URI — ошибка `-32003` (`SessionAlreadyExists`) | Создание сессии с заранее известным URI |
+| `createSession` | `channel` (URI выбирает клиент), `provider?`, `workingDirectories?`, `config?` (`channels-session/commands.ts:53`) | Нет initial message, нет title; при существующем URI — ошибка `-32003` (`SessionAlreadyExists`) | Создание сессии с заранее известным URI |
 | `ChatTurnStarted` | Клиентский `turnId`, `message` (в т.ч. `model`) | Один ход = одно сообщение; DAG нет | Запуск хода v1; `turnId` детерминирован для идемпотентности |
 | `ChatPendingMessageSet/Removed/Reordered`, `queuedMessages`, `queuedMessageId` | Штатная очередь сообщений чата; action client-dispatchable | Потребление при простое описано как `SHOULD`; корреляция `queuedMessageId` на живом хосте не проверена | Не primitive MVP; кандидат на отдельную проверку |
 | `inputNeeded` + `confirmTool` / `completeInput` | Причина блокировки и всё для ответа; по спецификации отвечать можно без подписки на чат (`channels-session/state.ts:330`) | `toolConfirmation` покрывает и подтверждение параметров, и подтверждение результата; `PendingResultConfirmation` панель не подтверждает; MCP-auth в панели не реализован | Детект `blocked`; ручное подтверждение в панели или VS Code |
@@ -105,7 +106,7 @@
 - **`createSession` не принимает initial message.** Сообщение отправляется отдельным `ChatTurnStarted` после того, как у сессии появился чат.
 - **Хост держит `lifecycle: creating` до первого хода, хотя чат уже доступен** — это зафиксировано комментарием и условием в панели (`src/SessionView.tsx:191`), поэтому ждать `Ready` нельзя: планировщик ждёт `defaultChat`/`chats[0]`.
 - **`SessionState.inputNeeded` агрегирован по всем чатам сессии**, entry содержит `id` и `chat` (`channels-session/state.ts:318`). Отвечать по спецификации можно без подписки на чат, но текущий `Hub.confirmTool` идёт через `confirmationOption` (`server/hub.ts:476`), который вызывает `chatState` (`server/hub.ts:495`) и требует зеркала чата. Поэтому очередь не отвечает сама: она показывает блокировку и ведёт пользователя в открытую сессию.
-- **`toolConfirmation` — один kind на два разных состояния.** Различать подтверждение параметров и подтверждение результата нужно по `request.toolCall.status`: `ToolCallPendingConfirmationState` против `ToolCallPendingResultConfirmationState` (`channels-chat/state.ts:1707`). Только первое панель умеет подтверждать.
+- **`toolConfirmation` — один kind на два разных состояния.** У `SessionToolConfirmationRequest` есть `turnId` и `toolCall` (`channels-session/state.ts:363-369`); поля `request` у него нет. `request: ChatInputRequest` объявлен только у `SessionChatInputRequest` (`channels-session/state.ts:345-349`), а общая база `SessionInputRequestBase` содержит лишь `id` и `chat` (`:318-333`). Поэтому подтверждение параметров и подтверждение результата различаются по `entry.toolCall.status`: `ToolCallPendingConfirmationState` против `ToolCallPendingResultConfirmationState` (`channels-chat/state.ts:1707`, сами статусы — `ToolCallStatus`, `:1271-1284`). `entry.turnId` — ход, к которому относится подтверждение; он используется для сверки с `attempt.turnId` в §3.8, но не для классификации `kind`. Только первое состояние панель умеет подтверждать.
 - **`ToolClientExecution`** в `inputNeeded` — это запрос на исполнение инструмента клиентом, а не человекозависимая блокировка; очередь его игнорирует.
 
 ### 2.2 Сверка с отчётом Recon
@@ -174,7 +175,7 @@ interface QueueTaskRecord {
     hostId: string;
     provider: string;               // id агента, не display name
     modelId?: string;
-    modelConfig?: Record<string, unknown>; // reasoning и прочие chatMutable-параметры
+    modelConfig?: Record<string, JsonPrimitive>; // reasoning и прочие chatMutable-параметры, форма ModelSelection["config"]
     workingDirectory: string;       // абсолютный POSIX-путь на хосте
   };
   dependsOn: string[];              // id задач той же очереди
@@ -197,6 +198,8 @@ type QueueTaskState =
 ```
 
 `state` — это состояние **намерения и оркестрации**, а не копия `SessionStatus`. Оно отвечает на вопрос «что очередь собирается делать с задачей», а не «что сейчас делает хост». Например, `running` означает «у задачи есть незавершённый ход, очередь его ждёт», а не «хост сообщил InProgress»; фактический статус хода читается из `ChatState`.
+
+`modelConfig` намеренно совпадает по форме с `ModelSelection["config"]` (`channels-root/state.ts:254-262`): `Record<string, JsonPrimitive>`, без вложенных объектов. Валидация — при `queueAdd` (только JSON-примитивы, известные ключи не проверяются: схема модели живёт на хосте) и на границе `TaskHostPort.startTurn`, где тип уже обязан быть `ModelSelection["config"]`. Иначе `Record<string, unknown>` пришлось бы сужать в рантайме без типа-доказательства.
 
 ### 3.3 Попытка
 
@@ -249,14 +252,20 @@ interface QueueError {
   starting | running | blocked ── сессия исчезла ──▶ failed(session_missing)
 
 Терминальные состояния: completed, failed, cancelled.
+
+Зависимости (пересчёт на каждом tick):
+  queued ── dependsOn failed/cancelled ──▶ blocked(dependency_failed|cancelled)
+  blocked(dependency_failed|cancelled) ── все dependsOn снова completed ──▶ queued
+  blocked(dependency_failed|cancelled) ── cancel ──▶ cancelled
 ```
 
 | Из | Событие | В | Примечание |
 | --- | --- | --- | --- |
 | — | `queueAdd` | `queued` | Валидация target, зависимостей, лимитов |
-| `queued` | зависимости `completed` + свободен running-слот | `starting` | Слот резервируется **до** await; пишется `sessionUri` |
+| `queued` | зависимости `completed` + свободен running-слот (`maxParallel`, `maxBlocked`, §3.6) | `starting` | Слот резервируется **до** await; пишется `sessionUri` |
 | `queued` | cancel | `cancelled` | Без обращения к хосту |
-| `starting` | чат получен, `ChatTurnStarted` подтверждён | `running` | `chatUri`, `turnId` записаны до dispatch |
+| `queued` | зависимость стала `failed`/`cancelled` | `blocked(dependency_failed \| dependency_cancelled)` | Gate пересчитывается на каждом tick (§3.5) |
+| `starting` | чат получен; persist `chatUri` + `turnId` + `running` **до** dispatch | `running` | `running` = «очередь ждёт ход с этим `turnId`», а не подтверждение хоста: write-ahead сильнее, чем ожидание echo |
 | `starting` | retryable-сбой, попытки есть | `retry_wait` | `error` сохраняется в попытке |
 | `starting` | cancel | `cancelled` | `cancelRequestedAt`; пустая сессия остаётся у хоста |
 | `starting` | retryable-сбой, попыток нет | `failed` | Терминальное |
@@ -268,7 +277,8 @@ interface QueueError {
 | `running` | сессия исчезла при подключённом хосте | `failed(session_missing)` | Зависимые → `blocked(dependency_failed)` |
 | `blocked` | `inputNeeded` по чату попытки исчез | `running` | Ход продолжается или уже завершился — решается по `ChatState` при следующем tick |
 | `blocked` | host disconnected | `blocked(host_disconnected)` | Причина блокировки меняется, слот не занимается |
-| `blocked` | cancel | `cancelled` | Если ход жив — `cancelTurn` |
+| `blocked(dependency_*)` | все `dependsOn` снова `completed` (retry зависимости завершился) | `queued` | Пересчёт на каждом tick, без рестарта backend; затем обычная проверка готовности (S15) |
+| `blocked` | cancel | `cancelled` | `cancelTurn` только с `attempt.turnId`, ошибка — no-op; чужой ход не трогается (§3.9) |
 | `retry_wait` | backoff истёк | `starting` | Новая попытка, новая сессия |
 | любой нетерминальный | host reconnect | сверка | Состояние пересчитывается с хоста, а не «додумывается» |
 
@@ -276,9 +286,11 @@ interface QueueError {
 
 ### 3.5 Зависимости
 
-- `dependsOn` ссылается только на задачи той же очереди. Цикл, self-dependency и несуществующий id отклоняются при `queueAdd` (и при `queueUpdateSettings`, если он меняет граф).
-- Задача готова, когда **все** зависимости в `completed`. `failed` или `cancelled` зависимость не запускает задачу, а переводит её в `blocked(dependency_failed | dependency_cancelled)` — без каскадной отмены и без автоматического «проброса» ошибки. Владелец решает: retry зависимости, отмена зависимой или правка графа.
-- Удаление задачи, от которой зависят другие, отклоняется. Сначала отменяются или переназначаются зависимые. Это защищает от «висячих» ссылок в графе.
+- `dependsOn` ссылается только на задачи той же очереди. Цикл, self-dependency и несуществующий id отклоняются при `queueAdd`; другого способа изменить граф в v1 нет (§6.2).
+- Задача готова, когда **все** зависимости в `completed`. `failed` или `cancelled` зависимость не запускает задачу, а переводит её в `blocked(dependency_failed | dependency_cancelled)` — без каскадной отмены и без автоматического «проброса» ошибки. Владелец решает: retry зависимости или отмена зависимой задачи; правки графа в v1 нет (§6.2).
+- Gate пересчитывается **на каждом tick** для всех нетерминальных задач, а не только при старте backend: `queued` → `blocked(dependency_failed | dependency_cancelled)`, если хотя бы одна зависимость стала `failed`/`cancelled`; `blocked(dependency_failed | dependency_cancelled)` → `queued`, когда все `dependsOn` снова `completed` (например, после `queueRetry` упавшей зависимости). Причина блокировки обновляется на месте, `position` сохраняется. Без этого правила зависимая задача навсегда осталась бы в `blocked` с устаревшей причиной (сценарий S15).
+- Если зависимость после retry снова `queued`/`running`, задача остаётся `blocked(dependency_failed | dependency_cancelled)`: причина не сбрасывается «на всякий случай», иначе UI показывал бы готовность раньше времени. Текст причины в UI строится из текущего состояния зависимости («ждёт retry A»), а не только из `blocked.kind`.
+- Удаление задачи, от которой зависят другие, отклоняется. Сначала зависимые нужно отменить (в v1 «переназначить» = удалить и добавить заново с новым `dependsOn`). Это защищает от «висячих» ссылок в графе.
 - `position` упорядочивает готовые задачи между собой. При равном `position` — по `createdAt`.
 - Глубина графа и число задач ограничены: 200 задач на очередь достаточно для панели и держит snapshot маленьким. DAG без циклов, значит глубина ≤ 200 по построению.
 
@@ -286,8 +298,9 @@ interface QueueError {
 
 - `settings.maxParallel` — 1–8, default 2. Считает только задачи в `starting | running`.
 - `settings.maxBlocked` — 0–8, default 2, где 0 означает «без ограничения». Считает только задачи в `blocked`, у которых **есть живая сессия и ожидается действие человека**: `tool_confirmation`, `tool_result_confirmation`, `chat_input`, `tool_authentication`, `external_turn`, `session_archived`, `cancel_pending`.
-- Задача стартует, только если `running < maxParallel` **и** `humanBlocked < maxBlocked`. Иначе она остаётся `queued`; уже запущенные задачи продолжают работать.
+- Задача стартует, только если `running < maxParallel` **и** (`maxBlocked === 0` или `humanBlocked < maxBlocked`). Иначе она остаётся `queued`; уже запущенные задачи продолжают работать. Проверка именно такая, а не `humanBlocked < maxBlocked`, иначе `maxBlocked = 0` («без ограничения») означал бы `0 < 0` и навсегда останавливал очередь.
 - `blocked` не держит running-слот. Иначе одно подтверждение инструмента останавливает весь пакет: слот занят, новая независимая задача не стартует, а человек может уйти на час.
+- Следствие, которое принимается осознанно: у `blocked(chat_input | tool_confirmation | tool_result_confirmation)` и `blocked(cancel_pending)` ход попытки ещё жив (paused или running); у `blocked(external_turn)` он может быть жив, если стартовал до чужого ввода. Такой ход идёт параллельно, но слот не занимает, поэтому фактическое число одновременных ходов может кратковременно превысить `maxParallel`. `maxParallel` ограничивает число стартов, которые очередь инициирует, а не число живых ходов на хосте в любой момент. Альтернатива — держать слот до терминального `Turn.state` — возвращает проблему «одно подтверждение останавливает пакет».
 - `blocked(host_disconnected | host_unknown | dependency_failed | dependency_cancelled)` не занимает ни running-слот, ни `maxBlocked`: живой сессии под контролем очереди нет, ограничивать нечего.
 - `retry_wait` не занимает ни того, ни другого: попытка уже завершилась, новая ещё не началась.
 - Лимиты глобальные, без per-host и per-directory. Причина: одна панель, один пользователь; per-host лимиты добавляют настройку без ясной пользы. Предупреждение о двух задачах в одной рабочей папке показывается в UI, но не блокирует — параллельная работа в одной папке иногда осмысленна и всегда рискованна.
@@ -299,7 +312,7 @@ interface QueueError {
 - Новая попытка — новая сессия и новый `turnId`. Старая сессия не удаляется и не архивируется очередью: это артефакт со своим исходом.
 - `maxAttempts` 1–3, default 1: по умолчанию задача не ретраится, потому что агент мог уже сделать половину работы и повтор опасен. Автоматический retry — осознанный выбор пользователя.
 - Ручной `queueRetry` разрешён сверх `maxAttempts`: человек видит контекст и решает сам.
-- Не ретраятся автоматически: `cancelled` (в т.ч. отмена человеком), `session_missing`, `auth_required`, `model_unavailable`, `chat_read_only`. Для них нужен человек или изменение target.
+- Не ретраятся автоматически: `cancelled` (в т.ч. отмена человеком), `session_missing`, `auth_required`, `model_unavailable`, `chat_read_only`. Для них нужен человек или изменение target; в v1 «сменить target» = удалить задачу и добавить заново, потому что `queueUpdateTask` нет (§6.2).
 - Идемпотентность: `turnId` фиксирован до dispatch. Если dispatch отвалился по таймауту, но хост принял ход, сверка находит ход с этим `turnId` в `activeTurn` или `turns` и присваивает его вместо создания второй попытки.
 
 ### 3.8 Approvals и блокировки
@@ -320,16 +333,18 @@ type QueueBlockedKind =
 Алгоритм на каждом tick для задачи в `starting | running`:
 
 1. Взять `SessionState.inputNeeded` (если `attempt.chatUri` ещё нет — пропустить шаг).
-2. Оставить только entries с `entry.chat === attempt.chatUri`. Причина: `inputNeeded` агрегирован по всем чатам сессии (`channels-session/state.ts:433`), а approval в боковом чате человека не должен блокировать задачу.
-3. Классифицировать:
+2. Оставить только entries с `entry.chat === attempt.chatUri`. Причина: `inputNeeded` агрегирован по всем чатам сессии (`channels-session/state.ts:434`), а approval в боковом чате человека не должен блокировать задачу.
+3. Классифицировать по `entry.kind`; для `toolConfirmation` статус читается из `entry.toolCall.status` (`SessionToolConfirmationRequest` не имеет поля `request` — оно есть только у `chatInput`, см. §2.1):
 
 | `inputNeeded[].kind` | Условие | `QueueBlockedKind` | Панель умеет снять? |
 | --- | --- | --- | --- |
 | `chatInput` | — | `chat_input` | Да, `completeInput` (`server/hub.ts:314`) |
-| `toolConfirmation` | `request.toolCall.status === 'pending-confirmation'` | `tool_confirmation` | Да, `confirmTool` (`server/hub.ts:305`) |
-| `toolConfirmation` | `request.toolCall.status === 'pending-result-confirmation'` | `tool_result_confirmation` | **Нет** (`src/SessionView.tsx:516`) |
+| `toolConfirmation` | `entry.toolCall.status === 'pending-confirmation'` | `tool_confirmation` | Да, `confirmTool` (`server/hub.ts:305`) |
+| `toolConfirmation` | `entry.toolCall.status === 'pending-result-confirmation'` | `tool_result_confirmation` | **Нет** (`src/SessionView.tsx:516`) |
 | `toolAuthentication` | — | `tool_authentication` | **Нет** (в панели не реализовано) |
 | `toolClientExecution` | — | игнорируется | Не human-block |
+
+Если у `toolConfirmation`-entry `entry.turnId !== attempt.turnId`, подтверждение относится к чужому ходу в том же чате: задача блокируется, но с причиной `external_turn`, а не `tool_confirmation` — снимать его «в панели вместо VS Code» бессмысленно, это чужой ход (§5.4).
 
 4. Перевести задачу в `blocked` с причиной и временем. Освободить running-слот.
 5. Когда entry исчез — на следующем tick пересчитать состояние по `ChatState`: `activeTurn` жив → `running`; ход завершён → settle.
@@ -345,9 +360,9 @@ type QueueBlockedKind =
 | `cancel_pending` | Отмена запрошена, но хост не подтвердил её за 30 с | Человек останавливает ход в панели или VS Code |
 | `host_disconnected` | Хост отключён | Reconnect |
 | `host_unknown` | Хост исчез из конфигурации | Правка `hosts.json` и перезапуск backend |
-| `dependency_failed` / `dependency_cancelled` | Зависимость завершилась неуспешно | Retry зависимости, отмена задачи или правка графа |
+| `dependency_failed` / `dependency_cancelled` | Зависимость завершилась неуспешно | Снимается автоматически, когда все `dependsOn` снова `completed` (retry зависимости, §3.5); иначе отмена или удаление задачи |
 
-Отличие от плана (осознанное уточнение): в плане `session_missing` и `model_unavailable` перечислены среди blocked-причин. Здесь они — терминальные `failed`, потому что это не «ждём человека с живой сессией», а «эта попытка больше не может продолжаться». `session_missing` ставится только при подключённом хосте и подтверждённом отсутствии сессии (событие `sessionRemoved` или сессия отсутствует в `overview.sessions` дольше 5 с). Пока хост недоступен, это `blocked(host_disconnected)`: отсутствие данных — не доказательство отсутствия сессии.
+Отличие от плана (продуктовое решение, вынесено владельцу — §11, вопрос 9): в плане `session_missing` и `model_unavailable` перечислены среди blocked-причин. Здесь они — терминальные `failed`, потому что это не «ждём человека с живой сессией», а «эта попытка больше не может продолжаться». `session_missing` ставится только при подключённом хосте и подтверждённом отсутствии сессии (событие `sessionRemoved` или сессия отсутствует в `overview.sessions` дольше 5 с). Пока хост недоступен, это `blocked(host_disconnected)`: отсутствие данных — не доказательство отсутствия сессии. Если владелец выберет blocked-вариант, меняются только значения `QueueTaskState`/`QueueBlockedKind` и переходы; архитектура и хранение не затрагиваются.
 
 ### 3.9 Отмена
 
@@ -355,7 +370,10 @@ type QueueBlockedKind =
 - `starting` → `cancelRequestedAt`, попытка помечается `cancelled`; если `createSession` уже прошёл, сессия остаётся пустой — очередь её не удаляет, хост ею владеет.
 - `running` → `cancelRequestedAt`, затем `Hub.cancelTurn` с `turnId` попытки. После этого задача остаётся в `running` до сверки: `cancelTurn` мог не сработать, если ход успел завершиться (`server/hub.ts:293` бросает «Этот ход уже завершён»).
 - Сверка: при следующем tick смотрим `ChatState`. Ход завершился `complete` → `completed` (не врём про отмену); `cancelled` → `cancelled`; `error` → `failed`; ход всё ещё активен → повторяем `cancelTurn` с ограничением (не чаще раза в 2 с, до 30 с), затем `blocked(cancel_pending)` с сообщением «хост не подтвердил отмену».
-- `blocked` → `cancelRequestedAt`, снимаем lease, `cancelled`. Если ход жив (например, blocked по `external_turn`), сначала `cancelTurn`.
+- `blocked` → `cancelRequestedAt`, снимаем lease. Дальше два случая:
+  - ход попытки ещё жив (`chat_input`, `tool_confirmation`, `tool_result_confirmation`, `cancel_pending`, иногда `external_turn`) — сначала `cancelTurn` **только с `attempt.turnId`**: `Hub.cancelTurn` отменяет ход лишь при совпадении `activeTurn.id` с переданным `turnId`, иначе бросает «Этот ход уже завершён» (`server/hub.ts:293-296`). Ошибка `cancelTurn` — no-op, не повод отменять чужой ход. Затем та же сверка, что для `running`: `Turn.state` даёт терминальное состояние, а неподтверждённая отмена — `blocked(cancel_pending)`.
+  - хода нет (`dependency_failed`, `dependency_cancelled`, `host_disconnected`, `host_unknown`, `session_archived`) — сразу `cancelled`, без обращения к хосту.
+  Чужой `activeTurn` в чате задачи не отменяется никогда (§5.4).
 - `retry_wait` → `cancelled` без обращения к хосту.
 - Отмена не удаляет сессию. Пользователь может открыть её и посмотреть, что успел сделать агент.
 
@@ -364,7 +382,7 @@ type QueueBlockedKind =
 Задача хранит ссылки и снимок исхода:
 
 - `attempts[].sessionUri`, `chatUri`, `turnId` — адреса, по которым всё открывается.
-- `outcome.turnState` — `Turn.state` нужного хода из `ChatState.turns`. Пока ход активен, исхода нет: задача остаётся `running` или `cancel_pending`.
+- `outcome.turnState` — `Turn.state` нужного хода из `ChatState.turns`. Пока ход активен, исхода нет: задача остаётся `running` или `blocked(cancel_pending)`.
 - `outcome.finishedAt` — время фиксации исхода.
 - `outcome.changes` — `SessionChatSummary.changes` нужного чата, fallback на `SessionSummary.changes`; это **снимок** на момент завершения, помечен как снимок.
 
@@ -426,6 +444,7 @@ type QueueBlockedKind =
 - Лимит: 200 задач. Терминальные задачи без зависимых прунятся по `updatedAt` старше настраиваемого порога (default 30 дней) — но только по явному действию пользователя или при превышении лимита, чтобы не терять историю молча.
 - `clientRequestId` (UUID со стороны формы) делает `queueAdd` идемпотентным: повтор после обрыва возвращает существующую задачу, а не создаёт вторую.
 - Ошибка записи не валит backend: она попадает в `QueueSnapshot.persistenceError` и показывается в UI. Очередь продолжает работать в памяти и пытается записать снова.
+- **Version mismatch:** `version !== 1` (отсутствует, строка, будущая версия) — это не corrupt JSON, а несовместимый формат. Файл не перезаписывается и не переименовывается: очередь стартует пустой в памяти, `loadError` объясняет, что версия файла не поддерживается, а запись блокируется до ручного решения. Молча перезаписать файл другой версии нельзя — это потеря задач.
 - **Corrupt JSON:** пробуем `.bak`. Если и он невалиден — переименовываем повреждённый файл в `task-queue.json.corrupt-<ISO>` (ничего не удаляем), стартуем с пустой очередью и отдаём `loadError` в snapshot. Молча подменять данные пустотой нельзя.
 
 ### 4.4 Recovery и write-ahead
@@ -451,7 +470,7 @@ type QueueBlockedKind =
      - `inputNeeded` по нашему чату → `blocked` с причиной;
      - чата нет, ход не найден, хост подключён и сессия отсутствует → `failed(session_missing)`;
      - сессия есть, но ход не найден и `activeTurn` пуст → `retry_wait` (dispatch потерялся) с проверкой, что `turnId` действительно нигде нет;
-   - для `blocked` (включая `cancel_pending`) и `retry_wait`: пересчитать причину/backoff. `retry_wait` с истёкшим backoff сразу становится `starting`.
+   - для `blocked` (включая `cancel_pending`) и `retry_wait`: пересчитать причину/backoff, включая gate зависимостей (задача с зависимостями, у которых все `dependsOn` уже `completed`, возвращается в `queued`). `retry_wait` с истёкшим backoff сразу становится `starting`.
 3. Записать нормализованное состояние, только если оно изменилось.
 4. Запустить tick.
 
@@ -494,7 +513,7 @@ type QueueBlockedKind =
 
 ### 5.2 Шаги и таймауты
 
-1. **Tick.** Single-flight: если tick уже идёт, второй не запускается. Tick выбирает готовую задачу с минимальным `position`, проверяет слоты, резервирует слот в памяти и пишет `starting` + `sessionUri`. Резерв — до первого `await`, иначе два параллельных tick'а стартуют одну задачу дважды.
+1. **Tick.** Single-flight: если tick уже идёт, второй не запускается. Сначала tick пересчитывает gate зависимостей для всех нетерминальных задач (§3.5): `blocked(dependency_*)` → `queued`, когда все `dependsOn` снова `completed`, и `queued` → `blocked(dependency_*)`, когда зависимость стала `failed`/`cancelled`. Затем выбирает готовую задачу с минимальным `position`, проверяет слоты, резервирует слот в памяти и пишет `starting` + `sessionUri`. Резерв — до первого `await`, иначе два параллельных tick'а стартуют одну задачу дважды.
 2. **Создание сессии.** `createSession` с `channel = sessionUri`, `provider`, `workingDirectories = [toFileUri(workingDirectory)]`. Ждём `defaultChat` или `chats[0]` из `SessionState` (не `lifecycle === 'ready'`): хост держит `creating`, пока чат уже доступен (`src/SessionView.tsx:191`). Таймаут — 60 с. Если `lifecycle === 'failed'` → `failed(creation_error)`.
 3. **Lease.** `Hub.watch(hostId, sessionUri)`, затем `Hub.watch(hostId, chatUri)`; счётчики подписок не дают очереди и браузеру мешать друг другу (`server/hub.ts:147`).
 4. **Проверка чата.** Дождаться загрузки `ChatState`. Если `interactivity` задан и не `full` → `failed(chat_read_only)`. Если есть `activeTurn` или непустые `queuedMessages` (очередь их не создаёт, значит это чужой ввод) → `blocked(external_turn)` (не отменяем чужой ход).
@@ -600,12 +619,14 @@ export function isQueueCall(call: Call): call is QueueCall;
 | --- | --- | --- |
 | `queueList` | Полный snapshot | — |
 | `queueGet` | Полная задача с prompt и attempts | Неизвестный id → ошибка |
-| `queueAdd` | Добавить задачу | Хост известен; `provider` непустой; папка — абсолютный POSIX-путь (`toFileUri`); prompt непустой и ≤ 100 KB; `dependsOn` существуют, без цикла и self; `maxAttempts` 1–3; очередь < 200; `clientRequestId` уникален либо повторяет уже добавленную задачу; при подключённом хосте — `modelId` есть в каталоге агента |
+| `queueAdd` | Добавить задачу | Хост известен; `provider` непустой; папка — абсолютный POSIX-путь (`toFileUri`); prompt непустой и ≤ 100 KB; `dependsOn` существуют, без цикла и self; `maxAttempts` 1–3; очередь < 200; `clientRequestId` уникален либо повторяет уже добавленную задачу; `modelConfig` — только JSON-примитивы; `modelId` — см. правило каталога ниже |
 | `queueCancel` | Отменить | `queued` — сразу; `starting`/`running`/`blocked` — через сверку; терминальные → ошибка «уже завершена» |
-| `queueRetry` | Ручной retry | Только `failed`/`cancelled`; создаёт новую попытку с номером `max(number)+1`, `maxAttempts` не ограничивает ручной retry |
+| `queueRetry` | Ручной retry | Только `failed`/`cancelled`; создаёт новую попытку с номером `max(number)+1`, `maxAttempts` не ограничивает ручной retry; `outcome`/`error` очищаются до следующего исхода. Зависимые задачи разблокируются не самим retry, а завершением зависимости (§3.5) |
 | `queueRemove` | Удалить | Только `queued` или терминальные; при наличии зависимых — ошибка; running/blocked сначала `queueCancel` |
 | `queueMove` | Изменить порядок | Только `queued`; `position` клампится в диапазон |
 | `queueUpdateSettings` | Лимиты | `maxParallel` 1–8, `maxBlocked` 0–8; применяется немедленно, уже запущенные задачи не останавливаются |
+
+Правило `modelId` одно для всех мест: если каталог моделей агента на подключённом хосте непуст — `modelId` обязан в нём быть (ошибка `queueAdd`/`queueRetry` с понятным текстом); если каталог пуст или хост не подключён — ручной `modelId` разрешён и передаётся хосту как есть, а несовместимость вернёт хост при старте хода (`model_unavailable`, §3.7). Если `modelId` не задан вообще — используется модель хоста по умолчанию. Это покрывает и форму «Codex до первой сессии» (§12.3): запрещать ручной id при пустом каталоге нельзя, разрешать при заполненном — тоже.
 
 Ошибки — через существующий `CallError.message` (`shared/protocol.ts:102`). Отдельные машинные коды не нужны: UI показывает текст, а различать случаи по строкам не требуется. Promise `queueAdd` возвращает `{ taskId }`, чтобы форма могла открыть созданную задачу.
 
@@ -655,7 +676,7 @@ interface TaskHostPort {
   retain(hostId: string, uri: string): void;      // watch
   release(hostId: string, uri: string): void;     // unwatch
   createSession(input: { hostId: string; sessionUri: string; provider: string; workingDirectory: string }): Promise<void>;
-  startTurn(input: { hostId: string; chatUri: string; turnId: string; prompt: string; modelId?: string; modelConfig?: Record<string, unknown> }): Promise<void>;
+  startTurn(input: { hostId: string; chatUri: string; turnId: string; prompt: string; modelId?: string; modelConfig?: Record<string, JsonPrimitive> }): Promise<void>;
   cancelTurn(input: { hostId: string; chatUri: string; turnId: string }): Promise<void>;
   setSessionTitle?(input: { hostId: string; sessionUri: string; title: string }): Promise<void>; // best-effort
 }
@@ -817,7 +838,7 @@ A остаётся полезной как **опциональный адапт
 | 4. Контракт и UI | `protocol.ts`, `index.ts`, `store.ts`, `QueueView`, навигация, mobile, in-app notices | 3–4 | Typecheck/build; store-тест на `queue`-сообщение; ручной smoke |
 | 5. Политики | DAG-UI (список зависимостей), retry/backoff в UI, settings, reorder, prune | 1–1,5 | Unit + smoke на пакете из 3 задач с зависимостью |
 | 6. Hardening | restart backend/хоста, disconnect, гонки, документация, smoke | 1–2 | CI зелёный; сценарии S7/S8/S10/S11 пройдены вручную |
-| **Итого MVP** |  | **11–16** | Сценарии S1–S14, кроме push и доски |
+| **Итого MVP** |  | **11–16** | Сценарии S1–S15, кроме push и доски |
 | Доска | Desktop drag-and-drop | +2–3 | Список остаётся основным; mobile не ломается |
 | Push | Service worker, VAPID, инфраструктура | +2–4 | Отдельное решение владельца, не часть MVP |
 | Automation-адаптер | Feature detection, raw actions, protocol | +4–6 | Нет изменений AHP-контрактов; при выключенных automations не активен |
@@ -875,8 +896,9 @@ A остаётся полезной как **опциональный адапт
 6. **Уведомления: in-app/title или отдельная задача на push?** Рекомендация — in-app. Push (+2–4) оправдан, только если сценарий «уйти от компьютера» реален.
 7. **Вложения в prompt: text-only v1 или файлы?** Рекомендация — text-only. Вложения тянут лимиты, копирование файлов и вопросы приватности.
 8. **Board: список v1 или доска сразу?** Рекомендация — список v1. Доска (+2–3) — после того, как станет ясно, что задач реально много и параллельно.
+9. **`session_missing` и `model_unavailable`: терминальный `failed` или `blocked`, как в одобренном плане?** Рекомендация — `failed` с ручным `queueRetry` (§3.8): после исчезновения сессии ждать нечего, а `model_unavailable` требует смены target, чего в v1 нет. Выбор `blocked` меняет только значения `QueueTaskState`/`QueueBlockedKind` и переходы; архитектура, хранение и UX блокировок не меняются. Нужно явное подтверждение владельца, потому что это расхождение с планом.
 
-**Что нужно от ревьюера:** подтвердить или изменить рекомендации по пунктам 1–8. После подтверждения открывается отдельная задача на реализацию этапов 0–6; в этой ноде ничего не кодится.
+**Что нужно от ревьюера:** подтвердить или изменить рекомендации по пунктам 1–9. После подтверждения открывается отдельная задача на реализацию этапов 0–6; в этой ноде ничего не кодится.
 
 ---
 
@@ -915,11 +937,13 @@ A остаётся полезной как **опциональный адапт
 
 | Утверждение | Где в SDK |
 | --- | --- |
-| `CreateSessionParams`: `channel`, `provider?`, `workingDirectories?`, `config?`, без initial message | `src/types/channels-session/commands.ts:42` |
+| `CreateSessionParams`: `channel`, `provider?`, `workingDirectories?`, `config?`, без initial message | `src/types/channels-session/commands.ts:53` |
 | Повторное создание существующей сессии → `-32003 SessionAlreadyExists` | `src/types/channels-session/commands.ts:26`, `src/types/common/errors.ts:50` |
 | `inputNeeded` host-managed, entry содержит `id` и `chat`, отвечать можно без подписки | `src/types/channels-session/state.ts:244`–`:332` |
 | Kinds: `chatInput`, `toolConfirmation`, `toolClientExecution`, `toolAuthentication` | `src/types/channels-session/state.ts:302`–`:311` |
 | `toolConfirmation` покрывает и `PendingConfirmation`, и `PendingResultConfirmation` | `src/types/channels-session/state.ts:351`–`:369`, `src/types/channels-chat/state.ts:1707` |
+| `SessionToolConfirmationRequest`: `kind`, `turnId`, `toolCall`; поля `request` нет — `request: ChatInputRequest` только у `SessionChatInputRequest`; база содержит `id` и `chat` | `src/types/channels-session/state.ts:318`–`:333`, `:345`–`:349`, `:363`–`:369` |
+| `ToolCallStatus`: `pending-confirmation`, `pending-result-confirmation`; `ToolCallConfirmationState` — union двух состояний | `src/types/channels-chat/state.ts:1271`–`:1284`, `:1707`–`:1709` |
 | `TurnState`: `complete`, `cancelled`, `error` | `src/types/channels-chat/state.ts:751` |
 | `Turn`: `id`, `state`, `responseParts`, `usage` | `src/types/channels-chat/state.ts:781` |
 | `ChatInteractivity`: `full`, `read-only`, `hidden` | `src/types/channels-chat/state.ts:425` |
@@ -941,12 +965,13 @@ A остаётся полезной как **опциональный адапт
 
 ### 12.4 Как проверялся этот документ
 
-- Каждый `path:line` сверен чтением файла на `6cbd5a5`; символы SDK — по типам 1.1.0.
+- Каждый `path:line`, на который опирается решение, сверен чтением файла на `6cbd5a5`; символы SDK — по типам 1.1.0. Безусловной пословной сверки каждого номера строки документ не заявляет: после ревью уточнены `channels-session/commands.ts:53` (вместо `:42`) и `SessionState.chats: ChatSummary[]` (`state.ts:193`). Если номер строки расходится с символом — верить имени символа.
 - `git status --short` до начала работы: чисто; после — только `docs/task-queue-design.md`.
 - `git diff --check` — без пробельных ошибок.
 - `rg -n "^## |^### "` — структура разделов на месте.
 - `rg -n "авторитет|хост остаётся"` — утверждение о владении присутствует в TL;DR, §1.4, §4.2, §10.
-- Проверки в worktree на `6cbd5a5`: `npm ci` (134 пакета), `npm run typecheck` — зелёный, `npm test` — 132/132, `npm run build -- --outDir /tmp/acc-queue-doc-build` — зелёный с известным предупреждением Vite о чанке > 500 kB (CI его сохраняет намеренно). Runtime-код не менялся, поэтому эти прогоны подтверждают baseline, а не поведение очереди.
+- Проверки в worktree на ветке `AGENTHOS-22` (код = `6cbd5a5`): `npm ci` (134 пакета), `npm run typecheck` — exit 0, `npm test` — 132/132, `npm run build -- --outDir /tmp/acc-queue-doc-build-2` — exit 0 с известным предупреждением Vite о чанке 505 kB (CI его сохраняет намеренно). Runtime-код не менялся, поэтому эти прогоны подтверждают baseline, а не поведение очереди.
+- Правки после ревью проверялись точечно: поиск устаревшего префикса `request.` перед `toolCall` по документу — пусто (теперь везде `entry.toolCall`, а поле `request` упоминается только для `chatInput`); таблицы документа (число колонок в строках) — без расхождений; `git diff --check` — без пробельных ошибок.
 - Команды проверки взяты из `package.json` и CI; `memory-bank/techContext.md:11` упоминает `npm run mock-host` и `npm run server:dev`, которых в `package.json` нет — эти команды не используются.
 
 ---
