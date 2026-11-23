@@ -1,16 +1,18 @@
 import { useEffect, useSyncExternalStore } from 'react';
 import { AhpErrorCodes } from '@microsoft/agent-host-protocol';
 import {
-  AUTH_REQUIRED_CODE,
+  describeCallError,
   parseServerMessage,
   type Call,
   type CallError,
   type ChannelState,
   type ClientMessage,
   type Overview,
+  type SearchHistoryResult,
   type ServerMessage,
 } from '../shared/protocol';
 import { channelKey, reduceChannel } from '../shared/reduce';
+import { CallCancelled } from './errors';
 
 export type Connection = 'connecting' | 'open' | 'closed';
 
@@ -56,7 +58,7 @@ class Store {
   };
   private readonly listeners = new Set<() => void>();
   private readonly watches = new Map<string, Watch>();
-  private readonly pending = new Map<number, { resolve(data: unknown): void; reject(error: Error): void }>();
+  private readonly pending = new Map<number, { resolve(data: unknown): void; reject(error: Error): void; cleanup(): void }>();
   private socket: WebSocket | undefined;
   private nextId = 1;
 
@@ -99,8 +101,38 @@ class Store {
         return;
       }
       const id = this.nextId++;
-      this.pending.set(id, { resolve: resolve as (data: unknown) => void, reject });
+      this.pending.set(id, { resolve: resolve as (data: unknown) => void, reject, cleanup: () => {} });
       this.send({ t: 'call', id, call });
+    });
+  }
+
+  /**
+   * Поиск по истории — единственная отменяемая команда. Обычный `call` не
+   * принимает сигнал, чтобы случайно не оборвать `sendMessage`.
+   */
+  search(query: string, signal: AbortSignal): Promise<SearchHistoryResult> {
+    return new Promise<SearchHistoryResult>((resolve, reject) => {
+      if (signal.aborted) {
+        reject(new CallCancelled());
+        return;
+      }
+      if (this.socket?.readyState !== WebSocket.OPEN) {
+        reject(new Error('Нет связи с backend'));
+        return;
+      }
+      const id = this.nextId++;
+      const onAbort = () => {
+        this.pending.delete(id);
+        this.send({ t: 'cancelSearch', id });
+        reject(new CallCancelled());
+      };
+      signal.addEventListener('abort', onAbort, { once: true });
+      this.pending.set(id, {
+        resolve: data => resolve(data as SearchHistoryResult),
+        reject,
+        cleanup: () => signal.removeEventListener('abort', onAbort),
+      });
+      this.send({ t: 'call', id, call: { op: 'searchHistory', query } });
     });
   }
 
@@ -144,7 +176,10 @@ class Store {
     };
     socket.onclose = () => {
       this.update({ connection: 'closed' });
-      for (const { reject } of this.pending.values()) reject(new Error('Связь с backend прервалась'));
+      for (const { reject, cleanup } of this.pending.values()) {
+        cleanup();
+        reject(new Error('Связь с backend прервалась'));
+      }
       this.pending.clear();
       setTimeout(() => this.connect(), RETRY_MS);
     };
@@ -196,6 +231,7 @@ class Store {
         const pending = this.pending.get(message.id);
         if (!pending) return;
         this.pending.delete(message.id);
+        pending.cleanup();
         if (message.ok) pending.resolve(message.data);
         else pending.reject(new CallRejected(message.error));
         return;
@@ -217,9 +253,7 @@ class Store {
 }
 
 export function describeError(error: unknown): string {
-  if (error instanceof CallRejected && error.detail.code === AUTH_REQUIRED_CODE) {
-    return 'Агент не готов на этом хосте: скачайте его SDK и выполните вход (блок «Хосты и агенты»).';
-  }
+  if (error instanceof CallRejected) return describeCallError(error.detail);
   return error instanceof Error ? error.message : String(error);
 }
 

@@ -2,20 +2,13 @@ import { useEffect, useId, useMemo, useRef, useState, type FormEvent } from 'rea
 import { ChatInteractivity, ChatOriginKind, type SessionChatSummary, type SessionState } from '@microsoft/agent-host-protocol';
 import type { AgentOverview, HostOverview, SessionOverview, UpdateCheck } from '../shared/protocol';
 import { channelKey } from '../shared/reduce';
-import { PHASE_LABEL, ellipsize, isArchived, pathOf, phaseOf, selectionFromHash, timeAgo, type Phase, type Selection } from './format';
+import { PHASE_LABEL, ellipsize, isArchived, pathOf, phaseOf, selectionFromHash, selectionToHash, timeAgo, type Phase, type Selection } from './format';
+import { CommandPalette } from './ui/CommandPalette';
 import { SessionView } from './SessionView';
 import { describeError, store, useAppState } from './store';
 import { recentDirectories, rememberDirectory } from './recent-directories';
 
 type Filter = 'all' | 'active' | 'input' | 'archived';
-
-// Адрес восстанавливает выбранную сессию и её чат после перезагрузки.
-function selectionToHash(selection: Selection | null): string {
-  if (!selection) return '';
-  const { hostId, sessionUri, chatUri } = selection;
-  const parts = chatUri ? [hostId, sessionUri, chatUri] : [hostId, sessionUri];
-  return `#${parts.map(encodeURIComponent).join('|')}`;
-}
 
 const HOST_STATUS_LABEL: Record<HostOverview['status'], string> = {
   connected: 'Подключён',
@@ -31,11 +24,33 @@ export function App() {
   const [selection, setSelection] = useState(() => selectionFromHash(location.hash));
   const [creating, setCreating] = useState(false);
   const [showSessionList, setShowSessionList] = useState(false);
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  const [revealSeq, setRevealSeq] = useState(0);
   const hasDetail = creating || selection !== null;
   useEffect(() => {
     history.replaceState(null, '', `${location.pathname}${location.search}${selectionToHash(selection)}`);
   }, [selection]);
   const [filter, setFilter] = useState<Filter>('all');
+
+  useEffect(() => {
+    const onKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.code !== 'KeyK' || !(event.metaKey || event.ctrlKey) || event.altKey || event.isComposing) return;
+      // Палитра не открывается поверх другого модального окна (обновления, правка сообщения).
+      if (!paletteOpen && document.querySelector('dialog[open]')) return;
+      event.preventDefault();
+      setPaletteOpen(open => !open);
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [paletteOpen]);
+
+  const navigate = (next: Selection) => {
+    setCreating(false);
+    setSelection(next);
+    setRevealSeq(value => value + 1);
+    setShowSessionList(false);
+    setPaletteOpen(false);
+  };
 
   const sessions = useMemo(
     () => overview.sessions
@@ -83,6 +98,9 @@ export function App() {
         </div>
 
         <div className="sidebar-actions">
+          <button type="button" className="search-button" aria-keyshortcuts="Meta+K Control+K" title="Поиск по сессиям и истории" onClick={() => setPaletteOpen(true)}>
+            Поиск <span className="palette-kbd">{navigator.userAgent.includes('Mac') ? '⌘K' : 'Ctrl K'}</span>
+          </button>
           <button className="primary" onClick={() => { setCreating(true); setShowSessionList(false); }}>Новая сессия</button>
           {hasDetail && showSessionList && (
             <button className="mobile-return" onClick={() => setShowSessionList(false)}>{creating ? 'К форме' : 'К открытому чату'}</button>
@@ -144,10 +162,19 @@ export function App() {
             backendConnected={backendConnected}
             onClose={() => setSelection(null)}
             onShowSessions={() => setShowSessionList(true)}
-            onOpenChat={chatUri => setSelection(current => current === selection ? { ...current, chatUri } : current)}
+            onOpenChat={chatUri => setSelection(current => current === selection
+              ? { hostId: current.hostId, sessionUri: current.sessionUri, chatUri }
+              : current)}
             onForked={sessionUri => {
               setFilter('all');
+              setRevealSeq(value => value + 1);
               setSelection(current => current === selection ? { hostId: current.hostId, sessionUri } : current);
+            }}
+            revealTurnId={selection.turnId}
+            revealSeq={revealSeq}
+            onRevealMissing={() => {
+              setSelection(current => current ? { hostId: current.hostId, sessionUri: current.sessionUri, ...(current.chatUri ? { chatUri: current.chatUri } : {}) } : current);
+              store.notify('Сообщение не найдено: возможно, история изменилась.');
             }}
           />
         ) : (
@@ -156,6 +183,8 @@ export function App() {
           </div>
         )}
       </main>
+
+      {paletteOpen && <CommandPalette onClose={() => setPaletteOpen(false)} onNavigate={navigate} />}
 
       <div className="notices" role="status">
         {notices.map(notice => (

@@ -28,8 +28,22 @@ if (Number.isSafeInteger(previousBackend) && previousBackend > 1) {
   }
 }
 
-const config = await loadConfig(process.env.ACC_CONFIG ?? 'hosts.json');
-const phone = await createPhoneAccess('.local/phone-access.json', 'dist').catch((error: unknown) => {
+// Параллельный dev/e2e backend не должен занимать production-порты и читать production-настройки,
+// поэтому порт и адрес mock-хоста переопределяются через env, а доступ с телефона отключается.
+function envPort(value: string | undefined, label: string): number | undefined {
+  if (value === undefined || value.trim() === '') return undefined;
+  const port = Number(value);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error(`${label}: ожидается целое число 1..65535`);
+  return port;
+}
+
+const portOverride = envPort(process.env.ACC_PORT, 'ACC_PORT');
+const mockHostUrl = process.env.ACC_MOCK_HOST_URL?.trim() || undefined;
+const config = await loadConfig(process.env.ACC_CONFIG ?? 'hosts.json', {
+  ...(portOverride !== undefined ? { port: portOverride } : {}),
+  ...(mockHostUrl ? { hostUrls: { mock: mockHostUrl } } : {}),
+});
+const phone = process.env.ACC_PHONE_ACCESS === '0' ? undefined : await createPhoneAccess('.local/phone-access.json', 'dist').catch((error: unknown) => {
   console.error('[acc] Доступ с телефона отключён.', error);
 });
 
@@ -38,6 +52,8 @@ interface Browser {
   watching: Set<string>;
   abort: AbortController;
   pickerAbort?: AbortController;
+  /** Текущий поиск по истории: новый запрос отменяет предыдущий. */
+  search?: { id: number; abort: AbortController };
   updatePlan?: UpdatePlan;
 }
 const browsers = new Set<Browser>();
@@ -146,6 +162,9 @@ async function onMessage(browser: Browser, message: ClientMessage): Promise<void
     case 'cancelDirectoryPicker':
       browser.pickerAbort?.abort();
       return;
+    case 'cancelSearch':
+      if (browser.search?.id === message.id) browser.search.abort.abort();
+      return;
     case 'watch': {
       const { hostId, uri } = message;
       const key = channelKey(hostId, uri);
@@ -168,6 +187,7 @@ async function onMessage(browser: Browser, message: ClientMessage): Promise<void
     }
     case 'call': {
       let pickerAbort: AbortController | undefined;
+      let searchAbort: AbortController | undefined;
       try {
         const call = message.call;
         if (backendRestarting) throw new Error('Backend перезапускается после обновления.');
@@ -191,7 +211,7 @@ async function onMessage(browser: Browser, message: ClientMessage): Promise<void
           send(browser, { t: 'result', id: message.id, ok: true, data: { restartBackend: true } }, () => void shutdown());
           return;
         }
-        if (updates.isRestarting(call.hostId) && (
+        if ('hostId' in call && updates.isRestarting(call.hostId) && (
           call.op === 'sendMessage' || call.op === 'createSession' || call.op === 'createChat'
           || call.op === 'forkSession' || call.op === 'editMessage' || call.op === 'retryEditedMessage'
         )) {
@@ -202,13 +222,22 @@ async function onMessage(browser: Browser, message: ClientMessage): Promise<void
           pickerAbort = new AbortController();
           browser.pickerAbort = pickerAbort;
         }
-        const signal = pickerAbort ? AbortSignal.any([browser.abort.signal, pickerAbort.signal]) : browser.abort.signal;
+        if (call.op === 'searchHistory') {
+          // Смена запроса и закрытие палитры не должны оставлять прежние воркеры.
+          browser.search?.abort.abort();
+          searchAbort = new AbortController();
+          browser.search = { id: message.id, abort: searchAbort };
+        }
+        const signals = [browser.abort.signal, pickerAbort?.signal, searchAbort?.signal].filter((value): value is AbortSignal => value !== undefined);
+        const signal = signals.length === 1 ? signals[0]! : AbortSignal.any(signals);
         const data = await hub.call(call, signal);
         send(browser, { t: 'result', id: message.id, ok: true, ...(data !== undefined ? { data } : {}) });
       } catch (error) {
         send(browser, { t: 'result', id: message.id, ok: false, error: toCallError(error) });
       } finally {
         if (pickerAbort) browser.pickerAbort = undefined;
+        // Новая поисковая команда могла уже заменить этот controller.
+        if (searchAbort && browser.search?.id === message.id) browser.search = undefined;
       }
       return;
     }

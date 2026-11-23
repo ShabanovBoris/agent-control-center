@@ -7,8 +7,9 @@ import {
   type ChatInputAnswer,
   type ChatInputQuestion,
   type ChatInputRequest,
-  type StringOrMarkdown,
 } from '@microsoft/agent-host-protocol';
+
+export { pathOf, plain } from '../shared/text';
 
 export type Phase = 'input' | 'running' | 'error' | 'idle';
 
@@ -16,6 +17,8 @@ export interface Selection {
   hostId: string;
   sessionUri: string;
   chatUri?: string;
+  /** Ход, к которому нужно прокрутить ленту после открытия. */
+  turnId?: string;
 }
 
 export function selectionFromHash(hash: string): Selection | null {
@@ -25,11 +28,21 @@ export function selectionFromHash(hash: string): Selection | null {
     fragment = fragment.replace(/%7c(?=ahp-(?:session|chat)(?::|%3a))/gi, '|');
   }
   try {
-    const [hostId, sessionUri, chatUri] = fragment.split('|').map(decodeURIComponent);
-    return hostId && sessionUri ? { hostId, sessionUri, ...(chatUri ? { chatUri } : {}) } : null;
+    const [hostId, sessionUri, chatUri, turnId] = fragment.split('|').map(decodeURIComponent);
+    return hostId && sessionUri
+      ? { hostId, sessionUri, ...(chatUri ? { chatUri } : {}), ...(chatUri && turnId ? { turnId } : {}) }
+      : null;
   } catch {
     return null;
   }
+}
+
+/** Адрес восстанавливает выбранную сессию, чат и ход после перезагрузки. */
+export function selectionToHash(selection: Selection | null): string {
+  if (!selection) return '';
+  const { hostId, sessionUri, chatUri, turnId } = selection;
+  const parts = chatUri ? [hostId, sessionUri, chatUri, ...(turnId ? [turnId] : [])] : [hostId, sessionUri];
+  return `#${parts.map(encodeURIComponent).join('|')}`;
 }
 
 /** SessionStatus — битовая маска: InputNeeded включает в себя бит InProgress. */
@@ -50,22 +63,6 @@ export const PHASE_LABEL: Record<Phase, string> = {
   error: 'Ошибка',
   idle: 'Свободна',
 };
-
-export function plain(value: StringOrMarkdown | undefined): string {
-  if (value === undefined) return '';
-  return typeof value === 'string' ? value : value.markdown;
-}
-
-/** file: URI хоста -> путь для показа. Прочие URI показываются как есть. */
-export function pathOf(uri: string | undefined): string {
-  if (!uri) return '';
-  try {
-    const url = new URL(uri);
-    return url.protocol === 'file:' ? decodeURIComponent(url.pathname) : uri;
-  } catch {
-    return uri;
-  }
-}
 
 const relative = new Intl.RelativeTimeFormat('ru', { numeric: 'auto' });
 

@@ -29,6 +29,7 @@ import {
   type Turn,
 } from '@microsoft/agent-host-protocol';
 import { SIDE_CHAT_FIRST_EDIT_UNAVAILABLE, type HostOverview, type ModelOverview, type SlashCompletions } from '../shared/protocol';
+import { visibleTurns } from '../shared/turns';
 import { PhaseBadge } from './App';
 import { collectFileEdits, resolveTurnChangeset } from './file-edits';
 import { inputOutcome, isArchived, pathOf, phaseOf, plain } from './format';
@@ -51,6 +52,11 @@ export function SessionView(props: {
   hostId: string;
   sessionUri: string;
   selectedChatUri?: string;
+  /** Ход, к которому нужно прокрутить ленту (результат поиска или deep link). */
+  revealTurnId?: string;
+  /** Растёт при каждом новом переходе, даже к тому же ходу. */
+  revealSeq?: number;
+  onRevealMissing?(): void;
   host: HostOverview | undefined;
   summary: SessionSummary | undefined;
   backendConnected: boolean;
@@ -212,6 +218,9 @@ export function SessionView(props: {
               : undefined}
             onOpenSource={originChat ? () => props.onOpenChat(originChat.resource) : undefined}
             onForked={props.onForked}
+            revealTurnId={props.revealTurnId}
+            revealSeq={props.revealSeq}
+            onRevealMissing={props.onRevealMissing}
           />
           <Composer
             key={JSON.stringify([hostId, sessionUri, chatUri, provider])}
@@ -253,15 +262,7 @@ export function SessionView(props: {
   );
 }
 
-function visibleTurns(chat: ChatState): readonly Turn[] {
-  const origin = chat.origin;
-  if (origin?.kind !== ChatOriginKind.SideChat) return chat.turns;
-  // Некоторые хосты возвращают унаследованный префикс при восстановлении боковой ветки.
-  const inherited = chat.turns.findIndex(turn => turn.id === origin.turnId);
-  return inherited < 0 ? chat.turns : chat.turns.slice(inherited + 1);
-}
-
-function Transcript({ chat, target, sessionUri, workingDirectory, commandsAvailable, canWrite, supportsFork, sourceLabel, onOpenSource, onForked }: {
+function Transcript({ chat, target, sessionUri, workingDirectory, commandsAvailable, canWrite, supportsFork, sourceLabel, onOpenSource, onForked, revealTurnId, revealSeq, onRevealMissing }: {
   chat: ChatState;
   target: ChatTarget;
   sessionUri: string;
@@ -272,12 +273,23 @@ function Transcript({ chat, target, sessionUri, workingDirectory, commandsAvaila
   sourceLabel?: string;
   onOpenSource?(): void;
   onForked(sessionUri: string): void;
+  revealTurnId?: string;
+  revealSeq?: number;
+  onRevealMissing?(): void;
 }) {
   const scroller = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
   const [loadingHistory, setLoadingHistory] = useState(false);
   const [forkingTurn, setForkingTurn] = useState<string>();
   const [editing, setEditing] = useState<{ turn: Turn; lastTurnId: string }>();
+  const [revealing, setRevealing] = useState(false);
+  const [revealError, setRevealError] = useState<string>();
+  const [revealMissing, setRevealMissing] = useState(false);
+  const [revealNonce, setRevealNonce] = useState(0);
+  const [highlighted, setHighlighted] = useState<string>();
+  const requestedReveal = useRef<string | undefined>(undefined);
+  const scrolledReveal = useRef<string | undefined>(undefined);
+  const reportedMissing = useRef<string | undefined>(undefined);
   const history = visibleTurns(chat);
   const turns = chat.activeTurn ? [...history, chat.activeTurn] : history;
   const changesetTemplate = chat.changesets?.find(item => item.changeKind === 'turn' && item.uriTemplate.includes('{turnId}'))?.uriTemplate;
@@ -303,6 +315,76 @@ function Transcript({ chat, target, sessionUri, workingDirectory, commandsAvaila
     finally { setForkingTurn(undefined); }
   };
 
+  const revealToken = `${revealTurnId ?? ''}\u0000${revealSeq ?? 0}\u0000${revealNonce}`;
+
+  // Новый переход начинает с чистого статуса; ошибка прошлого хода не блокирует поиск нового.
+  useEffect(() => { setRevealError(undefined); setRevealMissing(false); }, [revealToken]);
+
+  // Догружает страницы, пока целевой ход не появится в ленте.
+  useEffect(() => {
+    if (!revealTurnId) {
+      setRevealing(false);
+      setRevealError(undefined);
+      setRevealMissing(false);
+      setHighlighted(undefined);
+      requestedReveal.current = undefined;
+      scrolledReveal.current = undefined;
+      reportedMissing.current = undefined;
+      return;
+    }
+    if (history.some(turn => turn.id === revealTurnId)) {
+      setRevealing(false);
+      setRevealMissing(false);
+      return;
+    }
+    // Ошибку показывает отдельная кнопка «Повторить»: без неё не зацикливаемся.
+    if (revealError) return;
+    // В полёте может быть запрос прошлого перехода: новый токен не должен ждать его.
+    if (requestedReveal.current === revealToken) return;
+    if (chat.turnsNextCursor) {
+      if (!commandsAvailable) {
+        setRevealError('Нет связи с backend: историю не удалось догрузить.');
+        return;
+      }
+      requestedReveal.current = revealToken;
+      setRevealing(true);
+      setRevealError(undefined);
+      setRevealMissing(false);
+      stick.current = false;
+      void store.call({ op: 'fetchTurns', ...target, cursor: chat.turnsNextCursor })
+        .catch(error => { if (requestedReveal.current === revealToken) setRevealError(describeError(error)); })
+        .finally(() => {
+          if (requestedReveal.current !== revealToken) return;
+          requestedReveal.current = undefined;
+          setRevealing(false);
+        });
+      return;
+    }
+    if (reportedMissing.current === revealToken) return;
+    reportedMissing.current = revealToken;
+    setRevealMissing(true);
+  }, [revealTurnId, revealSeq, revealToken, chat, history, commandsAvailable, revealError, target]);
+
+  const retryReveal = () => {
+    requestedReveal.current = undefined;
+    setRevealError(undefined);
+    setRevealMissing(false);
+    setRevealNonce(value => value + 1);
+  };
+
+  // Прокрутка к найденному ходу — один раз на переход; highlight переживает скролл.
+  useLayoutEffect(() => {
+    if (!revealTurnId || !history.some(turn => turn.id === revealTurnId)) return;
+    if (scrolledReveal.current === revealToken) return;
+    const element = [...(scroller.current?.querySelectorAll<HTMLElement>('[data-turn-id]') ?? [])]
+      .find(node => node.dataset.turnId === revealTurnId);
+    if (!element) return;
+    scrolledReveal.current = revealToken;
+    stick.current = false;
+    element.scrollIntoView({ block: 'center' });
+    setHighlighted(revealTurnId);
+  }, [revealTurnId, revealToken, chat, history]);
+
   // Лента прокручивается за новым выводом, только пока пользователь сам не ушёл вверх.
   useLayoutEffect(() => {
     const element = scroller.current;
@@ -323,8 +405,20 @@ function Transcript({ chat, target, sessionUri, workingDirectory, commandsAvaila
           {onOpenSource ? <button type="button" onClick={onOpenSource}>{sourceLabel}</button> : sourceLabel}
         </div>
       )}
+      {revealing && <p className="muted" role="status">Ищем сообщение в истории…</p>}
+      {revealError && (
+        <p className="error-text" role="alert">
+          {revealError} <button type="button" onClick={retryReveal}>Повторить</button>
+        </p>
+      )}
+      {revealMissing && (
+        <p className="muted" role="status">
+          Сообщение не найдено: возможно, история изменилась.{' '}
+          <button type="button" onClick={() => { setRevealMissing(false); onRevealMissing?.(); }}>Закрыть</button>
+        </p>
+      )}
       {chat.turnsNextCursor && (
-        <button className="history-more" type="button" disabled={!commandsAvailable || loadingHistory} onClick={() => void loadOlderTurns()}>
+        <button className="history-more" type="button" disabled={!commandsAvailable || loadingHistory || revealing} onClick={() => void loadOlderTurns()}>
           {loadingHistory ? 'Загрузка…' : 'Ранние сообщения'}
         </button>
       )}
@@ -343,7 +437,8 @@ function Transcript({ chat, target, sessionUri, workingDirectory, commandsAvaila
               && completedResponseText(completed.state, completed.responseParts) !== undefined
               ? () => void fork(completed.id)
               : undefined}
-            forkPending={forkingTurn !== undefined} />
+            forkPending={forkingTurn !== undefined}
+            highlighted={turn.id === highlighted} />
         );
       })}
       {editing && (
@@ -361,7 +456,7 @@ function Transcript({ chat, target, sessionUri, workingDirectory, commandsAvaila
   );
 }
 
-function TurnView({ turn, target, workingDirectory, changesetTemplate, active, commandsAvailable, onEdit, editBlockedReason, onFork, forkPending }: {
+function TurnView({ turn, target, workingDirectory, changesetTemplate, active, commandsAvailable, onEdit, editBlockedReason, onFork, forkPending, highlighted }: {
   turn: Turn | ActiveTurn;
   target: ChatTarget;
   workingDirectory: string | undefined;
@@ -372,6 +467,7 @@ function TurnView({ turn, target, workingDirectory, changesetTemplate, active, c
   editBlockedReason?: string;
   onFork?(): void;
   forkPending: boolean;
+  highlighted: boolean;
 }) {
   const finished = 'state' in turn ? turn.state : undefined;
   const compact = slashCommand(turn.message.text) === '/compact';
@@ -391,7 +487,7 @@ function TurnView({ turn, target, workingDirectory, changesetTemplate, active, c
     }
   };
   return (
-    <article className="turn">
+    <article className="turn" data-turn-id={turn.id} data-search-target={highlighted ? 'true' : undefined}>
       <div className="user-message-row">
         {onEdit && (
           <button type="button" className="turn-action" aria-label={editBlockedReason ?? 'Редактировать сообщение'}

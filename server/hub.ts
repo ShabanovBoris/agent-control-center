@@ -33,11 +33,12 @@ import {
   SIDE_CHAT_FIRST_EDIT_UNAVAILABLE,
   type AgentOverview,
   type AgentSdkDownload,
-  type HostCall as Call,
+  type Call,
   type CallError,
   type ChannelState,
   type EditMessageResult,
   type HostOverview,
+  type HostStatus,
   type Overview,
   type ServerMessage,
   type SlashCompletions,
@@ -45,6 +46,9 @@ import {
 import { channelKey, isSupportedChannel } from '../shared/reduce.js';
 import { ChannelMirror } from './mirror.js';
 import type { DirectoryPicker } from './directory-picker.js';
+import { abortable } from './async.js';
+import { CallFailure, errorMessage, toCallError } from './errors.js';
+import { HistorySearch, Semaphore, type SearchEnvironment, type SearchLimits } from './search.js';
 
 // Служебные ключи VS Code в root config. Это не часть AHP: через них референсный клиент
 // просит хост скачать SDK агента (явное согласие пользователя) или перечитать его настройки.
@@ -72,11 +76,7 @@ interface PendingAction {
   finish(error?: unknown): void;
 }
 
-export class CallFailure extends Error {
-  constructor(message: string, readonly code?: number) {
-    super(message);
-  }
-}
+export { CallFailure, errorMessage, toCallError } from './errors.js';
 
 export interface HubSink {
   /** Сообщение всем подключённым браузерам. */
@@ -89,13 +89,17 @@ export interface HubSink {
  * Связывает AHP-хосты с браузерами: держит соединения через MultiHostClient,
  * ведёт зеркало состояния каналов и переводит узкие команды UI в AHP actions.
  */
-export class Hub {
+export class Hub implements SearchEnvironment {
   private readonly mirror = new ChannelMirror();
   private readonly watchCounts = new Map<string, number>();
   private readonly channelErrors = new Map<string, CallError>();
   private readonly connectedOnce = new Set<string>();
   private readonly pendingActions = new Map<string, PendingAction>();
   private readonly editingChats = new Set<string>();
+  /** Слушатели изменений канала: поиск ждёт снимок или следующую страницу истории. */
+  private readonly channelChanges = new Map<string, Set<() => void>>();
+  private readonly pageLocks = new Map<string, Semaphore>();
+  private readonly historySearch: HistorySearch;
   private overviewTimer: NodeJS.Timeout | undefined;
 
   constructor(
@@ -105,7 +109,10 @@ export class Hub {
     private readonly visibleAgents?: readonly string[],
     private readonly directoryPicker?: Pick<DirectoryPicker, 'availableFor' | 'choose'>,
     private readonly defaultModels?: ReadonlyMap<string, Readonly<Record<string, string>>>,
-  ) {}
+    searchLimits?: SearchLimits,
+  ) {
+    this.historySearch = new HistorySearch(this, searchLimits);
+  }
 
   async start(hosts: readonly HostConfig[]): Promise<void> {
     void this.consumeHostEvents();
@@ -119,6 +126,15 @@ export class Hub {
   async stop(): Promise<void> {
     clearTimeout(this.overviewTimer);
     for (const action of this.pendingActions.values()) action.finish(new CallFailure('Backend завершает работу'));
+    this.historySearch.clear();
+    this.pageLocks.clear();
+    // Ожидающие снимка/страницы не должны пережить остановку backend.
+    this.watchCounts.clear();
+    for (const key of [...this.channelChanges.keys()]) {
+      this.channelErrors.set(key, { message: 'Backend завершает работу' });
+      const [hostId, uri] = key.split('\u0000') as [string, string];
+      this.notifyChannel(hostId, uri);
+    }
     await this.multi.shutdown();
   }
 
@@ -171,6 +187,7 @@ export class Hub {
     this.watchCounts.delete(key);
     this.channelErrors.delete(key);
     this.mirror.drop(hostId, uri);
+    this.notifyChannel(hostId, uri);
     this.multi.unsubscribe(hostId, uri).catch(error => console.warn(`[hub] unsubscribe ${uri} failed:`, errorMessage(error)));
   }
 
@@ -182,6 +199,145 @@ export class Hub {
       if (error instanceof CallFailure) throw error;
       throw new CallFailure(errorMessage(error), error instanceof RpcError ? error.code : undefined);
     }
+  }
+
+  // --- SearchEnvironment: то, что нужно поиску по истории, без доступа к SDK напрямую.
+
+  sessions(): Overview['sessions'] {
+    return this.overview().sessions;
+  }
+
+  hostStatus(hostId: string): HostStatus | undefined {
+    return this.multi.host(hostId)?.state.status;
+  }
+
+  mirrorChat(hostId: string, chatUri: string): ChatState | undefined {
+    return this.mirror.state(hostId, chatUri) as ChatState | undefined;
+  }
+
+  mirrorSession(hostId: string, sessionUri: string): SessionState | undefined {
+    return this.mirror.state(hostId, sessionUri) as SessionState | undefined;
+  }
+
+  /**
+   * Открывает чат для поиска и удерживает подписку до `releaseChat`.
+   * При ошибке подписка не остаётся висеть: чужой watchCount не уменьшается.
+   */
+  async openChat(hostId: string, chatUri: string, signal: AbortSignal, waitMs: number): Promise<ChatState> {
+    signal.throwIfAborted();
+    const state = this.watch(hostId, chatUri);
+    if (state !== undefined) return state as ChatState;
+    try {
+      return await this.waitForChannel(hostId, chatUri, value => value !== undefined, signal, waitMs) as ChatState;
+    } catch (error) {
+      this.unwatch(hostId, chatUri);
+      throw error;
+    }
+  }
+
+  releaseChat(hostId: string, chatUri: string): void {
+    this.unwatch(hostId, chatUri);
+  }
+
+  /**
+   * Загружает одну страницу истории. Страницы одного чата сериализуются, а уже
+   * загруженный курсор превращается в no-op: SessionUsage, поиск и правка хода
+   * могут позвать один и тот же курсор.
+   */
+  async fetchOlderTurns(hostId: string, chatUri: string, cursor: string, signal?: AbortSignal, waitMs = 5000): Promise<ChatState | undefined> {
+    if (typeof cursor !== 'string' || !cursor) throw new CallFailure('Ожидался курсор истории');
+    const key = channelKey(hostId, chatUri);
+    let lock = this.pageLocks.get(key);
+    if (!lock) {
+      lock = new Semaphore(1);
+      this.pageLocks.set(key, lock);
+    }
+    const pageLock = lock;
+    const task = () => this.loadPage(hostId, chatUri, cursor, signal, waitMs);
+    try {
+      // Свободный лок не должен добавлять лишний microtask: вызывающий ждёт
+      // отправки запроса синхронно, как и до сериализации.
+      if (pageLock.tryAcquire()) {
+        try { return await task(); } finally { pageLock.release(); }
+      }
+      return await pageLock.run(signal, task);
+    } finally {
+      if (pageLock.pending === 0 && this.pageLocks.get(key) === pageLock) this.pageLocks.delete(key);
+    }
+  }
+
+  private async loadPage(hostId: string, chatUri: string, cursor: string, signal: AbortSignal | undefined, waitMs: number): Promise<ChatState | undefined> {
+    signal?.throwIfAborted();
+    const before = this.mirror.state(hostId, chatUri) as ChatState | undefined;
+    if (!before) {
+      // Раньше страницу можно было запросить без подписки; это поведение сохраняем.
+      await abortable(this.client(hostId).request('fetchTurns', { channel: chatUri, cursor }), signal, 'Загрузка истории отменена');
+      return this.mirror.state(hostId, chatUri) as ChatState | undefined;
+    }
+    if (before.turnsNextCursor !== cursor) return before;
+    const beforeLength = before.turns.length;
+    const changed = (state: ChatState) => state.turnsNextCursor !== cursor || state.turns.length !== beforeLength;
+    let failure: unknown;
+    try {
+      await abortable(this.client(hostId).request('fetchTurns', { channel: chatUri, cursor }), signal, 'Загрузка истории отменена');
+    } catch (error) {
+      failure = error;
+    }
+    // Действие `chat/turnsLoaded` может прийти раньше ответа на запрос.
+    const current = this.mirror.state(hostId, chatUri) as ChatState | undefined;
+    if (current && changed(current)) return current;
+    if (failure !== undefined) throw failure;
+    return await this.waitForChannel(hostId, chatUri, value => changed(value as ChatState), signal, waitMs) as ChatState;
+  }
+
+  private notifyChannel(hostId: string, uri: string): void {
+    const listeners = this.channelChanges.get(channelKey(hostId, uri));
+    if (!listeners?.size) return;
+    for (const listener of [...listeners]) listener();
+  }
+
+  private waitForChannel(
+    hostId: string,
+    uri: string,
+    predicate: (state: ChannelState) => boolean,
+    signal: AbortSignal | undefined,
+    timeoutMs: number,
+  ): Promise<ChannelState> {
+    const key = channelKey(hostId, uri);
+    return new Promise<ChannelState>((resolve, reject) => {
+      let timer: NodeJS.Timeout | undefined;
+      let settled = false;
+      const cleanup = () => {
+        clearTimeout(timer);
+        signal?.removeEventListener('abort', onAbort);
+        const listeners = this.channelChanges.get(key);
+        listeners?.delete(listener);
+        if (listeners?.size === 0) this.channelChanges.delete(key);
+      };
+      const finish = (error?: unknown, state?: ChannelState) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        if (error !== undefined) reject(error);
+        else resolve(state!);
+      };
+      const check = () => {
+        const failure = this.channelErrors.get(key);
+        if (failure) { finish(new CallFailure(failure.message, failure.code)); return; }
+        if (!this.watchCounts.has(key)) { finish(new CallFailure('Канал закрыт до получения состояния')); return; }
+        const state = this.mirror.state(hostId, uri);
+        if (state !== undefined && predicate(state)) { finish(undefined, state); return; }
+      };
+      const listener = () => check();
+      const onAbort = () => finish(signal?.reason ?? new CallFailure('Отменено'));
+      check();
+      if (settled) return;
+      const listeners = this.channelChanges.get(key) ?? new Set<() => void>();
+      listeners.add(listener);
+      this.channelChanges.set(key, listeners);
+      signal?.addEventListener('abort', onAbort, { once: true });
+      timer = setTimeout(() => finish(new CallFailure('Хост не прислал состояние канала вовремя')), timeoutMs);
+    });
   }
 
   private async execute(call: Call, signal?: AbortSignal): Promise<unknown> {
@@ -212,8 +368,16 @@ export class Hub {
         return undefined;
       }
       case 'fetchTurns':
-        await this.client(call.hostId).request('fetchTurns', { channel: call.chatUri, cursor: call.cursor });
+        // Через общую сериализацию: браузер, поиск и editMessage не запрашивают одну страницу дважды.
+        await this.fetchOlderTurns(call.hostId, call.chatUri, call.cursor, signal);
         return undefined;
+      case 'searchHistory': {
+        if (typeof call.query !== 'string') throw new CallFailure('Ожидался поисковый запрос');
+        if (call.limit !== undefined && (!Number.isInteger(call.limit) || call.limit < 1 || call.limit > 100)) {
+          throw new CallFailure('Лимит результатов должен быть целым числом от 1 до 100');
+        }
+        return this.historySearch.search(call.query, signal ?? new AbortController().signal, call.limit);
+      }
       case 'slashCompletions': {
         const { session } = this.historyChat(call);
         if (!this.multi.host(call.hostId)?.completionTriggerCharacters?.includes('/')) return { items: [] } satisfies SlashCompletions;
@@ -416,7 +580,7 @@ export class Hub {
       requireIdleHistory(chat, call.lastTurnId);
       if (chat.turns[0]?.id === call.turnId && chat.turnsNextCursor) {
         signal?.throwIfAborted();
-        await this.client(hostId).request('fetchTurns', { channel: chatUri, cursor: chat.turnsNextCursor });
+        await this.fetchOlderTurns(hostId, chatUri, chat.turnsNextCursor, signal);
         ({ chat } = this.historyChat(call));
         requireIdleHistory(chat, call.lastTurnId);
       }
@@ -553,12 +717,14 @@ export class Hub {
       this.mirror.loadFinished(token, undefined);
       // Подписка остаётся отслеживаемой: после восстановления связи resync запросит снимок заново.
       this.reportChannelError(hostId, uri, toCallError(error));
+      this.notifyChannel(hostId, uri);
       return;
     }
     if (!this.mirror.isCurrent(token)) return;
     if (snapshot?.state == null || !Number.isSafeInteger(snapshot.fromSeq)) {
       this.mirror.loadFinished(token, undefined);
       this.reportChannelError(hostId, uri, { message: 'Хост не вернул состояние канала' });
+      this.notifyChannel(hostId, uri);
       return;
     }
     const loaded = this.mirror.loadFinished(token, snapshot);
@@ -567,6 +733,7 @@ export class Hub {
       for (const type of loaded.invalidActions) this.reportInvalidAction(hostId, uri, type);
       if (uri === ROOT_URI) this.scheduleOverview();
     }
+    this.notifyChannel(hostId, uri);
   }
 
   private async consumeHostEvents(): Promise<void> {
@@ -576,6 +743,7 @@ export class Hub {
         // replay вернул снимки, не-root снимки он не отдаёт наружу. Поэтому состояние всех
         // отслеживаемых каналов перезапрашивается: порядок с replay разрешает serverSeq.
         const reconnecting = this.connectedOnce.has(event.hostId);
+        if (reconnecting) this.historySearch.forgetHost(event.hostId);
         const uris = reconnecting ? this.mirror.urisOf(event.hostId) : [ROOT_URI];
         this.connectedOnce.add(event.hostId);
         for (const uri of uris) {
@@ -626,6 +794,7 @@ export class Hub {
       }
       if (applied === 'applied') this.sink.toWatchers(hostId, channel, { t: 'action', hostId, uri: channel, action });
       pending?.finish();
+      this.notifyChannel(hostId, channel);
       if (channel === ROOT_URI) this.scheduleOverview();
     }
   }
@@ -648,8 +817,10 @@ export class Hub {
       this.mirror.drop(hostId, uri);
       const key = channelKey(hostId, uri);
       if (this.watchCounts.has(key)) this.channelErrors.set(key, { message: 'Сессия удалена на хосте', code: AhpErrorCodes.SessionNotFound });
+      this.notifyChannel(hostId, uri);
       void this.multi.unsubscribe(hostId, uri).catch(error => console.warn(`[hub] unsubscribe removed ${uri}:`, errorMessage(error)));
     }
+    this.historySearch.forgetSession(hostId, sessionUri);
     this.sink.broadcast({ t: 'sessionRemoved', hostId, sessionUri, chatUris });
   }
 
@@ -735,11 +906,3 @@ export function toFileUri(path: string): string {
   return `file://${trimmed.split('/').map(encodeURIComponent).join('/')}`;
 }
 
-export function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
-}
-
-export function toCallError(error: unknown): CallError {
-  if (error instanceof CallFailure || error instanceof RpcError) return { message: error.message, ...(error.code !== undefined ? { code: error.code } : {}) };
-  return { message: errorMessage(error) };
-}

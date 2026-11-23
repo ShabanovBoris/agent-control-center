@@ -2,7 +2,7 @@
 import WebSocket from 'ws';
 import { parseServerMessage, type Call, type ClientMessage } from '../shared/protocol.js';
 
-const readOnly = new Set<string>(['refreshSession', 'fetchTurns', 'readResource'] satisfies Call['op'][]);
+const readOnly = new Set<string>(['refreshSession', 'fetchTurns', 'readResource', 'searchHistory'] satisfies Call['op'][]);
 
 function parseCommands(args: string[], allowWrite: boolean): ClientMessage[] {
   return args.map((arg, index) => {
