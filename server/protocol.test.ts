@@ -24,6 +24,8 @@ test('парсер клиента проверяет обязательные п
     { t: 'call', id: 3, call: { op: 'pushSubscribe', origin: 'https://mac.ts.net', subscription: { endpoint: 'https://push.example/e', keys: { p256dh: 'a', auth: 'b' } } } },
     { t: 'call', id: 4, call: { op: 'pushUnsubscribe', endpoint: 'https://push.example/e' } },
     { t: 'call', id: 5, call: { op: 'pushTest', origin: 'https://mac.ts.net' } },
+    { t: 'call', id: 6, call: { op: 'health' } },
+    { t: 'call', id: 7, call: { op: 'readLog', hostId: 'local' } },
     { t: 'cancelDirectoryPicker' },
   ];
   for (const message of valid) assert.deepEqual(parseClientMessage(JSON.stringify(message)), message);

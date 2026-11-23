@@ -1,12 +1,12 @@
 import { setTimeout as delay } from 'node:timers/promises';
 import type { ChildProcess } from 'node:child_process';
 import type { Hub } from './hub.js';
+import { readHostBuild, type HostBuild } from './host-build.js';
 import {
   localInstance,
   restartLocalHost,
   startLocalHost,
   waitForLocalHost,
-  type HostBuild,
   type HostInstance,
   type LocalHost,
 } from './local-hosts.js';
@@ -33,15 +33,6 @@ export interface RestartServicesOptions {
   ) => Promise<void>;
   startHost?: (host: LocalHost) => Promise<ChildProcess>;
   waitForHost?: (host: LocalHost, ready: () => boolean, child: ChildProcess, signal: AbortSignal) => Promise<void>;
-}
-
-function build(value: unknown): HostBuild {
-  const candidate = (value as { _meta?: { hostBuild?: unknown } } | undefined)?._meta?.hostBuild as Partial<HostBuild> | undefined;
-  if (typeof candidate?.version !== 'string' || !/^\d+\.\d+\.\d+$/.test(candidate.version)
-      || typeof candidate.commit !== 'string' || !/^[a-f0-9]{40}$/.test(candidate.commit)) {
-    throw new Error('Хост не сообщил корректную версию Agent Host.');
-  }
-  return candidate as HostBuild;
 }
 
 async function activeSessions(hub: RestartServicesOptions['hub'], host: LocalHost): Promise<number> {
@@ -101,7 +92,9 @@ export async function restartServices(options: RestartServicesOptions): Promise<
       }
       const previous = options.hub.hostGeneration(host.id);
       console.log(`[services] Перезапуск хоста «${host.label}».`);
-      await restart(host, instance, build(root), ready(options.hub, host, previous), async () => {
+      const parsed = readHostBuild(root._meta?.hostBuild);
+      if (!parsed) throw new Error('Хост не сообщил корректную версию Agent Host.');
+      await restart(host, instance, parsed, ready(options.hub, host, previous), async () => {
         if (await activeSessions(options.hub, host) !== 0) {
           throw new Error(`На хосте «${host.label}» появились активные задачи. Перезапуск отменён.`);
         }

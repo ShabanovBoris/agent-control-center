@@ -37,6 +37,7 @@ import {
   type CallError,
   type ChannelState,
   type EditMessageResult,
+  type HostIssue,
   type HostOverview,
   type HostStatus,
   type Overview,
@@ -48,6 +49,9 @@ import { ChannelMirror } from './mirror.js';
 import type { DirectoryPicker } from './directory-picker.js';
 import { abortable } from './async.js';
 import { CallFailure, errorMessage, toCallError } from './errors.js';
+import { readHostBuild, type HostBuild } from './host-build.js';
+import { appendHostIssue } from './host-issues.js';
+import { redactSecrets } from './redact.js';
 import { HistorySearch, Semaphore, type SearchEnvironment, type SearchLimits } from './search.js';
 
 // Служебные ключи VS Code в root config. Это не часть AHP: через них референсный клиент
@@ -85,6 +89,16 @@ export interface HubSink {
   toWatchers(hostId: string, uri: string, message: ServerMessage): void;
 }
 
+/** Диагностика хоста сверх `HostOverview`: история ошибок и время последнего события. */
+export interface HostDiagnostics {
+  id: string;
+  lastConnectedAt?: string;
+  lastEventAt?: string;
+  activeSessions?: number;
+  hostBuild?: HostBuild;
+  issues: readonly HostIssue[];
+}
+
 /**
  * Связывает AHP-хосты с браузерами: держит соединения через MultiHostClient,
  * ведёт зеркало состояния каналов и переводит узкие команды UI в AHP actions.
@@ -100,6 +114,8 @@ export class Hub implements SearchEnvironment {
   private readonly channelChanges = new Map<string, Set<() => void>>();
   private readonly pageLocks = new Map<string, Semaphore>();
   private readonly historySearch: HistorySearch;
+  private readonly hostIssues = new Map<string, HostIssue[]>();
+  private readonly lastEventAt = new Map<string, number>();
   private overviewTimer: NodeJS.Timeout | undefined;
 
   constructor(
@@ -148,6 +164,23 @@ export class Hub implements SearchEnvironment {
   hostGeneration(hostId: string): number | undefined {
     const host = this.multi.host(hostId);
     return host?.state.status === 'connected' ? host.generation : undefined;
+  }
+
+  /** Снимок диагностики по каждому известному хосту: без сети, только уже накопленные данные. */
+  hostDiagnostics(): HostDiagnostics[] {
+    return this.multi.hostsSnapshot().map(host => {
+      const root = this.mirror.state(host.id, ROOT_URI) as RootState | undefined;
+      const hostBuild = readHostBuild(root?._meta?.hostBuild);
+      const lastEventAt = this.lastEventAt.get(host.id);
+      return {
+        id: host.id,
+        ...(typeof host.lastConnectedAt === 'number' ? { lastConnectedAt: new Date(host.lastConnectedAt).toISOString() } : {}),
+        ...(lastEventAt === undefined ? {} : { lastEventAt: new Date(lastEventAt).toISOString() }),
+        ...(typeof host.activeSessions === 'number' ? { activeSessions: host.activeSessions } : {}),
+        ...(hostBuild ? { hostBuild } : {}),
+        issues: [...(this.hostIssues.get(host.id) ?? [])],
+      };
+    });
   }
 
   async hostRoot(hostId: string): Promise<RootState> {
@@ -729,6 +762,8 @@ export class Hub implements SearchEnvironment {
     }
     const loaded = this.mirror.loadFinished(token, snapshot);
     if (loaded) {
+      // Снимок канала — тоже событие от хоста: страница здоровья показывает его время.
+      this.lastEventAt.set(hostId, Date.now());
       this.sink.toWatchers(hostId, uri, { t: 'snapshot', hostId, uri, state: loaded.state });
       for (const type of loaded.invalidActions) this.reportInvalidAction(hostId, uri, type);
       if (uri === ROOT_URI) this.scheduleOverview();
@@ -738,7 +773,15 @@ export class Hub implements SearchEnvironment {
 
   private async consumeHostEvents(): Promise<void> {
     for await (const event of this.multi.hostEvents()) {
+      if (event.type === 'stateChanged' && event.lastError) {
+        // AHP публикует lastError и при переходе в reconnecting, и при failed, поэтому
+        // один сбой может увеличить счётчик дважды: история считает наблюдаемые повторы.
+        this.recordHostIssue(event.hostId, event.lastError.message);
+      }
       if (event.type === 'connected') {
+        // Отвеченный initialize — подтверждение, что хост жив; неудачные попытки в
+        // «последнее событие» не попадают, иначе сломанный хост выглядел бы активным.
+        this.lastEventAt.set(event.hostId, Date.now());
         // При повторном подключении SDK доигрывает пропущенные actions, но если хост вместо
         // replay вернул снимки, не-root снимки он не отдаёт наружу. Поэтому состояние всех
         // отслеживаемых каналов перезапрашивается: порядок с replay разрешает serverSeq.
@@ -761,6 +804,7 @@ export class Hub implements SearchEnvironment {
 
   private async consumeEvents(): Promise<void> {
     for await (const { hostId, channel, event } of this.multi.events()) {
+      this.lastEventAt.set(hostId, Date.now());
       if (event.type === 'sessionRemoved') this.removeSession(hostId, event.params.session);
       if (event.type !== 'action') {
         // sessionAdded / sessionRemoved / sessionSummaryChanged / authRequired: сводку SDK уже обновил.
@@ -804,6 +848,11 @@ export class Hub implements SearchEnvironment {
     this.sink.toWatchers(hostId, uri, { t: 'channelError', hostId, uri, error: 'Не удалось применить действие хоста' });
   }
 
+  private recordHostIssue(hostId: string, message: string): void {
+    const issues = this.hostIssues.get(hostId) ?? [];
+    this.hostIssues.set(hostId, appendHostIssue(issues, redactSecrets(message), new Date().toISOString()));
+  }
+
   private reportChannelError(hostId: string, uri: string, failure: CallError): void {
     this.channelErrors.set(channelKey(hostId, uri), failure);
     this.sink.toWatchers(hostId, uri, { t: 'channelError', hostId, uri, error: failure.message, ...(failure.code !== undefined ? { code: failure.code } : {}) });
@@ -840,7 +889,7 @@ export class Hub implements SearchEnvironment {
       label: host.label,
       slashCompletions: host.completionTriggerCharacters?.includes('/') ?? false,
       status: host.state.status,
-      ...(host.lastError ? { error: host.lastError.message } : {}),
+      ...(host.lastError ? { error: redactSecrets(host.lastError.message) } : {}),
       ...(host.protocolVersion ? { protocolVersion: host.protocolVersion } : {}),
       ...(host.defaultDirectory ? { defaultDirectory: host.defaultDirectory } : {}),
       canPickDirectory: this.directoryPicker?.availableFor(host.id) ?? false,

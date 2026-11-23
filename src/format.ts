@@ -7,6 +7,7 @@ import {
   type ChatInputQuestion,
   type ChatInputRequest,
 } from '@microsoft/agent-host-protocol';
+import type { HostStatus } from '../shared/protocol';
 import type { Phase } from '../shared/status';
 
 // Роутинг, фазу и текстовые хелперы делят клиент, backend и service worker; отсюда они только
@@ -14,6 +15,14 @@ import type { Phase } from '../shared/status';
 export { pathOf, plain } from '../shared/text';
 export { isArchived, phaseOf, type Phase } from '../shared/status';
 export { selectionFromHash, selectionToHash, type Selection } from '../shared/routing';
+
+export const HOST_STATUS_LABEL: Record<HostStatus, string> = {
+  connected: 'Подключён',
+  connecting: 'Подключение…',
+  reconnecting: 'Переподключение…',
+  disconnected: 'Отключён',
+  failed: 'Недоступен',
+};
 
 export const PHASE_LABEL: Record<Phase, string> = {
   input: 'Ждёт ответа',

@@ -2,7 +2,8 @@ import type { UpdateCheck } from '../shared/protocol.js';
 import { agentPackages, compareVersions, resolveAgentSdk, stableVersion } from '../scripts/agent-sdks.mjs';
 import { installedAhpVersion, installVersion, latestVersion, type UpdateComponent, type UpdateVersions } from '../scripts/update-agents.mjs';
 import type { Hub } from './hub.js';
-import { canUpdateSdk, localInstance, restartLocalHost, runningSdks, type HostBuild, type HostInstance, type LocalHost } from './local-hosts.js';
+import { readHostBuild, type HostBuild } from './host-build.js';
+import { canUpdateSdk, localInstance, restartLocalHost, runningSdks, type HostInstance, type LocalHost } from './local-hosts.js';
 
 const agentNames = { codex: 'Codex', claude: 'Claude SDK' };
 type Agent = keyof typeof agentPackages;
@@ -28,20 +29,13 @@ export interface UpdatePlan {
   restartBackend: boolean;
 }
 
-function hostBuild(value: unknown): HostBuild | undefined {
-  const build = value as Partial<HostBuild> | undefined;
-  if (typeof build?.version !== 'string' || !stableVersion.test(build.version) ||
-      typeof build.commit !== 'string' || !/^[a-f0-9]{40}$/.test(build.commit)) return undefined;
-  return { version: build.version, commit: build.commit };
-}
-
 async function latestHostBuild(): Promise<HostBuild> {
   const response = await fetch(`https://update.code.visualstudio.com/api/update/server-darwin-${process.arch}/stable/latest`, {
     signal: AbortSignal.timeout(12_000),
   });
   if (!response.ok) throw new Error(`Служба обновлений VS Code вернула HTTP ${response.status}.`);
   const metadata = await response.json();
-  const build = hostBuild({ version: metadata.productVersion, commit: metadata.version });
+  const build = readHostBuild({ version: metadata.productVersion, commit: metadata.version });
   if (!build) throw new Error('Служба обновлений VS Code не вернула версию Agent Host.');
   return build;
 }
@@ -75,7 +69,7 @@ export class ProjectUpdates {
     const instance = await localInstance(host);
     if (!instance) throw new Error(`Хост «${host.label}» должен быть запущен скриптом этого проекта через VS Code Stable.`);
     const root = await this.hub.hostRoot(host.id);
-    const build = hostBuild(root._meta?.hostBuild);
+    const build = readHostBuild(root._meta?.hostBuild);
     if (!build) throw new Error(`Хост «${host.label}» не сообщил версию Agent Host.`);
     return { host, instance, build, active: root.activeSessions, versions: await runningSdks(host, instance, build) };
   }
