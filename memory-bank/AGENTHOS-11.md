@@ -21,8 +21,9 @@
       head `1f69000`. Упал шаг `Typecheck`:
       `src/ci-type-regression.ts(1,14): error TS2322: Type 'string' is not assignable to type 'number'.`
       Шаги `Test`, `Test debug UI`, `Build` — skipped. В `main` файла нет.
-- [x] Baseline и регрессия локально на `fbc4509`: `npm run typecheck` exit 0, `npm test` 132/132,
-      `npm test --prefix debug-ui` 4/4, `npm run build` exit 0.
+- [x] Baseline и регрессия локально: до workflow (`3bed0e2`) и повторно после документации (`98da139`)
+      — `npm run typecheck` exit 0, `npm test` 132/132, `npm test --prefix debug-ui` 4/4,
+      `npm run build` exit 0 и 505.49 kB / gzip 153.52 kB с warning.
 - [x] Сборка: `dist/assets/index-DQMZZ0Bv.js` 505.49 kB, gzip 153.52 kB; Vite warning о чанке >500 kB
       виден в логе Actions. `chunkSizeWarningLimit` не задавался, warning намеренно не подавлен
       (в workflow у шага Build есть комментарий).
