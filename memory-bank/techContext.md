@@ -11,6 +11,12 @@ React, TypeScript, Vite, Node.js 22+, `ws` и официальный TypeScript 
 | `npm run mock-host`, `npm run server:dev` | Учебный хост на `8189` и backend с `hosts.dev.json` |
 | `npm run typecheck`, `npm test`, `npm run build` | Проверка типов, тесты и production-сборка |
 
+GitHub Actions [workflow](../.github/workflows/ci.yml) на pull request и push в `main` (Node.js 22)
+выполняет `npm ci`, `npm ci --prefix debug-ui`, `npm run typecheck`, `npm test`,
+`npm test --prefix debug-ui`, `npm run build`; npm-кэш учитывает оба lockfile. Секреты, `.local`,
+AHP-хосты и VS Code CLI не требуются. Check `verify` требуется для merge PR в `main`; прямые push
+администратора branch protection не блокирует (`enforce_admins: false`).
+
 Claude и Gemini читают `API_KEY` и `BASE_URL` из `.local/model-provider.env`. Claude использует Anthropic Messages API и базовый адрес без `/v1`. Gemini использует Responses API и базовый адрес с `/v1`. На момент проверки локального файла адреса были `https://ru.cheapvibecode.ru` и `https://ru.cheapvibecode.ru/v1` соответственно. Актуальный источник этих значений — локальный файл. [Шаблон](../model-provider.env.example) · [Claude](../scripts/start-host.sh) · [Gemini](../scripts/start-gemini-host.ts)
 
 [Обёртка Claude SDK](../scripts/claude-provider.mjs) подставляет настройки API и очищает старый OAuth. Основной Codex сохраняет локальный вход ChatGPT. Gemini использует отдельные данные хоста, токен AHP и `CODEX_HOME` в `.local/gemini-codex`. Хост переиспользует установленный SDK Codex при наличии кэша.

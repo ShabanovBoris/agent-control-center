@@ -222,6 +222,33 @@ npm test --prefix debug-ui
 По умолчанию доступны сводка, подписки и команды чтения. Для команд, меняющих состояние хоста,
 передайте `--write` первым аргументом перед JSON-командами.
 
+### CI
+
+GitHub Actions workflow [`.github/workflows/ci.yml`](.github/workflows/ci.yml) запускается на каждый
+pull request и на push в `main`. Job `verify` работает на Node.js 22 и выполняет:
+
+```bash
+npm ci
+npm ci --prefix debug-ui
+npm run typecheck
+npm test
+npm test --prefix debug-ui
+npm run build
+```
+
+Кэш npm учитывает оба lockfile. Секреты, `.local`, реальные AHP-хосты и VS Code CLI не нужны:
+проверяются только unit-тесты и production-сборка. E2E, деплой, публикация артефактов и
+линтер/форматтер в workflow не входят.
+
+`npm run build` предупреждает о чанке больше 500 kB; предупреждение не подавляется и сборку не валит.
+Размер на 23 ноября 2026 — 505.49 kB (gzip 153.52 kB); цифры и ссылки на прогоны —
+в [memory-bank/AGENTHOS-11.md](memory-bank/AGENTHOS-11.md).
+
+Check `verify` включён как required для pull request в `main`. Required status checks проверяются
+только при merge PR; прямые push в `main` проходят мимо branch protection, потому что правила к
+администраторам не применяются (`enforce_admins: false`) и отдельного требования «только через PR»
+нет.
+
 ## Устройство
 
 - `server/hub.ts` — соединения с хостами через `MultiHostClient` из SDK, перевод команд UI в AHP actions.
