@@ -37,6 +37,10 @@
       PR #6 — run [45264627333](https://github.com/ShabanovBoris/agent-control-center/actions/runs/45264627333);
       после merge — push-прогон в `main` [45264703265](https://github.com/ShabanovBoris/agent-control-center/actions/runs/45264703265)
       на `2c157c3`, success.
+- [x] Concurrency с отменой устаревшего прогона проверена на временной ветке (PR #7, закрыт без merge):
+      два push подряд отменили прогон первого коммита — run [45264933773](https://github.com/ShabanovBoris/agent-control-center/actions/runs/45264933773)
+      `cancelled`, прогон второго — run [45264962126](https://github.com/ShabanovBoris/agent-control-center/actions/runs/45264962126)
+      success.
 
 ## Что CI не делает
 
