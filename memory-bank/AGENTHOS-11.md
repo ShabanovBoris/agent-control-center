@@ -32,6 +32,11 @@
       `required_status_checks.contexts = ["verify"]` (app `github-actions`, app_id 15368),
       `strict: false`, `enforce_admins: false`, `required_pull_request_reviews: null`,
       `restrictions: null`, force-push и удаление ветки запрещены.
+- [x] Проверка, что required check действительно гейтит merge: в PR #6 с документацией при pending
+      `verify` GitHub отдавал `mergeStateStatus: BLOCKED`, после успешного check — `CLEAN`. Прогон
+      PR #6 — run [45264627333](https://github.com/ShabanovBoris/agent-control-center/actions/runs/45264627333);
+      после merge — push-прогон в `main` [45264703265](https://github.com/ShabanovBoris/agent-control-center/actions/runs/45264703265)
+      на `2c157c3`, success.
 
 ## Что CI не делает
 
