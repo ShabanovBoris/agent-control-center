@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: "${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            debug-ui/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install debug UI dependencies
+        run: npm ci --prefix debug-ui
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+      - name: Test debug UI
+        run: npm test --prefix debug-ui
+
+      # Vite warns about the >500 kB chunk. Keep the warning visible; do not set chunkSizeWarningLimit.
+      - name: Build
+        run: npm run build
