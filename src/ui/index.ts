@@ -6,4 +6,5 @@ export { AttachmentUpload } from './AttachmentUpload';
 export { FileEditDisplay } from './FileEditDisplay';
 export { TerminalOutput } from './TerminalOutput';
 export { SubagentCard } from './SubagentCard';
+export { MarkdownMessage } from './MarkdownMessage';
 export { MessageView } from './MessageView';

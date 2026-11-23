@@ -30,13 +30,13 @@ import {
 } from '@microsoft/agent-host-protocol';
 import { SIDE_CHAT_FIRST_EDIT_UNAVAILABLE, type HostOverview, type ModelOverview, type SlashCompletions } from '../shared/protocol';
 import { PhaseBadge } from './App';
-import { copyableResponseText } from './copy-response';
 import { collectFileEdits, resolveTurnChangeset } from './file-edits';
 import { inputOutcome, isArchived, pathOf, phaseOf, plain } from './format';
+import { completedResponseText, layoutParts, type NonMarkdownPart } from './markdown-stream';
 import { composerModelOf, readPreferredModel, savePreferredModel } from './model';
 import { SessionUsage } from './SessionUsage';
 import { describeError, store, useChannel } from './store';
-import { ChatSourceMenu, ConfigPanel, FileEditDisplay, MessageView, ReasoningBlock, ToolResultsDisplay } from './ui';
+import { ChatSourceMenu, ConfigPanel, FileEditDisplay, MarkdownMessage, MessageView, ReasoningBlock, ToolResultsDisplay } from './ui';
 import { attachmentLabel, MAX_ATTACHMENT_FILE_BYTES, readFileAttachment } from './ui/AttachmentUpload';
 import { EditMessageDialog } from './ui/EditMessageDialog';
 import { modeFields } from './ui/ConfigPanel';
@@ -339,8 +339,8 @@ function Transcript({ chat, target, sessionUri, workingDirectory, commandsAvaila
               ? () => setEditing({ turn: completed, lastTurnId })
               : undefined}
             editBlockedReason={turn.id === firstSideTurnId ? SIDE_CHAT_FIRST_EDIT_UNAVAILABLE : undefined}
-            onFork={completed?.state === TurnState.Complete && canFork
-              && completed.responseParts.some(part => part.kind === ResponsePartKind.Markdown && part.content.trim())
+            onFork={completed && canFork
+              && completedResponseText(completed.state, completed.responseParts) !== undefined
               ? () => void fork(completed.id)
               : undefined}
             forkPending={forkingTurn !== undefined} />
@@ -376,7 +376,7 @@ function TurnView({ turn, target, workingDirectory, changesetTemplate, active, c
   const finished = 'state' in turn ? turn.state : undefined;
   const compact = slashCommand(turn.message.text) === '/compact';
   const compactFailed = compact && (finished === TurnState.Error || turn.responseParts.some(part => part.kind === ResponsePartKind.Error));
-  const responseToCopy = copyableResponseText(finished, turn.responseParts);
+  const responseToCopy = completedResponseText(finished, turn.responseParts);
   const { files, hasFileEditCall } = useMemo(() => collectFileEdits(turn.responseParts), [turn.responseParts]);
   const changesetUri = !active && files.size === 0 && hasFileEditCall
     ? resolveTurnChangeset(changesetTemplate, turn.id) : undefined;
@@ -403,8 +403,10 @@ function TurnView({ turn, target, workingDirectory, changesetTemplate, active, c
         )}
         <div className="message message-user"><MessageView message={turn.message} /></div>
       </div>
-      {turn.responseParts.map((part, index) => (
-        <PartView key={partKey(part, index)} part={part} turnId={turn.id} target={target} active={active} commandsAvailable={commandsAvailable} />
+      {layoutParts(turn.responseParts).map(item => (
+        item.kind === 'markdown'
+          ? <MarkdownMessage key={item.block.key} content={item.block.content} />
+          : <PartView key={partKey(item.part, item.index)} part={item.part} turnId={turn.id} target={target} active={active} commandsAvailable={commandsAvailable} />
       ))}
       {(files.size > 0 || changesetUri) && (
         <FileEditDisplay files={files} hostId={target.hostId} workingDirectory={workingDirectory} changesetUri={changesetUri} />
@@ -444,10 +446,8 @@ function partKey(part: ResponsePart, index: number): string {
   return `${part.kind}:${index}`;
 }
 
-function PartView({ part, turnId, target, active, commandsAvailable }: { part: ResponsePart; turnId: string; target: ChatTarget; active: boolean; commandsAvailable: boolean }) {
+function PartView({ part, turnId, target, active, commandsAvailable }: { part: NonMarkdownPart; turnId: string; target: ChatTarget; active: boolean; commandsAvailable: boolean }) {
   switch (part.kind) {
-    case ResponsePartKind.Markdown:
-      return <div className="message message-agent">{part.content.trimStart()}</div>;
     case ResponsePartKind.Reasoning:
       return <ReasoningBlock content={part.content} />;
     case ResponsePartKind.ToolCall:
