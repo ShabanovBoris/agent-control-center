@@ -249,11 +249,14 @@ interface QueueError {
 Отмена и потери:
   queued | starting | retry_wait ── cancel ──▶ cancelled          (без обращения к хосту)
   running | blocked ── cancel ──▶ blocked(cancel_pending) | cancelled
-                        │  свой ход жив → cancelTurn; хода попытки нет → сразу cancelled (§3.9)
+                        │  исход dispatch неизвестен → задача остаётся running (§3.9)
+                        │  свой ход жив → cancelTurn
+                        │  хода попытки нет и исход старта известен → сразу cancelled
                         └── Turn.state ──▶ completed | cancelled | failed
   running             ── Turn.state=error ──▶ retry_wait (есть попытки) | failed
   starting | running | blocked ── сессия исчезла ──▶ failed(session_missing)
-                        (в blocked наличие сессии проверяется до ожидания снимка, §3.9)
+                        (в blocked — до ожидания снимка; в starting — только после
+                         createSession и watch сессии, §3.9)
 
 Терминальные состояния: completed, failed, cancelled.
 
@@ -271,7 +274,7 @@ interface QueueError {
 | `queued` | зависимость стала `failed`/`cancelled` | `blocked(dependency_failed \| dependency_cancelled)` | Gate пересчитывается на каждом tick (§3.5) |
 | `starting` | чат получен; persist `chatUri` + `turnId` + `running` **до** dispatch | `running` | `running` = «очередь ждёт ход с этим `turnId`», а не подтверждение хоста: write-ahead сильнее, чем ожидание echo |
 | `starting` | retryable-сбой, попытки есть | `retry_wait` | `error` сохраняется в попытке |
-| `starting` | cancel | `cancelled` | `cancelRequestedAt`; без обращения к хосту; пустая сессия остаётся у хоста |
+| `starting` | cancel | `cancelled` | `cancelRequestedAt`; без обращения к хосту; пустая сессия остаётся у хоста; ход не диспатчится — ветка старта перечитывает `cancelRequestedAt` после `createSession` и после появления чата (§5.2) |
 | `starting` | retryable-сбой, попыток нет | `failed` | Терминальное |
 | `starting` | `auth_required`, `model_unavailable`, `chat_read_only` | `failed` | Требуется человек, автоматический retry бессмыслен |
 | `running` | `turn.state === 'complete'` | `completed` | `outcome` из `Turn` + `changes` |
@@ -279,9 +282,9 @@ interface QueueError {
 | `running` | `turn.state === 'cancelled'` | `cancelled` | В т.ч. отмена человеком вне очереди; автоматического retry нет |
 | `running` | `inputNeeded` по чату попытки | `blocked` | Kind определяется по entry (§3.8): сначала «в чате чужой `activeTurn` или непустые `queuedMessages`» → `external_turn`, потом классификация запроса; running-слот освобождается |
 | `running` | `ChatTurnStarted` отклонён хостом до принятия (`turn_rejected`) | `retry_wait` или `failed` | Тот же ряд, что у `starting`: `running` записан write-ahead, поэтому отказ приходит уже в `running`, а хода в `ChatState` нет |
-| `running` | подтверждение старта не пришло за 15 с (`start_timeout`) | `running` либо `retry_wait` | Перечитать чат: `activeTurn.id === attempt.turnId` или ход в `turns` → продолжаем `running`; иначе `retry_wait` (§5.2 п.5) |
+| `running` | подтверждение старта не пришло за 15 с (`start_timeout`) | `running` либо `retry_wait` | Перечитать чат: `activeTurn.id === attempt.turnId` → продолжаем `running`; ход в `turns` → settle по `Turn.state`; иначе хода нет → `retry_wait` (при `cancelRequestedAt` — `cancelled`). Только истечение этих 15 с при доступном `ChatState` делает отсутствие хода доказательством (§3.9) |
 | `running`, `blocked` (включая `cancel_pending`) | сессия подтверждённо исчезла при подключённом хосте (§3.9 «Потеря видимости») | `failed(session_missing)` | Зависимые → `blocked(dependency_failed)`; lease снимается в `finally` закрытия попытки (§5.2 п.7) |
-| `running`, `blocked` | cancel | `blocked(cancel_pending)` или `cancelled` | `cancelTurn` только при `activeTurn.id === attempt.turnId`; без своего хода — сразу `cancelled`; lease сохраняется (§3.9) |
+| `running`, `blocked` | cancel | `running` (окно dispatch→эхо) → `blocked(cancel_pending)` → `cancelled` | `cancelTurn` только при `activeTurn.id === attempt.turnId`; пока исход dispatch неизвестен, задача не терминальна и остаётся `running` (§3.9); без своего хода и с известным исходом старта — сразу `cancelled`; lease сохраняется (§3.9) |
 | `blocked` | `inputNeeded` по чату попытки исчез | `running`, `blocked(external_turn)` или терминальное | Пересчёт целиком по `ChatState`, в том же порядке, что §3.8 шаг 3: ход попытки в `turns` → settle по `Turn.state`; иначе чужой `activeTurn` или непустые `queuedMessages` → `blocked(external_turn)`; иначе свой `activeTurn` → `running`; иначе хода нет → `retry_wait` (§4.4) |
 | `blocked` | host disconnected | `blocked(host_disconnected)` | Причина блокировки меняется, слот не занимается |
 | `blocked(dependency_*)` | все `dependsOn` снова `completed` (retry зависимости завершился) | `queued` | Пересчёт на каждом tick, без рестарта backend; затем обычная проверка готовности (S15) |
@@ -337,8 +340,9 @@ type QueueBlockedKind =
   | 'dependency_failed' | 'dependency_cancelled';
 ```
 
-Алгоритм на каждом tick для задачи в `starting | running`:
+Алгоритм на каждом tick для задачи в `starting | running | blocked` (для `blocked` шаги 1–4 уточняют причину, шаг 5 — выход):
 
+0. Проверить архив: `SessionStatus.IsArchived` в `SessionState.status` (`channels-session/state.ts:71`), а при `attempt.chatUri` — ещё и в `ChatState.status` (`channels-chat/state.ts:59`). Отдельного источника не нужно: бит приходит и в `SessionSummary.status` (`channels-session/state.ts:128`, §2.1) без lease, и в `SessionState`, который шаг 1 всё равно читает под lease. Пока `attempt` ещё без lease (между `persist(starting)` и `watch(session)`), шаг пропускается: читать нечего, а следующий tick придёт уже после подписки. Архивированная сессия или архивный чат попытки → `blocked(session_archived)` без разбора `inputNeeded`, running-слот освобождается. Тот же бит панель проверяет перед правкой чата (`server/hub.ts:469`), поэтому правило совпадает с поведением хоста. Для `blocked` проверка идёт перед сверкой §3.9 и пересчётом шага 5: архив — причина блокировки, а не следствие.
 1. Взять `SessionState.inputNeeded` (если `attempt.chatUri` ещё нет — пропустить шаг).
 2. Оставить только entries с `entry.chat === attempt.chatUri`. Причина: `inputNeeded` агрегирован по всем чатам сессии (`channels-session/state.ts:434`), а approval в боковом чате человека не должен блокировать задачу.
 3. Сначала — исход и владение ходом. Порядок один и тот же здесь, в §3.4 и в §5.4:
@@ -366,62 +370,73 @@ type QueueBlockedKind =
 | Причина | Когда | Кто снимает |
 | --- | --- | --- |
 | `external_turn` | В чате попытки уже есть чужой активный ход или `queuedMessages` (чужой ввод) | Человек завершает свой ход; очередь не отменяет чужой ход |
-| `session_archived` | Сессия или чат архивированы | Человек восстанавливает сессию |
+| `session_archived` | `SessionStatus.IsArchived` в `SessionState.status` или `ChatState.status` (`SessionSummary.status` даёт тот же бит без lease; шаг 0) | Человек восстанавливает сессию: бит снят → пересчёт по шагу 5 |
 | `cancel_pending` | Отмена запрошена, `cancelTurn` отправлен, но ход попытки всё ещё жив и хост не подтвердил отмену за 30 с | Сверка §3.9 ставит исход по `Turn.state`; после 30 с очередь перестаёт повторять `cancelTurn`, ход останавливает человек в панели или VS Code |
 | `host_disconnected` | Хост отключён | Reconnect |
 | `host_unknown` | Хост исчез из конфигурации | Правка `hosts.json` и перезапуск backend |
 | `dependency_failed` / `dependency_cancelled` | Зависимость завершилась неуспешно | Снимается автоматически, когда все `dependsOn` снова `completed` (retry зависимости, §3.5); иначе отмена или удаление задачи |
 
-Отличие от плана (продуктовое решение, вынесено владельцу — §11, вопрос 9): в плане `session_missing` и `model_unavailable` перечислены среди blocked-причин. Здесь они — терминальные `failed`, потому что это не «ждём человека с живой сессией», а «эта попытка больше не может продолжаться». `session_missing` ставится только при подключённом хосте и подтверждённом отсутствии сессии (событие `sessionRemoved`, ответ `refreshSession` → `missing` либо отсутствие в `overview.sessions` дольше 5 с — подробно в §3.9 «Потеря видимости»). Пока хост недоступен, это `blocked(host_disconnected)`: отсутствие данных — не доказательство отсутствия сессии. Если владелец выберет blocked-вариант, меняются только значения `QueueTaskState`/`QueueBlockedKind` и переходы; архитектура и хранение не затрагиваются.
+Отличие от плана (продуктовое решение, вынесено владельцу — §11, вопрос 9): в плане `session_missing` и `model_unavailable` перечислены среди blocked-причин. Здесь они — терминальные `failed`, потому что это не «ждём человека с живой сессией», а «эта попытка больше не может продолжаться». `session_missing` ставится только при подключённом хосте и подтверждённом отсутствии сессии (событие `sessionRemoved` через `TaskHostPort.onSessionRemoved`, ответ `checkSession` → `missing` либо отсутствие в `overview.sessions` дольше 5 с — подробно в §3.9 «Потеря видимости»). Пока хост недоступен, это `blocked(host_disconnected)`: отсутствие данных — не доказательство отсутствия сессии. Если владелец выберет blocked-вариант, меняются только значения `QueueTaskState`/`QueueBlockedKind` и переходы; архитектура и хранение не затрагиваются.
 
 ### 3.9 Отмена
 
 Отмена — процесс, а не флаг (§3.11 п.9): `queueCancel` фиксирует намерение, а терминальное состояние ставит только сверка с хостом. Порядок шагов буквальный, и он же задан в §5.2 п.7 — если эти два места разойдутся, отмена перестаёт работать:
 
 1. **Persist.** `cancelRequestedAt` пишется в файл до любого обращения к хосту (§4.4). Состояние задачи при этом не меняется.
-2. **Диагноз владения ходом** — по `ChatState` чата попытки (`TaskHostPort.chatState`): `chat.activeTurn.id === attempt.turnId` — свой ход жив; `chat.turns` содержит `attempt.turnId` — свой ход уже завершился; ни там, ни там — хода попытки нет.
+2. **Диагноз владения ходом** — по `ChatState` чата попытки (`TaskHostPort.chatState`): `chat.activeTurn.id === attempt.turnId` — свой ход жив; `chat.turns` содержит `attempt.turnId` — свой ход уже завершился; ни там, ни там — хода попытки нет. Третий исход — доказательство только при известном исходе dispatch: пока эхо не пришло, отказ хоста не получен и 15 с подтверждения не истекли, `ChatState` законно не содержит хода (см. «Окно dispatch→эхо» ниже).
 3. **Решение** — по состоянию задачи и диагнозу (таблица ниже). `cancelTurn` вызывается **только** при своём живом ходе. `Hub.cancelTurn` сверяет `activeTurn.id` с переданным `turnId`, но на чужой ход отвечает той же ошибкой «Этот ход уже завершён», что и на завершившийся (`server/hub.ts:293-296`), поэтому по ошибке владение не определить — его нужно проверить до вызова. Чужой `activeTurn` не отменяется никогда (§5.4).
-4. **Lease не снимается при запросе отмены.** Подписки нужны шагам 2–3 и сверке: `Hub.unwatch` при счётчике 1 удаляет канал из зеркала (`server/hub.ts:163-175`, `server/mirror.ts:45-47`), после этого `chatState` бросает «Чат не открыт или его состояние ещё не получено» (`server/hub.ts:495-499`), а `cancelTurn` первым делом читает `ChatState` (`server/hub.ts:294`). Отмена «вслепую» в фоне, без браузерных подписчиков, не отправила бы `ChatTurnCancelled` вообще.
+4. **Lease не снимается при запросе отмены.** Подписки нужны шагам 2–3 и сверке: `Hub.unwatch` при счётчике 1 удаляет канал из зеркала (`server/hub.ts:163-175`, `server/mirror.ts:45-47`), после этого `chatState` бросает «Чат не открыт или его состояние ещё не получено» (`server/hub.ts:495-499`), а `cancelTurn` первым делом читает `ChatState` (`server/hub.ts:294`). Отмена «вслепую» в фоне, без браузерных подписчиков, не отправила бы `ChatTurnCancelled` вообще. Повторный `retain` не делается, пока lease жив; если его нет (recovery после рестарта backend), он сначала восстанавливается — §4.4.
 5. **Сверка** — на каждом следующем tick'е, строго по `attempt.turnId`. Никаких выводов по чужому ходу.
 
 | Состояние на момент `queueCancel` | Диагноз по `ChatState` | Действие | Куда переходит |
 | --- | --- | --- | --- |
 | `queued` | чата ещё нет | без хоста | `cancelled` |
-| `starting` | хода нет по построению: `running` пишется до dispatch (§4.4) | без хоста; если `createSession` уже прошёл, пустая сессия остаётся у хоста | `cancelled` |
+| `starting` | хода нет по построению: `running` пишется до dispatch (§4.4) | без хоста; если `createSession` уже прошёл, пустая сессия остаётся у хоста; ход не диспатчится (§5.2) | `cancelled` |
 | `retry_wait` | попытка закрыта, lease нет | без хоста | `cancelled` |
 | `running`, `blocked` без `attempt.chatUri` | диспатча не было | без хоста | `cancelled` |
+| `running` в окне dispatch→эхо: эхо не пришло, отказ хоста не получен, 15 с не истекли | `attempt.turnId` ещё не может быть в `ChatState`; отсутствие хода не доказательство | `cancelTurn` не вызывается (владения нет), lease сохраняется, намерение уже в файле | остаётся `running` до подтверждения, отказа или таймаута; сверка на следующем tick'е |
 | `running`, `blocked`, `ChatState` недоступен | видимости нет | сначала проверить сессию, затем «Потеря видимости» | `failed(session_missing)`, `blocked(host_*)` либо без изменений |
 | `running`, `blocked`, свой ход жив | `activeTurn.id === attempt.turnId` | `cancelTurn(attempt.turnId)`, lease сохраняется | `blocked(cancel_pending)` |
 | `running`, `blocked`, свой ход завершился | `attempt.turnId` в `turns` | settle по `Turn.state` | `completed` / `cancelled` / `failed` |
-| `running`, `blocked`, хода попытки нет (`activeTurn` пуст или чужой) | ни `activeTurn`, ни `turns` | чужой ход не трогаем, `cancelTurn` не вызывается | `cancelled` |
+| `running`, `blocked`, хода попытки нет, исход старта известен (эхо, отказ или 15 с) | ни `activeTurn`, ни `turns` | чужой ход не трогаем, `cancelTurn` не вызывается | `cancelled` |
 
-Вид блокировки не выбирает ветку отмены — ветку выбирает диагноз `ChatState` из таблицы, и порядок один для `running` и любого `blocked`. `blocked(dependency_*)` попадает в строку «хода попытки нет»: чата попытки уже нет или ход закрыт, отмена сразу терминальная, без обращения к хосту (§3.5). `blocked(external_turn)` — не исключение. Чужой `activeTurn` (`id !== attempt.turnId`) не отменяется никогда, но это не повод оставить жить свой ход: свой ход жив → `cancelTurn(attempt.turnId)` → `blocked(cancel_pending)` → сверка; свой ход уже в `turns` → settle по фактическому `Turn.state`, и `completed` не переписывается на `cancelled` (иначе теряется `outcome`, §3.10); сразу `cancelled` — только когда `attempt.turnId` нет ни в `activeTurn`, ни в `turns`, и найденный чужой `activeTurn` при этом остаётся жить. «Чужой ход не отменяем» относится ровно к `activeTurn` с чужим id.
+Вид блокировки не выбирает ветку отмены — ветку выбирает диагноз `ChatState` из таблицы, и порядок один для `running` и любого `blocked`. `blocked(dependency_*)` попадает в строку «хода попытки нет»: чата попытки уже нет или ход закрыт, отмена сразу терминальная, без обращения к хосту (§3.5). `blocked(external_turn)` — не исключение. Чужой `activeTurn` (`id !== attempt.turnId`) не отменяется никогда, но это не повод оставить жить свой ход: свой ход жив → `cancelTurn(attempt.turnId)` → `blocked(cancel_pending)` → сверка; свой ход уже в `turns` → settle по фактическому `Turn.state`, и `completed` не переписывается на `cancelled` (иначе теряется `outcome`, §3.10); сразу `cancelled` — только когда `attempt.turnId` нет ни в `activeTurn`, ни в `turns` **и** исход старта известен (ниже), и найденный чужой `activeTurn` при этом остаётся жить. «Чужой ход не отменяем» относится ровно к `activeTurn` с чужим id.
 
-Рестарт backend посередине отмены не начинает её заново: `cancelRequestedAt` уже в файле, а состояние могло остаться прежним (`running`/`blocked`), поэтому recovery продолжает с шага 2 — диагноз по `ChatState`, затем `cancelTurn` или терминальный исход (§4.4).
+**Окно dispatch→эхо.** `dispatchTurnAndWait` только отправляет action и ждёт эхо (`server/hub.ts:512-516`, `:527-541`); эхо применяется к зеркалу в `consumeEvents` (`:621`), а `chatState` читает зеркало (`:495-499`). Значит между `persist(running)`/dispatch и применением эха `ChatState` законно не содержит хода: отсутствие `attempt.turnId` в этом окне — не доказательство «хода нет». Поэтому окно не создаёт нового состояния и не отправляет `cancelTurn`: задача остаётся `running` (`running` = «ждём ход с этим `turnId`», §3.2) с persisted `cancelRequestedAt` и живым lease, а диагноз повторяется на каждом tick'е. Терминальный исход ставится, только когда исход старта известен:
+
+- ход появился в `activeTurn` → владение есть → `cancelTurn` → `blocked(cancel_pending)`;
+- ход сразу оказался в `turns` (успел завершиться) → settle по `Turn.state`, `completed` не переписывается;
+- хост отклонил старт (`turn_rejected`) или истекли 15 с подтверждения, а `ChatState` прочитан и хода в нём нет → хода не было никогда: попытка закрывается, и при `cancelRequestedAt` задача сразу `cancelled` с `error.kind = 'turn_rejected' | 'start_timeout'` (инвариант 7 требует `outcome` или `error`); без `cancelRequestedAt` те же исходы дали бы `retry_wait`/`failed` по §3.4. Если снимок чата недоступен, это не «хода нет», а ветка «`ChatState` недоступен» из таблицы выше.
+
+`blocked(cancel_pending)` означает «`cancelTurn` отправлен», и до появления хода задача в него не переходит — иначе состояние врало бы о том, чего не было. Отдельного поля «эхо получено» не нужно: ход либо виден в `ChatState`, либо исход старта уже зафиксирован отказом или таймаутом. После рестарта backend правило работает на свежем снимке: `ChatState` запрашивается заново под восстановленным lease (§4.4), живой ход в нём виден, а его отсутствие при `cancelRequestedAt` даёт `cancelled`.
+
+Рестарт backend посередине отмены не начинает её заново: `cancelRequestedAt` уже в файле, а состояние могло остаться прежним (`running`/`blocked`), поэтому recovery сначала восстанавливает lease, затем продолжает с шага 2 — диагноз по `ChatState`, затем `cancelTurn` или терминальный исход (§4.4).
 
 **Сверка `blocked(cancel_pending)`.** Читаем `ChatState` чата попытки; если его нет — сначала проверка сессии (§ «Потеря видимости»), а не ожидание: удалённая сессия даёт `failed(session_missing)`, а не вечный `cancel_pending`.
 
 - `attempt.turnId` есть в `turns` → `complete` даёт `completed` (не врём про отмену), `cancelled` — `cancelled`, `error` — `failed`. Порядок `turns` — хвостовое окно, новые ходы в конце (так его читает панель: `src/SessionView.tsx:284`, `server/hub.ts:417`); только что завершённый ход попадает в окно, поэтому его отсутствие — достаточный признак «хода нет», а не повод уходить в `retry_wait`.
 - свой ход всё ещё в `activeTurn` → повторяем `cancelTurn` не чаще раза в 2 с; пока хост не подтвердил, задача остаётся в `blocked(cancel_pending)`, а после 30 с автоматические повторы прекращаются и причину видит человек (остановить ход в панели или VS Code) — после остановки сверка поставит фактический исход.
-- хода нет ни в `activeTurn`, ни в `turns` → `cancelled`: ход не материализовался (ср. диагноз «dispatch потерялся» в §4.4).
+- хода нет ни в `activeTurn`, ни в `turns` → `cancelled`: ход не материализовался (ср. диагноз «dispatch потерялся» в §4.4). Окно dispatch→эхо этой ветки не касается: в `cancel_pending` задача попала только после того, как `activeTurn.id === attempt.turnId` был подтверждён, то есть приём хода уже доказан.
 
 **Ожидаемая и неожидаемая ошибка `cancelTurn`.** No-op только для отказа «Этот ход уже завершён»: это значит, что ход завершился между чтением `ChatState` и вызовом, и следующий tick зафиксирует `Turn.state`. Все остальные отказы (`Неизвестный хост`, «Чат не открыт или его состояние ещё не получено», транспортные) — не no-op: хост отключён → `blocked(host_disconnected)`, хост исчез из конфигурации → `blocked(host_unknown)`, причина видна пользователю, а `cancelTurn` повторяется на следующем tick'е, потому что `cancelRequestedAt` сохранён. Глушить их нельзя: именно так ход остаётся жить, выпав из учёта очереди.
 
 **Потеря видимости: сначала «сессия есть?», потом «снимок будет?».** Если `chatState === undefined` при подключённом хосте — это ещё не отказ, но и не повод ждать вслепую: зеркало пустеет по двум разным причинам, и они требуют разного.
 
-1. **Сессия подтверждённо отсутствует.** Критерий тот же, что в §3.8 (абзац про `session_missing`), плюс прямой ответ `refreshSession`: хост подключён, и либо пришло событие `sessionRemoved` (`server/hub.ts:653`), либо `refreshSession` ответил `missing` — хост вернул `NotFound`/`-32001` (`AhpErrorCodes.SessionNotFound`, `src/types/common/errors.ts:46`; `Hub.refreshSession` сохраняет его как `channelError` канала, `server/hub.ts:207-213`), либо сессия отсутствует в `summarize`/`overview.sessions` дольше 5 с после того, как наблюдалась в этой попытке. Тогда задача из любого нетерминального состояния, где попытка уже имеет чат, — `running`, `blocked(tool_confirmation | tool_result_confirmation | chat_input | tool_authentication | external_turn | session_archived)` и `blocked(cancel_pending)` — переходит в `failed(session_missing)`, зависимые — в `blocked(dependency_failed)`, lease снимается в `finally` закрытия попытки (§5.2 п.7). Ждать здесь нельзя: `Hub.removeSession` сбрасывает зеркало сессии и её чатов и записывает `channelErrors` «Сессия удалена на хосте», а снимки перезапрашиваются только по событию `connected` (`server/hub.ts:643-652`, `:572-588`). «Дождаться следующего tick'а» для удалённой сессии означало бы ждать вечно: `cancelTurn` и сверка упирались бы в «Чат не открыт…» (`:495-499`), а задача висела бы в `blocked(cancel_pending)` с lease до рестарта backend, хотя `S11` (§1) и §5.5 обещают `failed(session_missing)`.
-2. **Сессия есть, снимок потерян временно** (реконнект, рестарт хоста, гонка подписки). Задача ждёт следующий tick: lease остаётся, повторный `retain` не делается — иначе счётчик подписок течёт. Признак — сессия видна в `summarize`/`sessionState`, а канал отвечает ошибкой загрузки, не удаления.
+1. **Сессия подтверждённо отсутствует.** Критериев три, и все они проверяются при подключённом хосте (чтение каналов — под живым lease, критерий по `summarize` lease не требует): пришло событие `sessionRemoved` через `TaskHostPort.onSessionRemoved` (`Hub` пересылает событие хоста, `server/hub.ts:653`); либо `TaskHostPort.checkSession` ответил `missing` — хост вернул `NotFound`/`-32001` (`AhpErrorCodes.SessionNotFound`, `src/types/common/errors.ts:46`), и адаптер достаёт этот код из `channelError` канала после перезапроса снимка (§6.4); либо сессия отсутствует в `summarize`/`overview.sessions` дольше 5 с после того, как наблюдалась в этой попытке. Тогда задача из любого нетерминального состояния, где попытка уже имеет чат, — `running`, `blocked(tool_confirmation | tool_result_confirmation | chat_input | tool_authentication | external_turn | session_archived)` и `blocked(cancel_pending)` — переходит в `failed(session_missing)`, зависимые — в `blocked(dependency_failed)`, lease снимается в `finally` закрытия попытки (§5.2 п.7). Ждать здесь нельзя: `Hub.removeSession` сбрасывает зеркало сессии и её чатов и записывает `channelErrors` «Сессия удалена на хосте», а снимки перезапрашиваются только по событию `connected` (`server/hub.ts:643-652`, `:572-588`). «Дождаться следующего tick'а» для удалённой сессии означало бы ждать вечно: `cancelTurn` и сверка упирались бы в «Чат не открыт…» (`:495-499`), а задача висела бы в `blocked(cancel_pending)` с lease до рестарта backend, хотя `S11` (§1) и §5.5 обещают `failed(session_missing)`.
+2. **Сессия есть, снимок потерян временно** (реконнект, рестарт хоста, гонка подписки). Задача ждёт следующий tick: lease остаётся, повторный `retain` не делается — иначе счётчик подписок течёт. Признак — сессия видна в `summarize`/`sessionState`, а канал отвечает ошибкой загрузки, не удаления. Оговорка одна: «повторный» относится к живому lease. Если lease ещё не взят — backend только что перезапустился, — он сначала восстанавливается и лишь затем проверяется сессия (§4.4); иначе проверка не прочитает ничего (см. «Предусловие» ниже).
 
-Проверка идёт **до** «ждать следующий tick» и при каждом заходе в сверку: в обычном tick'е, в `queueCancel` и в recovery (§4.4). Это единственный способ отличить «снимок ещё не пришёл» от «сессии больше нет», не заводя второго списка сессий: очередь не решает, что сессия исчезла, — она спрашивает хост (`refreshSession`/`summarize`) и делает вывод только по его ответу, а хост остаётся авторитетом.
+**Предусловие: сначала lease, потом чтение.** `SessionState`/`ChatState` читаются из зеркала, а зеркало наполняется только подпиской: `Hub.watch` — единственный путь `mirror.track` + `load` для сессии и чата (`server/hub.ts:147-160`), `mirror.state` без `track` возвращает `undefined` (`server/mirror.ts:38-51`). Проверка сессии без подписки не вернёт `missing`, а бросит «Сессия не открыта» (`server/hub.ts:209`) — это нарушение предусловия, а не `unavailable`, и трактовать его как признак исчезновения нельзя. Поэтому правило одно: подписка → чтение; lease-free источник ровно один — `SessionSummary`/`overview.sessions` (`Hub.overview` собирает его из `aggregatedSessions`, `server/hub.ts:128`), и он же даёт бит архива и признак «сессии нет в каталоге» (§3.11 п.14).
+
+Проверка идёт **до** «ждать следующий tick» и при каждом заходе в сверку: в обычном tick'е, в `queueCancel` и в recovery (§4.4). Это единственный способ отличить «снимок ещё не пришёл» от «сессии больше нет», не заводя второго списка сессий: очередь не решает, что сессия исчезла, — она спрашивает хост (`checkSession`/`summarize`) и делает вывод только по его ответу, а хост остаётся авторитетом.
 
 Если хост отключён — `blocked(host_disconnected)`: отсутствие данных не доказательство отсутствия сессии. Хост исчез из конфигурации — `blocked(host_unknown)`. `session_missing` без подключённого хоста не выводится никогда.
 
-**Lease: где он есть, а где его нет.** Lease — это подписки очереди на `sessionUri` и `chatUri` попытки, которые она берёт в §5.2 п.3.
+**Lease: где он есть, а где его нет.** Lease — это подписки очереди на `sessionUri` и `chatUri` попытки, которые она берёт в §5.2 пп.2–3. Таблица описывает устойчивое состояние живого backend; после его рестарта lease восстанавливается **до** первой проверки сессии или чтения `ChatState` (§4.4), иначе строки «есть» были бы ложью.
 
 | Состояние | Lease |
 | --- | --- |
 | `queued`, `retry_wait`, терминальные | нет |
-| `starting` после `Hub.watch` (§5.2 п.3), `running` | есть |
+| `starting` после `Hub.watch` сессии (§5.2 п.2), `running` | есть |
 | `blocked(chat_input \| tool_confirmation \| tool_result_confirmation \| tool_authentication \| external_turn \| session_archived \| cancel_pending)` | есть: сверка §3.8 читает `ChatState` |
 | `blocked(host_disconnected)` | есть: счётчик дожидается реконнекта, состояние перезапрашивается (§5.5) |
 | `blocked(host_unknown)` | нет: подписку на хост, которого нет в конфигурации, создать нельзя; она берётся заново, когда хост вернулся, — до любой сверки |
@@ -459,7 +474,8 @@ type QueueBlockedKind =
 10. Нет изменения `SessionStatus`/`TurnState` в файле очереди.
 11. Нет `cancelTurn` без проверки владения: вызов только при `activeTurn.id === attempt.turnId` (§3.9).
 12. Нет нетерминальной задачи с живым ходом попытки без lease: исключение одно — `blocked(host_unknown)`, где подписку создать нельзя (§3.9).
-13. Нет ожидания снимка без проверки сессии: подтверждённое отсутствие сессии — всегда `failed(session_missing)` из любого нетерминального статуса, а не `blocked` и не «ждём следующий tick» (§3.9 «Потеря видимости»).
+13. Нет ожидания снимка без проверки сессии: подтверждённое отсутствие сессии — всегда `failed(session_missing)` из любого нетерминального статуса, где попытка уже имеет чат, а не `blocked` и не «ждём следующий tick» (§3.9 «Потеря видимости»). Для `starting` проверка делается только после `createSession` и `watch` сессии (§4.4).
+14. Нет чтения `SessionState`/`ChatState` и проверки сессии без живого lease: подписка берётся первой, чтение — вторым (§3.9 «Предусловие»). Lease-free источник только один — `SessionSummary`/`overview.sessions`; «Сессия не открыта» — нарушение предусловия, а не признак удаления.
 
 ---
 
@@ -520,16 +536,17 @@ type QueueBlockedKind =
 
 1. Загрузить файл (с fallback на `.bak`).
 2. Для каждой нетерминальной задачи:
-   - проверить, известен ли `hostId` и подключён ли хост; если нет — `blocked(host_disconnected | host_unknown)`;
-   - проверить сессию там, где попытка уже должна была стартовать: для `running`, `blocked` и `blocked(cancel_pending)` подтверждённое отсутствие (§3.9 «Потеря видимости») сразу даёт `failed(session_missing)`, зависимые → `blocked(dependency_failed)`, lease снимается в `finally` (§5.2 п.7). Проверка идёт до любых ожиданий снимка: у удалённой сессии снимка не будет. Для `starting` она делается после `createSession` (следующий пункт), иначе падение backend между записью `sessionUri` и вызовом выглядело бы как удаление;
-   - для `starting`: выполнить `createSession` с сохранённым `sessionUri`. Если хост ответил `-32003 SessionAlreadyExists` (`channels-session/commands.ts:26`) — сессия уже создана до падения backend, это успех: продолжаем с шага «ждать чат». Если хост ответил другой ошибкой — `retry_wait`/`failed` по политике. Этот случай — главная причина, почему `sessionUri` генерируется заранее: без него повтор создал бы вторую сессию;
-   - для `running`: подписаться на сессию и чат по сохранённым URI, прочитать `ChatState`:
+   - проверить, известен ли `hostId` и подключён ли хост; если нет — `blocked(host_disconnected | host_unknown)`, подписки не берутся;
+   - **восстановить lease до любого чтения**: для `running` и `blocked`, у которых попытка уже имеет `sessionUri` (включая `blocked(cancel_pending)`), — `retain(sessionUri)`, при наличии `chatUri` — `retain(chatUri)`; для `starting` — сразу после `createSession` (ниже); у `blocked(dependency_*)` попытки нет, lease не нужен. Без подписки зеркало пусто (`server/mirror.ts:38-51`), а проверка сессии без `watchCounts` бросает «Сессия не открыта» (`server/hub.ts:209`): чтение до `retain` — не ответ хоста, а нарушенное предусловие (§3.11 п.14). `Hub.watch` при первом подписчике сам делает `mirror.track` + `load` (`server/hub.ts:147-160`);
+   - проверить сессию — теперь под восстановленным lease: для тех же `running`/`blocked`, где попытка уже стартовала, подтверждённое отсутствие (§3.9 «Потеря видимости») сразу даёт `failed(session_missing)`, зависимые → `blocked(dependency_failed)`, lease снимается в `finally` (§5.2 п.7). Проверка идёт до любых ожиданий снимка: у удалённой сессии снимка не будет. Для `starting` она делается после `createSession` и `watch` (ниже), иначе падение backend между записью `sessionUri` и вызовом выглядело бы как удаление;
+   - для `starting`: выполнить `createSession` с сохранённым `sessionUri`. `-32003 SessionAlreadyExists` (`channels-session/commands.ts:26`) — успех: сессия уже создана до падения backend. **Сразу после ответа** (в том числе `-32003`) — `retain(sessionUri)` и ожидание `SessionState` с `defaultChat`/`chats[0]`; чат появился → `retain(chatUri)`. Другая ошибка — `retry_wait`/`failed` по политике. Порядок тот же, что в §5.2: `createSession` → `watch(session)` → ждать чат → `watch(chat)`; без него ожидание `SessionState` до `watch` упиралось бы в 60-секундный таймаут на happy path. Этот случай — главная причина, почему `sessionUri` генерируется заранее: без него повтор создал бы вторую сессию;
+   - для `running` (lease восстановлен, `ChatState` прочитан):
      - `activeTurn.id === turnId` → продолжаем `running`;
      - ход в `turns` с нашим `turnId` → settle по `turn.state`;
-     - `inputNeeded` по нашему чату → `blocked` с причиной;
+     - `inputNeeded` по нашему чату → `blocked` с причиной (перед этим — шаг 0 §3.8: архив);
      - чата нет, ход не найден, хост подключён и сессия отсутствует → `failed(session_missing)`;
-     - сессия есть, но ход не найден и `activeTurn` пуст → `retry_wait` (dispatch потерялся) с проверкой, что `turnId` действительно нигде нет;
-   - для `blocked` (включая `cancel_pending`) и `retry_wait`: пересчитать причину/backoff, включая gate зависимостей (задача с зависимостями, у которых все `dependsOn` уже `completed`, возвращается в `queued`). `retry_wait` с истёкшим backoff сразу становится `starting`. Для `blocked(cancel_pending)` — сначала сверка §3.9: ход уже завершился → терминальный исход по `Turn.state`; ход жив → продолжать `cancelTurn` по тем же правилам, что до рестарта backend. Если сессия подтверждённо отсутствует, сюда мы уже не попадаем — сработал пункт про сессию выше.
+     - сессия есть, но ход не найден и `activeTurn` пуст → `cancelRequestedAt` установлен ? `cancelled` (`error.kind = 'start_timeout'`) : `retry_wait` (dispatch потерялся) с проверкой, что `turnId` действительно нигде нет. Свежий снимок под lease показывает живой ход, поэтому отсутствие в нём — тот же критерий, что истечение 15 с в §3.9;
+   - для `blocked` (включая `cancel_pending`) и `retry_wait`: сначала шаг 0 §3.8 (архив → `blocked(session_archived)`), затем сверка отмены для `cancel_pending` (§3.9), затем пересчёт причины/backoff, включая gate зависимостей (задача с зависимостями, у которых все `dependsOn` уже `completed`, возвращается в `queued`). `retry_wait` с истёкшим backoff сразу становится `starting`. Для `blocked(cancel_pending)` — ход уже завершился → терминальный исход по `Turn.state`; ход жив → продолжать `cancelTurn` по тем же правилам, что до рестарта backend. Если сессия подтверждённо отсутствует, сюда мы уже не попадаем — сработал пункт про сессию выше.
 3. Записать нормализованное состояние, только если оно изменилось.
 4. Запустить tick.
 
@@ -551,10 +568,11 @@ type QueueBlockedKind =
    |                   |--------------------------->| createSession(uri)      |
    |                   |                            |------------------------>|
    |                   |                            |<--- created ------------|
-   |                   |<-- session snapshot -------|                         |
-   |                   | wait defaultChat/chats[0]  |                         |
    |                   |--------------------------->| retain(session), watch  |
-   |                   |                            |------------------------>|
+   |                   |                            |<--- session snapshot ---|
+   |                   | wait defaultChat/chats[0]  |                         |
+   |                   |--------------------------->| retain(chat), watch     |
+   |                   |<-- chat snapshot ----------|                         |
    |                   | wait chat idle             |                         |
    |                   | persist(chatUri, turnId, running)                    |
    |                   |--------------------------->| dispatch ChatTurnStarted|
@@ -573,12 +591,12 @@ type QueueBlockedKind =
 ### 5.2 Шаги и таймауты
 
 1. **Tick.** Single-flight: если tick уже идёт, второй не запускается. Сначала tick пересчитывает gate зависимостей для всех нетерминальных задач (§3.5): `blocked(dependency_*)` → `queued`, когда все `dependsOn` снова `completed`, и `queued` → `blocked(dependency_*)`, когда зависимость стала `failed`/`cancelled`. Затем выбирает готовую задачу с минимальным `position`, проверяет слоты, резервирует слот в памяти и пишет `starting` + `sessionUri`. Резерв — до первого `await`, иначе два параллельных tick'а стартуют одну задачу дважды.
-2. **Создание сессии.** `createSession` с `channel = sessionUri`, `provider`, `workingDirectories = [toFileUri(workingDirectory)]`. Ждём `defaultChat` или `chats[0]` из `SessionState` (не `lifecycle === 'ready'`): хост держит `creating`, пока чат уже доступен (`src/SessionView.tsx:191`). Таймаут — 60 с. Если `lifecycle === 'failed'` → `failed(creation_error)`.
-3. **Lease.** `Hub.watch(hostId, sessionUri)`, затем `Hub.watch(hostId, chatUri)`; счётчики подписок не дают очереди и браузеру мешать друг другу (`server/hub.ts:147`).
-4. **Проверка чата.** Дождаться загрузки `ChatState`. Если `interactivity` задан и не `full` → `failed(chat_read_only)`. Если есть `activeTurn` или непустые `queuedMessages` (очередь их не создаёт, значит это чужой ввод) → `blocked(external_turn)` (не отменяем чужой ход).
-5. **Старт хода.** Persist `chatUri`, `turnId`, `running`; диспатч `ChatTurnStarted` с `turnId = attempt.id`, `message.text = prompt`, `message.origin = { kind: MessageKind.User }`, при наличии модели — `message.model = { id, config }`. Ждём подтверждения через `dispatchTurnAndWait` (таймаут 15 с, `ACTION_CONFIRMATION_MS`).
-   - Rejection до принятия → `retry_wait`/`failed`.
-   - Таймаут → перечитать чат: если `activeTurn.id === turnId` или ход найден в `turns` — считаем старт успешным; иначе `retry_wait`.
+2. **Создание сессии.** `createSession` с `channel = sessionUri`, `provider`, `workingDirectories = [toFileUri(workingDirectory)]`. `Hub.createSession` возвращает только `{ sessionUri }` и ничего не подписывает (`server/hub.ts:192-200`), поэтому **сразу после ответа, включая `-32003 SessionAlreadyExists`**, берём `Hub.watch(hostId, sessionUri)`: первый подписчик делает `mirror.track` + `load` (`server/hub.ts:147-160`). Только теперь ждём `defaultChat` или `chats[0]` из `SessionState` (не `lifecycle === 'ready'`): хост держит `creating`, пока чат уже доступен (`src/SessionView.tsx:191`). Без `watch` ожидание `SessionState` не закончится — зеркало пусто (`server/mirror.ts:38-51`) — и happy path упирался бы в таймаут. Таймаут — 60 с. Если `lifecycle === 'failed'` → `failed(creation_error)`.
+3. **Lease чата.** Чат появился → `Hub.watch(hostId, chatUri)`. Счётчики подписок не дают очереди и браузеру мешать друг другу (`server/hub.ts:147`); повторный `watch` при живом lease не делается (§3.9, §3.11 п.14).
+4. **Проверка чата.** Дождаться загрузки `ChatState`. Если `interactivity` задан и не `full` → `failed(chat_read_only)`. **Перечитать `cancelRequestedAt`**: отмена могла прийти, пока ждали `createSession` или чат; тогда ход не диспатчится, задача `cancelled`, пустая сессия остаётся у хоста, lease освобождается в `finally` (§3.9). Если есть чужой `activeTurn` или непустые `queuedMessages` (очередь их не создаёт, значит это чужой ввод) → `blocked(external_turn)` (не отменяем чужой ход). Архив проверяется по шагу 0 §3.8.
+5. **Старт хода.** Ещё раз перечитать `cancelRequestedAt` непосредственно перед записью: persist `chatUri`, `turnId`, `running`; диспатч `ChatTurnStarted` с `turnId = attempt.id`, `message.text = prompt`, `message.origin = { kind: MessageKind.User }`, при наличии модели — `message.model = { id, config }`. Ждём подтверждения через `dispatchTurnAndWait` (таймаут 15 с, `ACTION_CONFIRMATION_MS`). До истечения этого окна отсутствие хода в `ChatState` ничего не доказывает (§3.9 «Окно dispatch→эхо»).
+   - Rejection до принятия → `retry_wait`/`failed` (при `cancelRequestedAt` — `cancelled`).
+   - Таймаут → перечитать чат: `activeTurn.id === turnId` → продолжаем `running`; ход в `turns` → settle по `Turn.state`; хода нет → `retry_wait` (при `cancelRequestedAt` — `cancelled`, `error.kind = 'start_timeout'`).
 6. **Мониторинг.** Пока есть нетерминальные задачи — tick раз в секунду (не чаще). Оптимизация: если все задачи в `blocked`/`retry_wait` с длинным backoff, интервал можно растянуть, но в v1 проще фиксированный.
 7. **Закрытие попытки (settle).** Один `finally` на два исхода, и `release` watches живёт только в нём:
    - терминальный переход (`completed`/`failed`/`cancelled`): persist `outcome`/`error`, `release` watches, освободить слот, `kick` tick;
@@ -595,12 +613,16 @@ type QueueBlockedKind =
 | Два tick'а стартуют одну задачу | Single-flight tick + резерв слота до `await` + persist `starting` |
 | Backend упал между `createSession` и записью `sessionUri` | `sessionUri` пишется **до** вызова; повтор получает `-32003` и продолжает |
 | Ход принят, но подтверждение потеряно | `turnId` детерминирован; сверка `activeTurn`/`turns` вместо второго dispatch |
+| Cancel пришёл после persist(running)/dispatch, но до эха | Отсутствие хода в `ChatState` в этом окне ничего не доказывает: задача остаётся `running` с `cancelRequestedAt` и lease, `cancelTurn` вызывается только после появления хода, терминальный исход — после эха, отказа хоста или 15 с (§3.9 «Окно dispatch→эхо») |
+| Cancel пришёл, пока старт ждёт `createSession`/чат | Ветка старта перечитывает `cancelRequestedAt` перед persist/dispatch и не отправляет ход отменённой задачи; остаётся пустая сессия (§5.2 пп.4–5) |
+| Backend перезапустился, задача в `blocked`/`cancel_pending` | Recovery сначала восстанавливает lease, потом читает `ChatState` и проверяет сессию (§4.4): иначе зеркало пусто, а проверка без подписки бросает «Сессия не открыта» |
+| Человек архивировал сессию или чат задачи | `SessionStatus.IsArchived` в `SessionState`/`ChatState` (или `SessionSummary.status` без lease) → `blocked(session_archived)`; снятый бит возвращает задачу в пересчёт (§3.8 шаг 0) |
 | Человек отправил сообщение в тот же чат | `blocked(external_turn)`; очередь не отменяет чужой ход |
 | Человек подтвердил approval одновременно с тиком | Очередь вообще не отвечает на approvals, конфликта нет |
 | Cancel приходит, когда ход уже завершился | `cancelTurn` бросает «уже завершён» — единственная ожидаемая ошибка: settle фиксирует фактический `Turn.state`; остальные ошибки дают `blocked` с причиной |
 | Cancel в фоне, когда чат никто не открыл в браузере | Lease держит сама очередь (§3.9): lease не снимается до терминального исхода, поэтому `cancelTurn` видит `ChatState`, а сверка не теряется |
 | Cancel задачи в `blocked`, у которой живой ход | `cancelTurn` только при `activeTurn.id === attempt.turnId`; чужой ход не трогается, задача в `blocked(cancel_pending)` до фактического исхода. В `blocked(external_turn)` это работает так же: свой живой ход отменяется, чужой остаётся (§3.9) |
-| Сессия удалена во время мониторинга, в том числе пока задача в `blocked`/`cancel_pending` | `sessionRemoved`, `refreshSession` → `missing` или отсутствие в overview дольше 5 с → `failed(session_missing)` из любого нетерминального статуса (§3.9), зависимые blocked; lease снимается в `finally` |
+| Сессия удалена во время мониторинга, в том числе пока задача в `blocked`/`cancel_pending` | `TaskHostPort.onSessionRemoved`, `checkSession` → `missing` или отсутствие в overview дольше 5 с → `failed(session_missing)` из любого нетерминального статуса (§3.9), зависимые blocked; lease снимается в `finally` |
 | Реконнект хоста совпал с проверкой сессии | Сначала `disconnected` → `blocked(host_disconnected)`, счётчик отсутствия сессии обнуляется на `connected` (§5.5): ложного `session_missing` из-за пустого зеркала не бывает |
 | Два backend на одном файле | Не поддерживается и явно запрещено правилом владения |
 
@@ -615,7 +637,7 @@ type QueueBlockedKind =
 ### 5.5 Хост: disconnect, restart, updates
 
 - **Disconnect:** все задачи, чьи сессии на этом хосте, переходят в `blocked(host_disconnected)` — включая `blocked(cancel_pending)` и `running`, — lease при этом сохраняется (§3.9, lease-таблица). Ни `failed`, ни retry: сеть может вернуться. Слоты освобождаются. Пока хост не подключён, отсутствие сессии не проверяется: отсутствие данных — не доказательство отсутствия сессии.
-- **Reconnect:** подписки переустанавливаются, состояние задач сверяется по `overview.sessions` и `ChatState`. Порядок важен: сначала `disconnected` → `blocked(host_disconnected)`, и только после `connected` проверяется существование сессии (§3.9 «Потеря видимости»), а 5-секундный счётчик отсутствия считается заново от `connected`. Иначе реконнект дал бы ложный `session_missing`. Задачи, чьи сессии действительно исчезли, → `failed(session_missing)` из любого нетерминального статуса (включая `blocked`/`cancel_pending`), зависимые → `blocked(dependency_failed)`; lease снимается в `finally` (§5.2 п.7).
+- **Reconnect:** подписки переустанавливаются, состояние задач сверяется по `overview.sessions` и `ChatState`. Порядок важен: сначала `disconnected` → `blocked(host_disconnected)`, и только после `connected` проверяется существование сессии (§3.9 «Потеря видимости»), а 5-секундный счётчик отсутствия считается заново от `connected`. Иначе реконнект дал бы ложный `session_missing`. Задачи, чьи сессии действительно исчезли, → `failed(session_missing)` из любого нетерминального статуса (включая `blocked`/`cancel_pending`), зависимые → `blocked(dependency_failed)`; lease снимается в `finally` (§5.2 п.7). После перезапуска самого backend подписки восстанавливаются до первой сверки — §4.4; пока lease не восстановлен, `ChatState` не читается и сессия не проверяется (§3.11 п.14).
 - **Restart хоста:** сессии могут исчезнуть. Это неотличимо от удаления; поведение то же.
 - **Обновление/рестарт сервисов:** `server/index.ts:194` блокирует `createSession`/`sendMessage` и родственные операции, пока хост перезапускается (`updates.isRestarting`). Runner должен вести себя так же: не начинать `starting`, пока хост в этом состоянии, и переводить такие задачи в `blocked`, а не спамить ошибками. Техническая деталь: проверка `updates.isRestarting(call.hostId)` работает только потому, что union сужен early-return'ами до `HostCall`. Если добавить `QueueCall` без `hostId` в `Call`, TypeScript не даст обратиться к `call.hostId` у union с вариантом без `hostId` — маршрутизацию queue-calls нужно делать до этой ветки, а проверку сузить явным type guard'ом.
 - **Backend restart:** см. §4.4.
@@ -685,7 +707,7 @@ export function isQueueCall(call: Call): call is QueueCall;
 | `queueList` | Полный snapshot | — |
 | `queueGet` | Полная задача с prompt и attempts | Неизвестный id → ошибка |
 | `queueAdd` | Добавить задачу | Хост известен; `provider` непустой; папка — абсолютный POSIX-путь (`toFileUri`); prompt непустой и ≤ 100 KB; `dependsOn` существуют, без цикла и self; `maxAttempts` 1–3; очередь < 200; `clientRequestId` уникален либо повторяет уже добавленную задачу; `modelConfig` — только JSON-примитивы; `modelId` — см. правило каталога ниже |
-| `queueCancel` | Отменить | `queued`/`starting`/`retry_wait` — сразу, без обращения к хосту; `running`/`blocked` — `cancelTurn` только при `activeTurn.id === attempt.turnId`, затем `blocked(cancel_pending)` до сверки (§3.9); терминальные → ошибка «уже завершена» |
+| `queueCancel` | Отменить | `queued`/`starting`/`retry_wait` — сразу, без обращения к хосту; `running`/`blocked` — `cancelTurn` только при `activeTurn.id === attempt.turnId`, затем `blocked(cancel_pending)` до сверки (§3.9); пока исход dispatch неизвестен (окно до эха/15 с), задача остаётся `running` с `cancelRequestedAt` и не терминальна; терминальные → ошибка «уже завершена» |
 | `queueRetry` | Ручной retry | Только `failed`/`cancelled`; создаёт новую попытку с номером `max(number)+1`, `maxAttempts` не ограничивает ручной retry; `outcome`/`error`/`cancelRequestedAt` очищаются до следующего исхода. Зависимые задачи разблокируются не самим retry, а завершением зависимости (§3.5) |
 | `queueRemove` | Удалить | Только `queued` или терминальные; при наличии зависимых — ошибка; running/blocked сначала `queueCancel` |
 | `queueMove` | Изменить порядок | Только `queued`; `position` клампится в диапазон |
@@ -726,7 +748,7 @@ export function isQueueCall(call: Call): call is QueueCall;
 | `server/task-queue.ts` | Чистые переходы состояния, DAG, выбор готовых, backoff, проекция в snapshot | `shared/queue.ts` |
 | `server/queue-store.ts` | Загрузка/атомарная запись, backup, corrupt-handling, сериализация | `fs` |
 | `server/queue-runner.ts` | Оркестрация: старт, мониторинг, settle, blocked, cancel, recovery; работает через `TaskHostPort` | `task-queue`, `queue-store`, port |
-| `server/hub.ts` | Тонкий адаптер `TaskHostPort`: создать сессию с заданным URI, старт хода, summaries, состояние каналов, watch/unwatch, cancel, refreshSession | SDK |
+| `server/hub.ts` | Тонкий адаптер `TaskHostPort`: создать сессию с заданным URI, старт хода, summaries, состояние каналов, watch/unwatch, cancel, `checkSession`, событие `sessionRemoved` | SDK |
 | `server/index.ts` | Маршрутизация, broadcast, жизненный цикл runner | всё выше |
 | `src/queue.ts` | Клиентские типы/хелперы отображения (лейблы, сортировка, группировка) | `shared/queue.ts` |
 | `src/QueueView.tsx` | Список, форма, карточка, пустые/ошибочные состояния | `store` |
@@ -736,21 +758,26 @@ export function isQueueCall(call: Call): call is QueueCall;
 
 ```ts
 interface TaskHostPort {
-  summarize(hostId: string): SessionSummary[] | undefined;
-  sessionState(hostId: string, sessionUri: string): SessionState | undefined;
-  chatState(hostId: string, chatUri: string): ChatState | undefined;
+  summarize(hostId: string): SessionSummary[] | undefined;              // lease-free: overview.sessions
+  sessionState(hostId: string, sessionUri: string): SessionState | undefined; // требует живого lease
+  chatState(hostId: string, chatUri: string): ChatState | undefined;          // требует живого lease
   hostAvailable(hostId: string): boolean;
-  retain(hostId: string, uri: string): void;      // watch
+  retain(hostId: string, uri: string): void;      // watch: единственный путь наполнить зеркало
   release(hostId: string, uri: string): void;     // unwatch
   createSession(input: { hostId: string; sessionUri: string; provider: string; workingDirectory: string }): Promise<void>;
   startTurn(input: { hostId: string; chatUri: string; turnId: string; prompt: string; modelId?: string; modelConfig?: Record<string, JsonPrimitive> }): Promise<void>;
   cancelTurn(input: { hostId: string; chatUri: string; turnId: string }): Promise<void>;
-  refreshSession(hostId: string, sessionUri: string): Promise<'ok' | 'missing' | 'unavailable'>; // Hub.refreshSession + код channelError
+  /** Перезапрос снимка сессии под живым lease; watchCounts не меняет. */
+  checkSession(hostId: string, sessionUri: string): Promise<'ok' | 'missing' | 'unavailable'>;
+  /** Единственное push-событие порта: хост удалил сессию. Возвращает отписку. */
+  onSessionRemoved(listener: (hostId: string, sessionUri: string, chatUris: readonly string[]) => void): () => void;
   setSessionTitle?(input: { hostId: string; sessionUri: string; title: string }): Promise<void>; // best-effort
 }
 ```
 
-`refreshSession` — это существующий `HostCall.refreshSession` (`shared/protocol.ts:79`, `server/hub.ts:207-213`): он заново запрашивает снимок сессии через `mirror.track` + `load`, **не трогая** `watchCounts`, поэтому его можно звать при живом lease, не нарушая запрет на повторный `retain` (§3.9). `missing` — сохранённый `channelError` с `AhpErrorCodes.SessionNotFound` (`-32001`), `unavailable` — транспорт/хост не подключён, `ok` — снимок получен. Это единственный способ отличить «снимка ещё нет» от «сессии нет», не заводя второго списка сессий: решение принимает хост, очередь только читает ответ.
+`checkSession` — **не** существующий `HostCall.refreshSession`: тот возвращает `void` (`shared/protocol.ts:79`), требует, чтобы канал уже был подписан (`server/hub.ts:207-213`), а ошибку кладёт в приватный `channelErrors` (`server/hub.ts:638-640`). Tri-state даёт новый внутренний метод `Hub.checkSession(hostId, sessionUri)`: `mirror.track` + `await load`, затем чтение `mirror.state` и `channelErrors` канала → `ok` (снимок есть), `missing` (`AhpErrorCodes.SessionNotFound`, `-32001`), `unavailable` (транспорт, хост не подключён, снимок не пришёл). `watchCounts` метод не меняет, поэтому он безопасен при живом lease и не является повторным `retain` (§3.9). На неподписанном канале он бросает «Сессия не открыта» — это нарушение предусловия (§3.11 п.14), а не `unavailable`, и трактовать его как удаление нельзя. Браузерный `HostCall.refreshSession` остаётся без изменений.
+
+`onSessionRemoved` — единственное push-событие порта, и оно нужно, потому что без него критерий `sessionRemoved` нереализуем: порт в остальном pull-only, а `Hub` пересылает это событие только браузеру через `sink.broadcast` (`server/hub.ts:653`). Адаптер подписывает runner на тот же `removeSession`; контракт Hub↔браузер не меняется, новых AHP-каналов нет. Альтернатива — убрать `sessionRemoved` из критериев и оставить `checkSession`/`summarize`: тогда обнаружение удаления занимает до одного tick'а, а «5 секунд» в §3.9 становится основным путём; это допустимо, но медленнее и хуже для S11.
 
 Почему очередь не внутри `Hub`: `server/hub.ts` — 745 строк и отвечает за AHP-интеграцию. Домену очереди нужны собственные тесты без SDK и без WebSocket, а `Hub` в этой схеме — тонкий адаптер, который заменяется fake-портом. Обратная сторона — ещё один слой; он окупается тестируемостью state machine и recovery.
 
@@ -904,7 +931,7 @@ A остаётся полезной как **опциональный адапт
 | 0. Валидация допущений | Одноразовая сессия на живом хосте: клиентский `turnId` и его эхо в `entry.turnId`, `inputNeeded`-формы, title, `createSession` → чат, cancel без открытой вкладки | 0,5–1 | Записанные наблюдения; ни одно архитектурное решение не держится на непроверенном primitive |
 | 1. Домен | `shared/queue.ts`, `server/task-queue.ts`: состояния, DAG, выбор готовых, backoff, проекция | 1,5–2 | Unit-тесты на переходы, циклы, лимиты; нет SDK в зависимостях |
 | 2. Хранилище | `server/queue-store.ts`: atomic write, `.bak`, corrupt-handling, сериализация | 1–1,5 | Тесты на обрыв записи, битый JSON, идемпотентность `clientRequestId` |
-| 3. Исполнение | `Hub`-адаптер + `queue-runner`: старт, мониторинг, settle, blocked, cancel, recovery | 3–4 | Fake-порт: happy path, timeout, rejection, cancel-гонка (в т.ч. отмена `blocked` без браузерных подписчиков и без потери lease), recovery, `-32003`, удаление сессии в `blocked`/`cancel_pending` → `failed(session_missing)` с освобождением lease |
+| 3. Исполнение | `Hub`-адаптер + `queue-runner`: старт, мониторинг, settle, blocked, cancel, recovery | 3–4 | Fake-порт: happy path (в т.ч. `watch(session)` до ожидания чата), timeout, rejection, cancel-гонка (в т.ч. отмена `blocked` без браузерных подписчиков и без потери lease, и отмена в окне dispatch→эхо), recovery (`blocked` восстанавливает lease до чтения), `-32003`, удаление сессии в `blocked`/`cancel_pending` → `failed(session_missing)` с освобождением lease, архив сессии → `blocked(session_archived)` |
 | 4. Контракт и UI | `protocol.ts`, `index.ts`, `store.ts`, `QueueView`, навигация, mobile, in-app notices | 3–4 | Typecheck/build; store-тест на `queue`-сообщение; ручной smoke |
 | 5. Политики | DAG-UI (список зависимостей), retry/backoff в UI, settings, reorder, prune | 1–1,5 | Unit + smoke на пакете из 3 задач с зависимостью |
 | 6. Hardening | restart backend/хоста, disconnect, гонки, документация, smoke | 1–2 | CI зелёный; сценарии S7/S8/S10/S11 пройдены вручную |
@@ -1028,6 +1055,9 @@ A остаётся полезной как **опциональный адапт
 | Вопрос | Почему важно | Как проверить (этап 0) |
 | --- | --- | --- |
 | Принимает ли живой хост `ChatTurnStarted` с клиентским `turnId` при простое | Основа старта хода | Одна тестовая сессия: отправить ход, сравнить `activeTurn.id` с отправленным |
+| Заполняется ли `SessionSummary.chats`/`defaultChat` сразу после `createSession` | Если да, чат можно найти без подписки на сессию; если нет — `watch(session)` обязателен до ожидания `SessionState` (§5.2 п.2) | Создать сессию и посмотреть `overview.sessions[].summary.chats` до `watch`; отдельно убедиться, что `sessionState` до подписки пуст |
+| Приходит ли `sessionRemoved` для сессии, созданной очередью, и когда | Критерий `session_missing` и `TaskHostPort.onSessionRemoved` (§3.9, §6.4) | Создать сессию из backend, удалить её в VS Code, проверить событие хоста и `sink.broadcast`; при отсутствии события критерий убирается, остаются `checkSession`/`summarize` |
+| Возвращает ли хост `-32001` на перезапрос снимка (`refreshSession`) под живым lease | Tri-state `checkSession`: `missing` не должен выглядеть как `unavailable` | Удалить сессию в VS Code при открытом канале очереди и вызвать `refreshSession`; ожидается `channelError` с `-32001`, а не «Сессия не открыта» |
 | Все ли формы `inputNeeded` приходят на живом VS Code-хосте | Источник `blocked` | Вызвать инструмент с approval, посмотреть `SessionState.inputNeeded` |
 | Равен ли `entry.turnId` у `toolConfirmation`/`toolAuthentication` отправленному `attempt.turnId` | Правило атрибуции чужого хода (`external_turn`, §3.8) | На живой сессии отправить approval-инструмент и сравнить `inputNeeded[].turnId` с отправленным; если хост переназначает id, правило §3.8 до пересмотра считается неприменимым |
 | Работает ли отмена из backend, когда чат не открыт ни в одном браузере | Основа §3.9: lease очереди, `ChatTurnCancelled`, сверка `Turn.state` | Тестовая сессия ждёт approval, вкладки закрыты, `cancelTurn` вызывается из backend: проверить, что action применён, ход попал в `turns` как `cancelled`, а `ChatState` читается без браузерных подписчиков |
@@ -1051,6 +1081,8 @@ A остаётся полезной как **опциональный адапт
 - Номера строк в этом разделе и в §3.9 чувствительны к правкам кода: при расхождении верить имени символа, а не номеру.
 - Правки раунда 5 (отмена `blocked(external_turn)`, удаление сессии в `blocked`/`cancel_pending`) сверены по коду, а не по памяти: `server/hub.ts:207`–`:213` (`refreshSession`: `mirror.track` + `load`, `watchCounts` не меняется), `:572`–`:592` (`consumeHostEvents`: снимки перезапрашиваются только по `connected`), `:643`–`:653` (`removeSession`: `mirror.drop` сессии и её чатов, `channelErrors` «Сессия удалена на хосте», `sink.broadcast({ t: 'sessionRemoved' })`), `server/lifecycle.test.ts:85`–`:100` (перепроверка через `refreshSession` выявляет удаление, даже если хост не прислал `sessionRemoved`), `:147`–`:160` (`watch` бросает сохранённую ошибку канала при `count > 0`), `:293`–`:296` (`cancelTurn` читает `chatState` и сверяет `activeTurn.id`), `:495`–`:499` (`chatState` бросает при пустом зеркале). SDK: `src/types/common/errors.ts:46` (`SessionNotFound: -32001`), `src/types/channels-chat/state.ts:161`, `:176` (`activeTurn` и `queuedMessages` в одном `ChatState`), `src/types/channels-chat/actions.ts:84` (`queuedMessageId`).
 - Команды проверки взяты из `package.json` и CI; `memory-bank/techContext.md:11` упоминает `npm run mock-host` и `npm run server:dev`, которых в `package.json` нет — эти команды не используются.
+- Правки раунда 6 (`lease → чтение`, окно dispatch→эхо, архив сессии, tri-state проверки сессии) сверены по коду `6cbd5a5`: `server/hub.ts:110-117` (`Hub.start` отслеживает только `ROOT`), `:147-160` (`watch` — единственный путь `mirror.track` + `load`), `:192-200` (`createSession` возвращает только `{ sessionUri }` и ничего не подписывает), `:207-213` (`refreshSession` требует `watchCounts.has` и возвращает `void`), `:495-499` (`chatState` читает зеркало), `:508-516`, `:527-541` (dispatch отправляет action и ждёт эхо до `ACTION_CONFIRMATION_MS`), `:621` (эхо применяется к зеркалу), `:643-653` (`removeSession` → `channelErrors` и `sink.broadcast sessionRemoved`), `:469` (панель проверяет `SessionStatus.IsArchived`); `server/mirror.ts:38-51` (без `track` состояние `undefined`); `shared/protocol.ts:79` (`refreshSession` — `void`, без кода ошибки). SDK 1.1.0: `channels-session/state.ts:71` (`SessionStatus.IsArchived`), `:128` (`SessionMetadata.status`), `:502-529` (`SessionSummary` с `status`, `chats`, `defaultChat`), `channels-chat/state.ts:59` (`ChatState.status`). Отсюда порядок `createSession → watch(session) → ждать чат → watch(chat) → чтение`, восстановление lease в recovery и tri-state `Hub.checkSession` (§3.9, §4.4, §5.2, §6.4).
+- После правок раунда 6: `npm run typecheck` — exit 0, `npm test` — 132/132, `npm run build -- --outDir /tmp/acc-queue-doc-build-6` — exit 0 с тем же предупреждением Vite; таблицы документа (число ячеек) и `git diff --check` — без расхождений. Runtime-код не менялся, это baseline.
 
 ---
 
