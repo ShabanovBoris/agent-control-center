@@ -24,13 +24,15 @@ export async function ensureHostConnected(page: Page): Promise<void> {
   if (await detailsOpen(details)) await summary.click();
 }
 
-export async function createSession(page: Page): Promise<string> {
+export async function createSession(page: Page, options: { beforeCreate?: (page: Page) => Promise<void> } = {}): Promise<string> {
   await page.getByRole('button', { name: 'Новая сессия' }).click();
   await expect(page.getByRole('heading', { name: 'Новая сессия' })).toBeVisible();
   // Видимые подписи — «Учебный хост (e2e)» и «Mock Agent», значения селектов остаются mock.
   await expect(page.getByRole('combobox', { name: 'Хост', exact: true })).toHaveValue('mock');
   await expect(page.getByRole('combobox', { name: 'Агент', exact: true })).toHaveValue('mock');
   await expect(page.getByRole('textbox', { name: 'Рабочая папка на хосте' })).toHaveValue('/mock/workspace');
+
+  await options.beforeCreate?.(page);
 
   // Смена hash — это состояние выбранной сессии; без него форма может ещё показывать старую.
   const previousHash = await page.evaluate(() => location.hash);

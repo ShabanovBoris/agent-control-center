@@ -8,6 +8,18 @@ export class CallFailure extends Error {
   }
 }
 
+/** Текст RpcError без технического префикса `RPC error <code>: ` — для сообщений формы. */
+const RPC_MESSAGE_PREFIX = /^RPC error -?\d+: /;
+
+/**
+ * Хостовая RPC-ошибка как CallFailure с исходным кодом и понятным текстом.
+ * `undefined` — ошибка другого рода, её обрабатывает вызывающий код.
+ */
+export function rpcCallFailure(error: unknown): CallFailure | undefined {
+  if (!(error instanceof RpcError)) return undefined;
+  return new CallFailure(error.message.replace(RPC_MESSAGE_PREFIX, ''), error.code);
+}
+
 export function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }

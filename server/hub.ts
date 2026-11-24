@@ -21,6 +21,7 @@ import {
   type ActionOrigin,
   type ChatTurnStartedAction,
   type ChatState,
+  type CommandMap,
   type Message,
   type RootState,
   type SessionState,
@@ -53,7 +54,7 @@ import { ChannelMirror } from './mirror.js';
 import type { DirectoryPicker } from './directory-picker.js';
 import type { LocalDirectoryLister } from './directory-listing.js';
 import { abortable } from './async.js';
-import { CallFailure, errorMessage, toCallError } from './errors.js';
+import { CallFailure, errorMessage, rpcCallFailure, toCallError } from './errors.js';
 import { readHostBuild, type HostBuild } from './host-build.js';
 import { appendHostIssue } from './host-issues.js';
 import { redactSecrets } from './redact.js';
@@ -382,6 +383,20 @@ export class Hub implements SearchEnvironment {
     });
   }
 
+  /**
+   * Запрос конфигурации сессии: RpcError сохраняет код хоста (по -32601 форма скрывает блок),
+   * но теряет технический префикс сообщения.
+   */
+  private async sessionConfigRequest<M extends 'resolveSessionConfig' | 'sessionConfigCompletions'>(
+    call: { hostId: string }, method: M, params: CommandMap[M]['params'],
+  ): Promise<CommandMap[M]['result']> {
+    try {
+      return await this.client(call.hostId).request(method, params);
+    } catch (error) {
+      throw rpcCallFailure(error) ?? error;
+    }
+  }
+
   private async execute(call: Call, signal?: AbortSignal): Promise<unknown> {
     switch (call.op) {
       case 'pickDirectory':
@@ -414,8 +429,27 @@ export class Hub implements SearchEnvironment {
           channel: sessionUri,
           provider: call.provider,
           workingDirectories: [toFileUri(call.workingDirectory)],
+          ...(call.config ? { config: call.config } : {}),
         });
         return { sessionUri };
+      }
+      case 'resolveSessionConfig':
+        return this.sessionConfigRequest(call, 'resolveSessionConfig', {
+          channel: ROOT_URI,
+          provider: call.provider,
+          workingDirectory: toFileUri(call.workingDirectory),
+          ...(call.config ? { config: call.config } : {}),
+        });
+      case 'sessionConfigCompletions': {
+        if (typeof call.property !== 'string' || !call.property) throw new CallFailure('Ожидалось свойство конфигурации сессии');
+        return this.sessionConfigRequest(call, 'sessionConfigCompletions', {
+          channel: ROOT_URI,
+          provider: call.provider,
+          workingDirectory: toFileUri(call.workingDirectory),
+          ...(call.config ? { config: call.config } : {}),
+          property: call.property,
+          ...(call.query ? { query: call.query } : {}),
+        });
       }
       case 'archiveSession': {
         if (!call.sessionUri.startsWith('ahp-session:')) throw new CallFailure('Ожидалась сессия');

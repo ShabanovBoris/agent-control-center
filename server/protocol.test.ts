@@ -27,6 +27,11 @@ test('парсер клиента проверяет обязательные п
     { t: 'call', id: 6, call: { op: 'health' } },
     { t: 'call', id: 7, call: { op: 'readLog', hostId: 'local' } },
     { t: 'call', id: 8, call: { op: 'pinSession', hostId, sessionUri: uri, pinned: true } },
+    { t: 'call', id: 9, call: { op: 'createSession', hostId, provider: 'mock', workingDirectory: '/mock/workspace' } },
+    { t: 'call', id: 10, call: { op: 'createSession', hostId, provider: 'mock', workingDirectory: '/mock/workspace', config: { target: 'worktree', baseBranch: 'develop' } } },
+    { t: 'call', id: 11, call: { op: 'resolveSessionConfig', hostId, provider: 'mock', workingDirectory: '/mock/workspace', config: { target: 'worktree' } } },
+    { t: 'call', id: 12, call: { op: 'sessionConfigCompletions', hostId, provider: 'mock', workingDirectory: '/mock/workspace', config: { target: 'worktree' }, property: 'baseBranch', query: 'dev' } },
+    { t: 'call', id: 13, call: { op: 'sessionConfigCompletions', hostId, provider: 'mock', workingDirectory: '/mock/workspace', property: 'baseBranch' } },
     { t: 'cancelDirectoryPicker' },
   ];
   for (const message of valid) assert.deepEqual(parseClientMessage(JSON.stringify(message)), message);

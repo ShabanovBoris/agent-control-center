@@ -1,6 +1,14 @@
 import { useEffect, useId, useMemo, useRef, useState, type FormEvent } from 'react';
 import { ChatInteractivity, ChatOriginKind, type SessionChatSummary, type SessionState } from '@microsoft/agent-host-protocol';
-import type { AgentOverview, HostOverview, SessionOverview, UpdateCheck } from '../shared/protocol';
+import type {
+  AgentOverview,
+  HostOverview,
+  ResolveSessionConfigResult,
+  SessionConfigCompletionsResult,
+  SessionConfigSchema,
+  SessionOverview,
+  UpdateCheck,
+} from '../shared/protocol';
 import { channelKey } from '../shared/reduce';
 import { HOST_STATUS_LABEL, PHASE_LABEL, ellipsize, isArchived, pathOf, phaseOf, selectionFromHash, selectionToHash, timeAgo, type Phase, type Selection } from './format';
 import { HealthView } from './HealthView';
@@ -12,6 +20,20 @@ import { pinnedKeys, sortSessions, unreadCounts } from './session-list';
 import { NotificationsButton } from './ui/NotificationsButton';
 import { DirectoryTree } from './ui/DirectoryTree';
 import { recentDirectories, rememberDirectory } from './recent-directories';
+import {
+  branchFieldOf,
+  completionOptions,
+  configString,
+  currentBranchOf,
+  effectiveConfig,
+  isAbsoluteHostPath,
+  sessionConfigFailure,
+  sessionConfigOptions,
+  sessionConfigPayload,
+  targetFieldOf,
+  workspaceProbeConfig,
+  type SessionConfigOption,
+} from './session-config';
 
 type Filter = 'all' | 'active' | 'input' | 'archived';
 
@@ -589,6 +611,134 @@ function NewSessionForm({ host, hosts, backendConnected, onHostChange, onCancel,
   const commandsAvailable = backendConnected && host.status === 'connected';
   const pending = busy || picking;
 
+  // Конфигурация сессии приходит от хоста: target/isolation и ветка. Список веток — только из ответов.
+  // Схема описывает контролы и переживает смену target: иначе выбор исчезал бы на время повторного
+  // resolve. Values — defaults конкретного запроса, после смены target они уже не используются.
+  const [targetChoice, setTargetChoice] = useState<{ key: string; value: string }>();
+  const [branch, setBranch] = useState<string>();
+  const [branchQuery, setBranchQuery] = useState('');
+  const [branchItems, setBranchItems] = useState<SessionConfigOption[]>([]);
+  const [schema, setSchema] = useState<SessionConfigSchema>();
+  const [values, setValues] = useState<Record<string, unknown>>();
+  const [configPending, setConfigPending] = useState(false);
+  const [branchPending, setBranchPending] = useState(false);
+  const [currentBranch, setCurrentBranch] = useState<string>();
+  const [configError, setConfigError] = useState<string>();
+  const [branchError, setBranchError] = useState<string>();
+  const branchListId = useId();
+
+  const targetField = targetFieldOf(schema);
+  const branchField = branchFieldOf(schema);
+  const targetValue = targetChoice?.value ?? (targetField && configString(values, targetField.key)) ?? targetField?.workspaceValue;
+  const targetOptions = sessionConfigOptions(targetField?.property);
+  const targetSelectable = targetOptions.length > 1 && !targetField?.property.readOnly;
+  const branchDynamic = branchField?.dynamic === true;
+  const branchValue = branch ?? (branchField ? configString(values, branchField.key) : undefined);
+  const branchOptions = branchDynamic ? branchItems : sessionConfigOptions(branchField?.property);
+  const branchStatus = configPending || branchPending ? 'определяется…' : currentBranch ?? 'неизвестна';
+
+  // Смена папки/хоста/агента делает недействительными и схему, и выбор: чужие defaults не переезжают.
+  useEffect(() => {
+    setTargetChoice(undefined);
+    setBranch(undefined);
+    setBranchQuery('');
+    setBranchItems([]);
+    setSchema(undefined);
+    setValues(undefined);
+    setCurrentBranch(undefined);
+    setConfigError(undefined);
+    setBranchError(undefined);
+  }, [hostId, provider, directory]);
+
+  useEffect(() => {
+    let live = true;
+    // Недописанный путь не повод ходить в хост: ветка честно неизвестна.
+    if (!commandsAvailable || !provider || !isAbsoluteHostPath(directory)) {
+      setConfigPending(false);
+      setBranchPending(false);
+      return;
+    }
+    setConfigPending(true);
+    setBranchPending(false);
+    const timer = setTimeout(() => {
+      void (async () => {
+        try {
+          const result = await store.call<ResolveSessionConfigResult>({
+            op: 'resolveSessionConfig', hostId, provider, workingDirectory: directory,
+            ...(targetChoice ? { config: { [targetChoice.key]: targetChoice.value } } : {}),
+          });
+          if (!live) return;
+          setSchema(result.schema);
+          setValues(result.values);
+          setBranchItems(sessionConfigOptions(branchFieldOf(result.schema)?.property));
+          setConfigPending(false);
+          // Текущую ветку отдаёт только режим «текущая папка»; worktree-ответ содержит default branch.
+          const probe = workspaceProbeConfig(result.schema);
+          if (!probe) return;
+          setBranchPending(true);
+          try {
+            const current = await store.call<ResolveSessionConfigResult>({
+              op: 'resolveSessionConfig', hostId, provider, workingDirectory: directory, config: probe,
+            });
+            if (!live) return;
+            setCurrentBranch(currentBranchOf(current.schema, current.values));
+          } catch (failure) {
+            if (!live) return;
+            setCurrentBranch(undefined);
+            setBranchError(`Текущая ветка неизвестна: ${describeError(failure)}`);
+          } finally {
+            if (live) setBranchPending(false);
+          }
+        } catch (failure) {
+          if (!live) return;
+          setConfigPending(false);
+          // -32601 — штатная деградация: блок скрыт, создание сессии работает как раньше.
+          const { hidden, text } = sessionConfigFailure(failure);
+          if (!hidden) setConfigError(text);
+        }
+      })();
+    }, 300);
+    return () => { live = false; clearTimeout(timer); };
+  }, [commandsAvailable, hostId, provider, directory, targetChoice]);
+
+  // Динамические значения (ветки) хост отдаёт по мере ввода; запоздалый ответ не перезаписывает новый.
+  useEffect(() => {
+    if (!schema || !branchField || !branchDynamic || targetValue !== targetField?.worktreeValue) return;
+    let live = true;
+    const timer = setTimeout(() => {
+      void (async () => {
+        try {
+          const result = await store.call<SessionConfigCompletionsResult>({
+            op: 'sessionConfigCompletions', hostId, provider, workingDirectory: directory,
+            ...(targetField ? { config: { [targetField.key]: targetValue } } : {}),
+            property: branchField.key,
+            ...(branchQuery.trim() ? { query: branchQuery } : {}),
+          });
+          if (!live) return;
+          setBranchItems(completionOptions(result.items));
+          setBranchError(undefined);
+        } catch (failure) {
+          if (!live) return;
+          // Ошибка списка не сбрасывает выбранную ветку и не блокирует создание.
+          setBranchError(`Список веток недоступен: ${describeError(failure)}`);
+        }
+      })();
+    }, 250);
+    return () => { live = false; clearTimeout(timer); };
+  }, [schema, branchField?.key, branchDynamic, targetField?.key, targetValue, commandsAvailable, hostId, provider, directory, branchQuery]);
+
+  const changeTarget = (value: string) => {
+    if (!targetField) return;
+    setTargetChoice({ key: targetField.key, value });
+    // Defaults и ветка относились к прежнему target: до ответа хоста на новый запрос их не используем.
+    setValues(undefined);
+    setBranch(undefined);
+    setBranchQuery('');
+    setBranchItems([]);
+    setBranchError(undefined);
+    setConfigError(undefined);
+  };
+
   const chooseDirectory = async () => {
     if (!commandsAvailable || pending) return;
     setPicking(true);
@@ -606,7 +756,17 @@ function NewSessionForm({ host, hosts, backendConnected, onHostChange, onCancel,
     setBusy(true);
     setError(undefined);
     try {
-      const { sessionUri } = await store.call<{ sessionUri: string }>({ op: 'createSession', hostId, provider, workingDirectory: directory });
+      const overrides: Record<string, unknown> = {};
+      // Явный выбор пользователя уходит хосту даже во время повторного resolve: target и ветка
+      // не должны молча откатываться на текущую папку. Defaults без выбора — из ответа для этого target.
+      if (targetChoice) overrides[targetChoice.key] = targetChoice.value;
+      else if (targetField && targetValue !== undefined) overrides[targetField.key] = targetValue;
+      // Очищенное пользователем поле уходит хосту как есть: default подставляет только он.
+      if (branchField && branchValue !== undefined) overrides[branchField.key] = branchValue;
+      const config = sessionConfigPayload(schema, effectiveConfig(values, overrides));
+      const { sessionUri } = await store.call<{ sessionUri: string }>({
+        op: 'createSession', hostId, provider, workingDirectory: directory, ...(config ? { config } : {}),
+      });
       // Созданная сессия остаётся успешным результатом, даже если браузер запретил запись настроек.
       try { rememberDirectory(window.localStorage, hostId, directory); }
       catch (failure) { store.notify(`Сессия создана, но папку не удалось запомнить: ${describeError(failure)}`); }
@@ -651,6 +811,47 @@ function NewSessionForm({ host, hosts, backendConnected, onHostChange, onCancel,
           </select>
         </label>
       )}
+      <p className="session-branch" aria-live="polite">Ветка: {branchStatus}</p>
+      {targetField && targetSelectable && (
+        <div className="session-config">
+          <label>
+            Куда создать сессию
+            <select value={targetValue ?? ''} onChange={event => changeTarget(event.currentTarget.value)} disabled={pending}>
+              {targetOptions.map(option => (
+                <option key={option.value} value={option.value} title={option.description}>{option.label}</option>
+              ))}
+            </select>
+          </label>
+          {targetValue === targetField.worktreeValue && branchField && (branchDynamic ? (
+            <label>
+              Базовая ветка
+              <input
+                list={branchListId}
+                value={branchValue ?? ''}
+                onChange={event => { setBranch(event.currentTarget.value); setBranchQuery(event.currentTarget.value); }}
+                placeholder="Начните вводить ветку"
+                spellCheck={false}
+                disabled={pending}
+              />
+              <datalist id={branchListId}>
+                {branchOptions.map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
+              </datalist>
+            </label>
+          ) : (
+            <label>
+              Базовая ветка
+              <select value={branchValue ?? ''} onChange={event => setBranch(event.currentTarget.value)} disabled={pending}>
+                {!branchValue && <option value="" disabled>Выберите ветку</option>}
+                {branchOptions.map(option => (
+                  <option key={option.value} value={option.value} title={option.description}>{option.label}</option>
+                ))}
+              </select>
+            </label>
+          ))}
+        </div>
+      )}
+      {branchError && <p className="error-text" role="alert">{branchError}</p>}
+      {configError && <p className="error-text" role="alert">{configError}</p>}
       {recent.error && <p className="error-text" role="alert">{recent.error}</p>}
       {error && <p className="error-text" role="alert">{error}</p>}
       <div className="row">
