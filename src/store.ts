@@ -1,10 +1,8 @@
 import { useEffect, useSyncExternalStore } from 'react';
 import { AhpErrorCodes } from '@microsoft/agent-host-protocol';
 import {
-  describeCallError,
   parseServerMessage,
   type Call,
-  type CallError,
   type ChannelState,
   type ClientMessage,
   type Overview,
@@ -13,8 +11,10 @@ import {
   type UsageReport,
 } from '../shared/protocol';
 import { channelKey, reduceChannel } from '../shared/reduce';
-import { CallCancelled } from './errors';
+import { CallCancelled, CallRejected, describeError } from './errors';
 import type { Selection } from '../shared/routing';
+
+export { CallRejected, describeError } from './errors';
 
 export type Connection = 'connecting' | 'open' | 'closed';
 
@@ -34,12 +34,6 @@ export interface AppState {
   overview: Overview;
   channels: ReadonlyMap<string, ChannelView>;
   notices: readonly Notice[];
-}
-
-export class CallRejected extends Error {
-  constructor(readonly detail: CallError) {
-    super(detail.message);
-  }
 }
 
 interface Watch {
@@ -285,11 +279,6 @@ class Store {
     this.state = { ...this.state, ...patch };
     for (const listener of this.listeners) listener();
   }
-}
-
-export function describeError(error: unknown): string {
-  if (error instanceof CallRejected) return describeCallError(error.detail);
-  return error instanceof Error ? error.message : String(error);
 }
 
 export const store = new Store();

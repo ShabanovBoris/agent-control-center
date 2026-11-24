@@ -31,6 +31,7 @@ import {
 import { SIDE_CHAT_FIRST_EDIT_UNAVAILABLE, type HostOverview, type ModelOverview, type SlashCompletions } from '../shared/protocol';
 import { visibleTurns } from '../shared/turns';
 import { PhaseBadge } from './App';
+import { copyText } from './clipboard';
 import { collectFileEdits, resolveTurnChangeset } from './file-edits';
 import { inputOutcome, isArchived, pathOf, phaseOf, plain } from './format';
 import { completedResponseText, layoutParts, type NonMarkdownPart } from './markdown-stream';
@@ -494,14 +495,10 @@ function TurnView({ turn, target, workingDirectory, changesetTemplate, active, c
     ? resolveTurnChangeset(changesetTemplate, turn.id) : undefined;
   const copyResponse = async () => {
     if (responseToCopy === undefined) return;
-    try {
-      if (!navigator.clipboard?.writeText) throw new Error('Буфер обмена недоступен');
-      await navigator.clipboard.writeText(responseToCopy);
-      store.notify('Ответ скопирован');
-    } catch (error) {
-      store.notify(`Не удалось скопировать ответ: ${describeError(error)}`);
-    }
+    const result = await copyText(responseToCopy);
+    store.notify(result.ok ? 'Ответ скопирован' : `Не удалось скопировать ответ: ${result.message}`);
   };
+  const notify = useCallback((text: string) => { store.notify(text); }, []);
   return (
     <article className="turn" data-turn-id={turn.id} data-search-target={highlighted ? 'true' : undefined}>
       <div className="user-message-row">
@@ -517,7 +514,7 @@ function TurnView({ turn, target, workingDirectory, changesetTemplate, active, c
       </div>
       {layoutParts(turn.responseParts).map(item => (
         item.kind === 'markdown'
-          ? <MarkdownMessage key={item.block.key} content={item.block.content} />
+          ? <MarkdownMessage key={item.block.key} content={item.block.content} onNotify={notify} />
           : <PartView key={partKey(item.part, item.index)} part={item.part} turnId={turn.id} target={target} active={active} commandsAvailable={commandsAvailable} subagentNavigation={subagentNavigation} />
       ))}
       {(files.size > 0 || changesetUri) && (

@@ -27,19 +27,23 @@ test('списки, вложенные списки и task-list рендеря�
   assert.ok(tasks.includes('<input type="checkbox" disabled="" checked=""/>'));
 });
 
-test('fenced-код сохраняет язык и экранирует HTML внутри', () => {
-  assert.equal(
-    render('```ts\nconst a = 1 < 2;\n```'),
-    '<div class="markdown-message"><pre><code class="language-ts">const a = 1 &lt; 2;\n</code></pre></div>',
-  );
+test('fenced-код сохраняет язык, экранирует HTML и получает кнопку копирования', () => {
+  const markup = render('```ts\nconst a = 1 < 2;\n```');
+
+  assert.ok(markup.includes('class="code-block"'));
+  assert.ok(markup.includes('aria-label="Скопировать код"'));
+  assert.ok(markup.includes('<span class="code-block-lang">ts</span>'));
+  assert.ok(markup.includes('<pre><code class="language-ts">const a = 1 &lt; 2;\n</code></pre>'));
 });
 
 test('inline-код и код с отступом в начале реплики', () => {
   assert.ok(render('текст `code`').includes('<code>code</code>'));
-  assert.equal(
-    render('    const x = 1;'),
-    '<div class="markdown-message"><pre><code>const x = 1;\n</code></pre></div>',
-  );
+
+  const indented = render('    const x = 1;');
+  assert.ok(indented.includes('class="code-block"'));
+  assert.ok(indented.includes('aria-label="Скопировать код"'));
+  assert.ok(indented.includes('<pre><code>const x = 1;\n</code></pre>'));
+  assert.doesNotMatch(indented, /language-/);
 });
 
 test('GFM-таблица рендерится таблицей', () => {
@@ -73,6 +77,21 @@ test('ссылки: безопасные схемы открываются в н
   const vbscript = render('[x](vbscript:msgbox(1))');
   assert.doesNotMatch(vbscript, /href="vbscript:/);
   assert.ok(vbscript.includes('<span>x</span>'));
+
+  // file:line через vscode:// не открываем: безопасного предсказуемого способа нет.
+  const vscode = render('[x](vscode://file/Users/a.ts:3)');
+  assert.doesNotMatch(vscode, /href="vscode:/);
+  assert.ok(vscode.includes('<span>x</span>'));
+});
+
+test('неизвестный язык остаётся обычным кодом с кнопкой копирования', () => {
+  const markup = render('```mermaid\ngraph TD;\n```');
+
+  assert.ok(markup.includes('class="code-block"'));
+  assert.ok(markup.includes('aria-label="Скопировать код"'));
+  assert.ok(markup.includes('<span class="code-block-lang">mermaid</span>'));
+  assert.ok(markup.includes('<pre><code class="language-mermaid">graph TD;\n</code></pre>'));
+  assert.doesNotMatch(markup, /hljs-/);
 });
 
 test('внешняя картинка не загружается, inline data:image рендерится', () => {
