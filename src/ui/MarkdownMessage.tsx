@@ -1,6 +1,7 @@
-import { memo, type ReactElement, type ReactNode } from 'react';
+import { memo, useMemo, type ReactElement, type ReactNode } from 'react';
 import Markdown, { type Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import { CodeBlock } from './CodeBlock';
 
 const SAFE_LINK_PROTOCOLS = new Set(['http:', 'https:', 'mailto:']);
 const SCHEME = /^([a-z][a-z0-9+.-]*):/i;
@@ -79,10 +80,18 @@ const COMPONENTS: Components = {
 };
 
 /** Markdown-реплика агента; memo по `content`, чтобы неизменные части не парсились на каждом чанке. */
-export const MarkdownMessage = memo(function MarkdownMessage({ content }: { content: string }) {
+export const MarkdownMessage = memo(function MarkdownMessage({ content, onNotify }: {
+  content: string;
+  onNotify?: (text: string) => void;
+}) {
+  const components = useMemo<Components>(() => ({
+    ...COMPONENTS,
+    pre: ({ node, children }) => <CodeBlock node={node} onNotify={onNotify}>{children}</CodeBlock>,
+  }), [onNotify]);
+
   return (
     <div className="markdown-message">
-      <Markdown remarkPlugins={REMARK_PLUGINS} components={COMPONENTS} urlTransform={urlTransform}>
+      <Markdown remarkPlugins={REMARK_PLUGINS} components={components} urlTransform={urlTransform}>
         {content}
       </Markdown>
     </div>

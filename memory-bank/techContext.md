@@ -2,6 +2,12 @@
 
 React, TypeScript, Vite, Node.js 22+, `ws` и официальный TypeScript SDK `@microsoft/agent-host-protocol`. В [package.json](../package.json) объявлен `^1.1.0`, в [lockfile](../package-lock.json) закреплён `1.1.0`.
 
+Подсветка кода в markdown — `lowlight@3.3.0` с грамматиками `highlight.js@11.11.2` и рендером hast
+через `hast-util-to-jsx-runtime`; модуль [src/highlight.ts](../src/highlight.ts) грузится динамически
+из [CodeBlock.tsx](../src/ui/CodeBlock.tsx), поэтому в entry попадают только оболочка и кнопка.
+Копирование вынесено в [src/clipboard.ts](../src/clipboard.ts), ошибки — в [src/errors.ts](../src/errors.ts),
+чтобы markdown-цепочка не импортировала module-level `Store`.
+
 Web Push отправляет backend через `web-push@4.0.0` (ESM, типы `@types/web-push`). Слои:
 [server/push.ts](../server/push.ts) — VAPID, подписки, доставка и prune;
 [server/push-transitions.ts](../server/push-transitions.ts) — переходы по `Overview` без подписки на чаты;
