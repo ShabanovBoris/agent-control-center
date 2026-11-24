@@ -1,6 +1,7 @@
 // Учебный AHP-хост для разработки и проверки панели без настоящих агентов.
 // Состояние ведёт теми же редьюсерами SDK, что и клиенты, но сценарий «агента» выдуман:
-// он отвечает эхом, а на слова «tool» и «input» просит подтверждение вызова или ввод.
+// он отвечает эхом, а на слова «tool» и «input» просит подтверждение вызова или ввод,
+// на слово «markdown» добавляет заголовок, список, таблицу и code block.
 // История ходов хранится в памяти: снимок чата отдаёт хвост, остальное — через fetchTurns.
 // Запуск: npx tsx scripts/mock-host.ts [port] или MOCK_HOST_PORT=8190; аргумент важнее env.
 import { randomUUID } from 'node:crypto';
@@ -221,6 +222,15 @@ async function runTurn(chatUri: string, turnId: string, text: string, signal: Ab
       await say('Ввод отклонён.');
     }
   }
+  // Заголовок, список, таблица и длинная строка в code block: материал для проверки GFM-рендера
+  // и отсутствия горизонтального скролла ленты на узком экране.
+  if (/markdown/i.test(text)) {
+    // Пустая строка отделяет блок от эха: соседние markdown-части склеиваются без разделителя.
+    await pause(300, signal);
+    await say('\n\n## Учебный отчёт\n\n- Первый пункт\n- Второй пункт\n\n'
+      + '| Поле | Значение |\n| --- | --- |\n| Статус | Готово |\n\n'
+      + '```\nhttps://example.test/' + 'a'.repeat(120) + '\n```');
+  }
   emit(chatUri, { type: ActionType.ChatTurnComplete, turnId, duration: Date.now() - startedAt });
   setSummary(sessionUri, { status: SessionStatus.Idle, activity: '' });
 }
@@ -395,7 +405,8 @@ function handleRequest(connection: Connection, method: string, params: any): unk
   }
 }
 
-new WebSocketServer({ host: '127.0.0.1', port }).on('connection', socket => {
+const server = new WebSocketServer({ host: '127.0.0.1', port });
+server.on('connection', socket => {
   const connection: Connection = { socket, clientId: '', subscriptions: new Set() };
   connections.add(connection);
   socket.on('close', () => connections.delete(connection));
@@ -417,8 +428,14 @@ new WebSocketServer({ host: '127.0.0.1', port }).on('connection', socket => {
     }
   });
 });
+// Строка готовности печатается после фактического bind: по ней fixture понимает,
+// что слушает именно запущенный ею процесс, а не чужой на том же порту.
+server.on('listening', () => console.log(`[mock-host] ws://127.0.0.1:${port} pid=${process.pid}`));
+server.on('error', (error: NodeJS.ErrnoException) => {
+  console.error(`[mock-host] Не удалось слушать 127.0.0.1:${port}: ${error.message}`);
+  process.exitCode = 1;
+});
 // Для проверки переподключения клиентов: kill -USR2 <pid> рвёт все соединения, состояние остаётся.
 process.on('SIGUSR2', () => {
   for (const connection of connections) connection.socket.terminate();
 });
-console.log(`[mock-host] ws://127.0.0.1:${port} pid=${process.pid}`);

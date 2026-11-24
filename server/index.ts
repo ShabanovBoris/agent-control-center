@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { createServer, type IncomingMessage, type Server } from 'node:http';
+import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { MultiHostClient } from '@microsoft/agent-host-protocol/hosts';
@@ -43,6 +44,9 @@ function envPort(value: string | undefined, label: string): number | undefined {
 
 const portOverride = envPort(process.env.ACC_PORT, 'ACC_PORT');
 const mockHostUrl = process.env.ACC_MOCK_HOST_URL?.trim() || undefined;
+// Параллельные контуры не должны читать production VAPID-ключи и clientId из `.local`.
+// По умолчанию пути остаются прежними: меняется только каталог, явно заданный через env.
+const stateDir = process.env.ACC_STATE_DIR?.trim() || '.local';
 const config = await loadConfig(process.env.ACC_CONFIG ?? 'hosts.json', {
   ...(portOverride !== undefined ? { port: portOverride } : {}),
   ...(mockHostUrl ? { hostUrls: { mock: mockHostUrl } } : {}),
@@ -52,7 +56,7 @@ const ahpVersion = await installedAhpVersion();
 const appVersion = await readAppVersion();
 const backendStartedAt = Date.now();
 const logSources = localLogSources(locals);
-const phone = process.env.ACC_PHONE_ACCESS === '0' ? undefined : await createPhoneAccess('.local/phone-access.json', 'dist').catch((error: unknown) => {
+const phone = process.env.ACC_PHONE_ACCESS === '0' ? undefined : await createPhoneAccess(join(stateDir, 'phone-access.json'), 'dist').catch((error: unknown) => {
   console.error('[acc] Доступ с телефона отключён.', error);
 });
 
@@ -86,7 +90,7 @@ interface Browser {
 const browsers = new Set<Browser>();
 const defaultModels = new Map(config.hosts.map(host => [host.id, host.defaultModels ?? {}]));
 
-const push = await createPushService({ dir: '.local' }).catch((error: unknown) => {
+const push = await createPushService({ dir: stateDir }).catch((error: unknown) => {
   console.error('[acc] Push-уведомления отключены.', error instanceof Error ? error.message : String(error));
   return undefined;
 });
@@ -97,7 +101,7 @@ function send(browser: Browser, message: ServerMessage, onSent?: () => void): vo
   else onSent?.();
 }
 
-const hub = new Hub(new MultiHostClient({ clientIdStore: new FileClientIdStore('.local/client-ids.json') }), {
+const hub = new Hub(new MultiHostClient({ clientIdStore: new FileClientIdStore(join(stateDir, 'client-ids.json')) }), {
   broadcast(message) {
     for (const browser of browsers) send(browser, message);
     if (message.t === 'overview' && push) {

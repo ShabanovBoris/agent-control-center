@@ -4,6 +4,11 @@
 
 23 ноября 2026 добавлен рендер markdown-частей ответа агента: [markdown-stream.ts](../src/markdown-stream.ts) нормализует поток частей и конкатенирует соседние markdown-части как display text SDK, [MarkdownMessage.tsx](../src/ui/MarkdownMessage.tsx) рендерит GFM без raw HTML и внешних картинок. Копирование и форк по-прежнему берут исходный markdown финального блока. Подробности и результаты проверок — [AGENTHOS-10.md](AGENTHOS-10.md).
 
+24 ноября 2026 добавлен E2E-контур на Playwright: `npm run test:e2e` поднимает mock-хост, backend
+`hosts.e2e.json` на 8096 и Vite на 5175, прогоняет шесть сценариев в Chromium и изолирует состояние
+backend через `ACC_STATE_DIR=test-results/state`. Job `e2e` добавлен в CI после `verify`.
+Подробности — [AGENTHOS-13.md](AGENTHOS-13.md).
+
 24 ноября 2026 добавлены Web Push-уведомления для PWA: [server/push.ts](../server/push.ts) (VAPID и подписки в `.local`, доставка через `web-push`), [server/push-transitions.ts](../server/push-transitions.ts) (переходы `InputNeeded`, `InProgress → Idle`, ошибка), [server/presence.ts](../server/presence.ts) (подавление на устройстве, где сессия видима), [public/sw.js](../public/sw.js), manifest и иконки, диалог «Уведомления» в [NotificationsButton.tsx](../src/ui/NotificationsButton.tsx). Общие hash- и phase-функции вынесены в [shared/routing.ts](../shared/routing.ts) и [shared/status.ts](../shared/status.ts). Проверено в Chromium; iOS/APNs не проверялись. Подробности — [AGENTHOS-14.md](AGENTHOS-14.md).
 
 - Основной хост `8089` обслуживает Claude через cheapvibecode и Codex через ChatGPT. Gemini изолирован на `8091` и работает в среде Codex. Адреса провайдера читаются из локальной конфигурации при запуске.

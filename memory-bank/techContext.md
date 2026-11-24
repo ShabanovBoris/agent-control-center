@@ -26,6 +26,7 @@ Web Push отправляет backend через `web-push@4.0.0` (ESM, типы
 | `npm run server:dev` | Backend на `127.0.0.1:8095` с mock-only `hosts.dev.json` |
 | `npm run server:e2e` | Backend на `127.0.0.1:8095` с `hosts.e2e.json` |
 | `npm run web:dev` | Панель на `http://127.0.0.1:5173` с прокси `/ws` на 8095 |
+| `npm run test:e2e` | Playwright: mock 8190, backend 8096, Vite 5175 |
 | `npm run typecheck`, `npm test`, `npm run build` | Проверка типов, тесты и production-сборка |
 
 Mock-контур не требует VS Code CLI, AHP-токенов и `.local`: `hosts.dev.json` и `hosts.e2e.json`
@@ -38,15 +39,23 @@ Mock-контур не требует VS Code CLI, AHP-токенов и `.local
 для прокси. При смене порта mock задавайте пару `MOCK_HOST_PORT` + `ACC_MOCK_HOST_URL`.
 
 Учебный хост отвечает эхом с markdown-стримингом, на слово `tool` просит подтвердить `mock_shell`,
-на слово `input` показывает карточку `InputRequest`, создаёт боковой чат через `createChat` и
-держит историю в памяти: снимок чата отдаёт последние 6 ходов, остальное грузится через
-`fetchTurns` (курсор `older:<index>`). После перезапуска mock-host история и чаты теряются.
+на слово `input` показывает карточку `InputRequest`, на слово `markdown` добавляет заголовок,
+список, таблицу и длинный code block. Он создаёт боковой чат через `createChat` и держит историю
+в памяти: снимок чата отдаёт последние 6 ходов, остальное грузится через `fetchTurns`
+(курсор `older:<index>`). После перезапуска mock-host история и чаты теряются.
+
+E2E на `@playwright/test@1.65.1` запускается командой `npm run test:e2e` (Chromium). Playwright
+поднимает backend `hosts.e2e.json` на 8096 и Vite на 5175, worker-fixture владеет mock-процессом на
+8190 и умеет его останавливать/запускать для reconnect-сценария. `ACC_STATE_DIR=test-results/state`
+изолирует VAPID-ключи и clientId от `.local`; `retries: 0`, при падении сохраняются trace и
+screenshot. `pretest:e2e` ставит Chromium после чистого `npm ci`. Подробности — [AGENTHOS-13.md](AGENTHOS-13.md).
 
 GitHub Actions [workflow](../.github/workflows/ci.yml) на pull request и push в `main` (Node.js 22)
 выполняет `npm ci`, `npm ci --prefix debug-ui`, `npm run typecheck`, `npm test`,
-`npm test --prefix debug-ui`, `npm run build`; npm-кэш учитывает оба lockfile. Секреты, `.local`,
-AHP-хосты и VS Code CLI не требуются. Check `verify` требуется для merge PR в `main`; прямые push
-администратора branch protection не блокирует (`enforce_admins: false`).
+`npm test --prefix debug-ui`, `npm run build`; npm-кэш учитывает оба lockfile. Job `e2e` идёт после
+`verify`, кэширует Chromium и выгружает `playwright-report`/`test-results` при падении. Секреты,
+`.local`, AHP-хосты и VS Code CLI не требуются. Check `verify` требуется для merge PR в `main`;
+прямые push администратора branch protection не блокирует (`enforce_admins: false`).
 
 Claude и Gemini читают `API_KEY` и `BASE_URL` из `.local/model-provider.env`. Claude использует Anthropic Messages API и базовый адрес без `/v1`. Gemini использует Responses API и базовый адрес с `/v1`. На момент проверки локального файла адреса были `https://ru.cheapvibecode.ru` и `https://ru.cheapvibecode.ru/v1` соответственно. Актуальный источник этих значений — локальный файл. [Шаблон](../model-provider.env.example) · [Claude](../scripts/start-host.sh) · [Gemini](../scripts/start-gemini-host.ts)
 

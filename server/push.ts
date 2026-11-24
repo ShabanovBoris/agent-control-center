@@ -66,7 +66,7 @@ export interface PushServiceOptions {
   now?: () => Date;
 }
 
-/** Открывает хранилище и VAPID-ключи; всё лежит в `.local` с правами 0600. */
+/** Открывает хранилище и VAPID-ключи; всё лежит в каталоге состояния (по умолчанию `.local`) с правами 0600. */
 export async function createPushService(options: PushServiceOptions): Promise<PushService> {
   const store = new PushStore(join(options.dir, 'push-subscriptions.json'));
   await store.load();

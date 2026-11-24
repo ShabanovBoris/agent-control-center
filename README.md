@@ -352,7 +352,8 @@ npm run web:dev       # панель на http://127.0.0.1:5173, прокси /w
 не занимают порт 8092 и не читают `.local/phone-access.json`.
 
 Mock-хост отвечает эхом с markdown-стримингом, на слово `tool` просит подтвердить `mock_shell`,
-на слово `input` показывает карточку ввода. После завершённого хода в панели доступен боковой чат
+на слово `input` показывает карточку ввода, на слово `markdown` добавляет заголовок, список,
+таблицу и длинный code block. После завершённого хода в панели доступен боковой чат
 (`createChat`); история живёт в памяти, снимок чата отдаёт последние 6 ходов, а кнопка «Ранние
 сообщения» грузит остальное через `fetchTurns`. После перезапуска mock-host история пропадает.
 
@@ -361,6 +362,8 @@ Mock-хост отвечает эхом с markdown-стримингом, на �
 `ACC_MOCK_HOST_URL=ws://127.0.0.1:8190`; для панели — `ACC_BACKEND=127.0.0.1:8096 npm run web:dev`.
 При смене порта mock задавайте пару `MOCK_HOST_PORT` + `ACC_MOCK_HOST_URL`, иначе backend продолжит
 искать 8189. `npm run server:e2e` поднимает тот же backend на 8095 с `hosts.e2e.json`.
+`ACC_STATE_DIR` задаёт каталог состояния backend (файл доступа с телефона, VAPID-ключи, clientId);
+по умолчанию это `.local`, а E2E пишет в `test-results/state`.
 
 Проверки:
 
@@ -368,6 +371,7 @@ Mock-хост отвечает эхом с markdown-стримингом, на �
 npm run typecheck
 npm test
 npm test --prefix debug-ui
+npm run test:e2e
 ```
 
 `npx tsx scripts/probe.ts` проверяет AHP-хост напрямую с общим таймаутом 10 секунд.
@@ -385,6 +389,37 @@ npx tsx scripts/backend-check.ts '{"op":"health"}' '{"op":"readLog","hostId":"lo
 `health` возвращает снимок версий и истории ошибок, `readLog` — хвост журнала локального хоста;
 неизвестный `hostId` отклоняется сообщением «Журнал доступен только для локальных хостов проекта».
 
+### E2E-тесты
+
+`npm run test:e2e` поднимает mock-контур и прогоняет панель в Chromium. Первый запуск сам ставит
+браузер (`pretest:e2e`); на Linux без системных библиотек предварительно выполните
+`npx playwright install --with-deps chromium`.
+
+Что запускается: mock-хост на `ws://127.0.0.1:8190`, backend на `127.0.0.1:8096` с
+`hosts.e2e.json` и Vite на `http://127.0.0.1:5175`. `reuseExistingServer: false` не даёт
+подключиться к чужому серверу: production 8090, dev-контур 8095/8189, резервная панель 5174 и
+`.local` не затрагиваются. Состояние backend (VAPID-ключи и clientId) пишется в
+`test-results/state` через `ACC_STATE_DIR`.
+
+Порты переопределяются через env:
+`E2E_MOCK_PORT=8290 E2E_BACKEND_PORT=8097 E2E_WEB_PORT=5176 npm run test:e2e`.
+Занятый порт даёт понятную ошибку с подсказкой; чужой процесс Playwright и fixture не убивают.
+
+Один сценарий или группа:
+
+```bash
+npm run test:e2e -- e2e/copy-response.spec.ts
+npm run test:e2e -- --grep "markdown"
+npm run test:e2e -- --headed
+npm run test:e2e -- --debug
+```
+
+Отчёт лежит в `playwright-report/index.html`; `npx playwright show-report` открывает его.
+При падении Playwright сохраняет screenshot и trace в `test-results`, trace открывается командой
+`npx playwright show-trace test-results/<каталог теста>/trace.zip`. Ретраев нет: нестабильный
+сценарий падает на первом прогоне. Покрытие — Chromium, последовательный прогон, без визуального
+диффа скриншотов и реальных моделей.
+
 ### CI
 
 GitHub Actions workflow [`.github/workflows/ci.yml`](.github/workflows/ci.yml) запускается на каждый
@@ -399,9 +434,13 @@ npm test --prefix debug-ui
 npm run build
 ```
 
+Job `e2e` идёт после `verify`, кэширует Chromium по ключу lockfile и выполняет
+`npx playwright install --with-deps chromium` и `npm run test:e2e`. При падении он выгружает
+`playwright-report/` и `test-results/` артефактом (без `test-results/state`).
+
 Кэш npm учитывает оба lockfile. Секреты, `.local`, реальные AHP-хосты и VS Code CLI не нужны:
-проверяются только unit-тесты и production-сборка. E2E, деплой, публикация артефактов и
-линтер/форматтер в workflow не входят.
+проверяются unit-тесты, production-сборка и E2E на mock-контуре. Деплой, публикация артефактов,
+линтер и форматтер в workflow не входят.
 
 `npm run build` предупреждает о чанке больше 500 kB; предупреждение не подавляется и сборку не валит.
 Размер на 23 ноября 2026 — 505.49 kB (gzip 153.52 kB); цифры и ссылки на прогоны —
@@ -431,11 +470,8 @@ Check `verify` включён как required для pull request в `main`. Req
   ранжирование, сниппеты и извлечение текста хода. Используется браузером и backend.
 - `src/search.ts` — overview-поиск, локальный корпус загруженной истории, слияние с deep-результатами
   и текст статуса полноты; React и WebSocket сюда не входят, поэтому модуль тестируется в Node.
-- `shared/` — контракт backend ↔ браузер и общие редьюсеры: браузер получает снимок и actions
-  и применяет те же редьюсеры SDK, что и backend.
-- `src/` — интерфейс на React.
 - `scripts/mock-host.ts` — учебный AHP-хост для dev/e2e: эхо, подтверждение инструмента, ввод,
-  боковой чат и постраничная история; запускается через `npm run mock-host`.
+  markdown-отчёт с таблицей, боковой чат и постраничная история; запускается через `npm run mock-host`.
 - `server/health.ts` — снимок здоровья: backend, хосты, версии SDK, история ошибок по запросу `health`.
 - `server/logs.ts` — allowlist двух журналов и хвост с лимитами; `server/redact.ts` — редакция секретов.
 - `server/host-issues.ts` — ограниченная история ошибок подключения; `server/host-build.ts` — общий
@@ -490,8 +526,9 @@ Check `verify` включён как required для pull request в `main`. Req
   пределами 40 кандидатов в него не попадают, о чём сигнализирует глобальный `≥`. Кэш хранит
   usage вместе с текстом и не учитывает строки usage в лимите `maxChars`. Унаследованный префикс
   side chat по-прежнему может учитываться дважды — parity с `sessionTokenUsage` сохраняется.
-- E2E-тестов нет: поиск, ранжирование, расход, кэш и отмена покрыты unit-тестами, палитра,
-  панель расхода и переход к ходу проверяются вручную.
+- E2E на Playwright покрывают создание сессии, отправку сообщения, markdown-стриминг, tool call,
+  копирование ответа, переподключение хоста и мобильную ленту. Поиск, ранжирование, кэш и отмена
+  остаются за unit-тестами; палитра и переход к ходу проверяются вручную.
 - Пути рабочих папок — только POSIX.
 - Смену модели в уже идущей сессии Claude хост не применяет: ход выполняет прежняя модель.
   На первом ходе новой сессии выбор работает; Codex меняет модель и посреди сессии.
