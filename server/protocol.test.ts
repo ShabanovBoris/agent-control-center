@@ -81,6 +81,15 @@ test('поиск по истории проходит парсер вызова,
   }
 });
 
+test('отчёт по расходу проходит парсер вызова и имеет отдельную отмену', () => {
+  const call = { t: 'call', id: 8, call: { op: 'usageReport', timeZone: 'Europe/Moscow' } } as const;
+  assert.deepEqual(parseClientMessage(JSON.stringify(call)), call);
+  assert.deepEqual(parseClientMessage('{"t":"cancelUsage","id":8}'), { t: 'cancelUsage', id: 8 });
+  for (const raw of ['{"t":"cancelUsage"}', '{"t":"cancelUsage","id":"8"}', '{"t":"cancelUsage","id":null}']) {
+    assert.equal(parseClientMessage(raw), undefined, raw);
+  }
+});
+
 test('describeCallError сохраняет авторизационное указание и код обычной ошибки', () => {
   assert.match(describeCallError({ message: 'Authentication required', code: -32007 }), /скачайте его SDK/);
   assert.equal(describeCallError({ message: 'Хост недоступен', code: -32001 }), 'Хост недоступен');

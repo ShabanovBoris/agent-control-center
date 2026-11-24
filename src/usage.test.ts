@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { ChatState, UsageInfo } from '@microsoft/agent-host-protocol';
-import { chatContextUsage, sessionTokenUsage } from './usage.js';
+import {
+  UNDATED_USAGE_DAY, aggregateUsage, chatContextUsage, resolveTimeZone, sessionTokenUsage, usageSourceOf,
+} from '../shared/usage.js';
 
 const chat = (...usage: (UsageInfo | undefined)[]): ChatState => ({ turns: usage.map((usage, id) => ({ id: String(id), usage })) }) as ChatState;
 
@@ -80,4 +82,88 @@ test('отсутствие замера отличается от явно со�
   assert.equal(chatContextUsage(chat({ inputTokens: 100, outputTokens: 10, cacheReadTokens: 800000 })), undefined);
   assert.equal(chatContextUsage(chat({ inputTokens: 100, outputTokens: 10, _meta: { modelContextWindow: 0 } })), undefined);
   assert.deepEqual(chatContextUsage(chat({ inputTokens: 0, outputTokens: 0, _meta: { modelContextWindow: 475000 } })), { usedTokens: 0, windowTokens: 475000 });
+});
+
+const totalsOf = (usage: ReturnType<typeof aggregateUsage>) => {
+  const { days: _days, models: _models, ...totals } = usage;
+  return totals;
+};
+const sumBuckets = (buckets: readonly { total: number | undefined }[]) => buckets.reduce((sum, bucket) => sum + (bucket.total ?? 0), 0);
+
+test('агрегаты по дням и моделям совпадают с sessionTokenUsage на тех же данных', () => {
+  const state = chat(
+    { inputTokens: 100, outputTokens: 10, cacheReadTokens: 60 },
+        { inputTokens: 10, outputTokens: 1, _meta: { turnTokenTotals: [{ model: 'one', inputTokens: 300, outputTokens: 30 }, { model: 'two', inputTokens: 200, outputTokens: 20 }] } },
+  );
+  for (const provider of ['codex', 'claude']) {
+    const usage = aggregateUsage([usageSourceOf(state, provider)], { timeZone: 'UTC' });
+    assert.deepEqual(totalsOf(usage), sessionTokenUsage([state], provider));
+    assert.equal(sumBuckets(usage.days), usage.total);
+    assert.equal(sumBuckets(usage.models), usage.total);
+    assert.deepEqual(usage.models.flatMap(model => model.model ? [model.model] : []).sort(), ['one', 'two']);
+    assert.equal(usage.models.some(model => model.model === undefined), true, 'ход без модели остаётся отдельным бакетом');
+  }
+});
+
+test('день считается в часовом поясе браузера, а не в UTC', () => {
+  const state = chat({ inputTokens: 10, outputTokens: 1 });
+  state.turns[0]!.startedAt = '2026-11-20T23:30:00.000Z';
+  const moscow = aggregateUsage([usageSourceOf(state, 'codex')], { timeZone: 'Europe/Moscow' });
+  const utc = aggregateUsage([usageSourceOf(state, 'codex')], { timeZone: 'UTC' });
+  assert.deepEqual(moscow.days.map(day => day.day), ['2026-11-21']);
+  assert.deepEqual(utc.days.map(day => day.day), ['2026-11-20']);
+});
+
+test('ход без даты попадает в undated и делает неполной только разбивку по дням', () => {
+  const state = chat({ inputTokens: 10, outputTokens: 1 });
+  const usage = aggregateUsage([usageSourceOf(state, 'codex')], { timeZone: 'UTC' });
+  assert.equal(usage.partial, false);
+  assert.equal(usage.total, 11);
+  assert.deepEqual(usage.days.map(day => day.day), [UNDATED_USAGE_DAY]);
+  assert.equal(usage.days[0]!.partial, true);
+  assert.equal(usage.models[0]!.partial, false);
+});
+
+test('неполная история помечает partial на сумме, сессии, днях и моделях', () => {
+  const state = chat({ inputTokens: 10, outputTokens: 1 });
+  state.turnsNextCursor = 'older';
+  const source = usageSourceOf(state, 'codex');
+  const usage = aggregateUsage([source], { timeZone: 'UTC' });
+  assert.equal(source.partial, false);
+  assert.equal(usage.hasMoreTurns, true);
+  assert.equal(usage.partial, true);
+  assert.equal(usage.days[0]!.partial, true);
+  assert.equal(usage.models[0]!.partial, true);
+});
+
+test('модель строки берётся из turnTokenTotals, usage или выбранной модели хода', () => {
+  const state = {
+    turns: [
+      { id: 'a', message: { model: { id: 'from-message' } }, usage: { inputTokens: 1, outputTokens: 1 } },
+      { id: 'b', message: { model: { id: 'ignored' } }, usage: { inputTokens: 2, outputTokens: 2, model: 'from-usage' } },
+      { id: 'c', message: { model: { id: 'ignored' } }, usage: { inputTokens: 3, outputTokens: 3, model: 'from-usage', _meta: { turnTokenTotals: [{ model: 'from-totals', inputTokens: 4, outputTokens: 4 }] } } },
+    ],
+  } as unknown as ChatState;
+  const usage = aggregateUsage([usageSourceOf(state, 'codex')], { timeZone: 'UTC' });
+  assert.deepEqual(usage.models.map(model => [model.model, model.total]).sort(), [
+    ['from-message', 2],
+    ['from-totals', 8],
+    ['from-usage', 4],
+  ]);
+});
+
+test('кэш активного хода учитывается по умолчанию и исключается для кэша истории', () => {
+  const state = chat({ inputTokens: 10, outputTokens: 1 });
+  state.activeTurn = { id: 'live', startedAt: '2026-11-20T10:00:00.000Z', usage: { inputTokens: 5, outputTokens: 1 } } as ChatState['activeTurn'];
+  assert.equal(sessionTokenUsage([state], 'codex').total, 17);
+  const cached = usageSourceOf(state, 'codex', { includeActiveTurn: false });
+  assert.equal(cached.turns, 1);
+  assert.equal(aggregateUsage([cached], { timeZone: 'UTC' }).total, 11);
+});
+
+test('resolveTimeZone принимает только известные зоны, aggregate падает на неизвестной', () => {
+  assert.equal(resolveTimeZone('Europe/Moscow'), 'Europe/Moscow');
+  assert.equal(resolveTimeZone(' UTC '), 'UTC');
+  for (const value of [undefined, null, 42, '', 'x'.repeat(65), 'Mars/Base']) assert.equal(resolveTimeZone(value), undefined, String(value));
+  assert.throws(() => aggregateUsage([], { timeZone: 'Mars/Base' }), /часовой пояс/);
 });

@@ -55,3 +55,20 @@ Claude и Gemini читают `API_KEY` и `BASE_URL` из `.local/model-provide
 Настройки, skills и MCP зависят от запуска и рабочей папки. Основной Codex читает обычную локальную конфигурацию с переопределениями Agent Host. Claude загружает пользовательские, проектные и локальные настройки Claude Code. Подключения, предоставленные desktop-приложением, отдельно в панель не импортируются.
 
 Для диагностики [probe.ts](../scripts/probe.ts) обращается к хосту, [backend-check.ts](../scripts/backend-check.ts) — к backend. Подробная настройка SDK и агента описана в [README](../README.md).
+
+## Расход токенов
+
+`shared/usage.ts` — единственный расчёт: строки usage по моделям и датам, суммы, `partial`/`hasMoreTurns`
+и поправка Claude (`input += cached`). Панель и backend-отчёт используют один и тот же модуль, поэтому
+цифры совпадают с `sessionTokenUsage`. День считается `Intl.DateTimeFormat` в часовом поясе браузера;
+ходы без даты не делают сумму токенов неполной, но разбивка по дням помечается.
+
+Межсессионный отчёт — `HistorySearch.usageReport` в [server/search.ts](../server/search.ts): тот же
+`openChat`/`fetchOlderTurns`/`releaseChat`, семафоры, page budget, deadline и `SearchCache`, что у поиска.
+Скрытые чаты включаются в отчёт для parity, но поиск их не индексирует. Отчёт по определению частичный
+и показывает `reasons`/`issues`. Денег и прайса нет: AHP публикует только токены.
+
+Порог — одно число в `localStorage` (`acc.tokenBudget.v1`) в [src/usage-budget.ts](../src/usage-budget.ts).
+`BudgetLatch` живёт вне React и уведомляет один раз на переход ниже→выше; push/Notification в проекте нет,
+поэтому только `store.notify`. Проверки: `npm run typecheck`, `npm test` (включая parity и отчёт),
+`npm run build`, `npm test --prefix debug-ui`.

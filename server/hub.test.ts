@@ -3,11 +3,11 @@ import { EventEmitter, on } from 'node:events';
 import { setImmediate } from 'node:timers/promises';
 import { test } from 'node:test';
 import {
-  ActionType, ChatOriginKind, ChatSourceKind, MessageAttachmentKind, MessageKind, SessionLifecycle, TurnState,
-  type ActionEnvelope, type ChatState, type MessageEmbeddedResourceAttachment, type SessionModelInfo, type SessionState, type StateAction, type Turn,
+  ActionType, ChatOriginKind, ChatSourceKind, MessageAttachmentKind, MessageKind, SessionLifecycle, SessionStatus, TurnState,
+  type ActionEnvelope, type ChatState, type MessageEmbeddedResourceAttachment, type SessionModelInfo, type SessionState, type SessionSummary, type StateAction, type Turn,
 } from '@microsoft/agent-host-protocol';
 import type { MultiHostClient } from '@microsoft/agent-host-protocol/hosts';
-import type { SessionOverview } from '../shared/protocol.js';
+import type { SessionOverview, UsageReport } from '../shared/protocol.js';
 import { Hub } from './hub.js';
 
 const model: SessionModelInfo = {
@@ -470,4 +470,64 @@ test('диагностика хоста накапливает ограниче�
   } finally {
     await hub.stop();
   }
+});
+const usageAt = '2026-11-20T10:00:00.000Z';
+
+function usageTurn(inputTokens: number, outputTokens: number): Turn {
+  return {
+    id: `turn-${inputTokens}`, startedAt: usageAt,
+    message: { text: 'usage', origin: { kind: MessageKind.User } }, responseParts: [],
+    usage: { inputTokens, outputTokens }, state: TurnState.Complete,
+  };
+}
+
+function usageSession(sessionUri: string, chatUri: string, cursor?: string): { session: SessionOverview; chat: ChatState } {
+  const session: SessionOverview = {
+    hostId: 'h', hostLabel: 'Host',
+    summary: {
+      resource: sessionUri, createdAt: usageAt, modifiedAt: usageAt, provider: 'codex', title: 'Usage',
+      status: SessionStatus.Idle,
+      chats: [{ resource: chatUri, title: 'Main', status: SessionStatus.Idle }],
+    } as SessionSummary,
+  };
+  const chat = {
+    resource: chatUri, title: 'Main', status: SessionStatus.Idle, modifiedAt: usageAt,
+    turns: [usageTurn(100, 10)],
+    ...(cursor ? { turnsNextCursor: cursor } : {}),
+  } as ChatState;
+  return { session, chat };
+}
+
+test('usageReport считает расход через слой истории и валидирует часовой пояс', async () => {
+  const { hub, sessions, states } = setup();
+  const { session, chat } = usageSession('ahp-session:/usage', 'ahp-chat:/usage');
+  sessions.push(session);
+  states.set(chat.resource, chat);
+
+  const report = await hub.call({ op: 'usageReport', timeZone: 'UTC' }) as UsageReport;
+  assert.equal(report.total, 110);
+  assert.equal(report.partial, false);
+  assert.equal(report.sessions[0]?.title, 'Usage');
+  assert.equal(report.sessions[0]?.chats[0]?.chatUri, chat.resource);
+  assert.equal(report.timeZone, 'UTC');
+  assert.deepEqual(report.reasons, []);
+
+  for (const timeZone of ['Mars/Base', '', 42 as unknown as string]) {
+    await assert.rejects(hub.call({ op: 'usageReport', timeZone }), /часовой пояс/);
+  }
+});
+
+test('отмена usageReport освобождает канал и не превращается в issue хоста', async () => {
+  const { hub, sessions, states, unsubscribed } = setup();
+  const { session, chat } = usageSession('ahp-session:/cancel', 'ahp-chat:/cancel', 'p1');
+  sessions.push(session);
+  states.set(chat.resource, chat);
+
+  const controller = new AbortController();
+  const running = hub.call({ op: 'usageReport', timeZone: 'UTC' }, controller.signal);
+  await setImmediate();
+  await setImmediate();
+  controller.abort();
+  await assert.rejects(running, /Отчёт отменён/);
+  assert.ok(unsubscribed.includes(chat.resource), 'подписка отчёта снята');
 });
