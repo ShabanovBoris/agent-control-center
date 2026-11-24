@@ -24,6 +24,7 @@ Web Push отправляет backend через `web-push@4.0.0` (ESM, типы
 
 | Команда | Назначение |
 | --- | --- |
+| `npm run up` | Оба локальных хоста, backend и Vite одной командой; Ctrl+C/SIGTERM гасит всё, повторный запуск — no-op |
 | `npm run host` | `code agent host` на `127.0.0.1:8089` для Claude и Codex |
 | `npm run host:gemini` | Отдельный `code agent host` на `127.0.0.1:8091` для Gemini |
 | `npm run server` | Backend на `127.0.0.1:8090`, конфигурация из `hosts.json` |
@@ -34,6 +35,23 @@ Web Push отправляет backend через `web-push@4.0.0` (ESM, типы
 | `npm run web:dev` | Панель на `http://127.0.0.1:5173` с прокси `/ws` на 8095 |
 | `npm run test:e2e` | Playwright: mock 8190, backend 8096, Vite 5175 |
 | `npm run typecheck`, `npm test`, `npm run build` | Проверка типов, тесты и production-сборка |
+
+`npm run up` — тонкий CLI [scripts/up.ts](../scripts/up.ts) и супервизор [server/up.ts](../server/up.ts).
+CLI читает `hosts.json`/`ACC_CONFIG`, `.local/model-provider.env` и состояние phone listener, собирает
+реальный `UpDeps` и обрабатывает `SIGINT`/`SIGTERM`/`SIGHUP`; супервизор делает preflight, запускает
+процессы и останавливает их. Переиспользуются `localHosts`/`localInstance`/`nativeVSCodeCli`
+([local-hosts.ts](../server/local-hosts.ts)), `readLogTail` ([logs.ts](../server/logs.ts)), WS-проба
+`overview` ([backend-probe.ts](../scripts/backend-probe.ts), также в `restart:services`) и сами
+`scripts/start-host.sh`, `scripts/start-gemini-host.ts`, `server/index.ts`. Хосты идут последовательно
+`local → gemini`, затем backend и web; каждый child — в своей группе (`detached: true`), остановка —
+`SIGINT` хостам и `SIGTERM` backend/web по `-pgid`, через 15 с `SIGKILL`, затем проверка портов
+через bind и fallback `localInstance` + `signalPid`. Готовность — не `spawn`: `localInstance` для
+хостов, `overview` с `connected` для `local` и `gemini`, HTTP 200 на `/` у Vite. Полностью живой
+стенд при повторе даёт код 0 без запусков; частичный стенд или чужой порт — код 1 и список без
+`spawn`. Ограничения: только VS Code Stable по стандартному пути (кастомный `VSCODE_CLI` отклоняется,
+потому что `localInstance` его не найдёт), `ACC_PORT`/`ACC_MOCK_HOST_URL` отклоняются, `--prod` не
+поддерживается, внешние `restart:services`/`update:agents` под работающим `up` ломают владение.
+Тесты — [server/up.test.ts](../server/up.test.ts) и [server/backend-probe.test.ts](../server/backend-probe.test.ts).
 
 Mock-контур не требует VS Code CLI, AHP-токенов и `.local`: `hosts.dev.json` и `hosts.e2e.json`
 содержат только хост `mock` (`ws://127.0.0.1:8189`), без `tokenFile`, `localFilesystem`, `local`

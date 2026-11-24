@@ -12,15 +12,52 @@
 npm install
 ```
 
-Три процесса, каждый в своём терминале:
+Одна команда из корня проекта поднимает dev-стенд целиком:
 
 ```bash
-npm run host     # Agent Host VS Code на ws://127.0.0.1:8089, данные в .local/host-data
-npm run server   # backend на 127.0.0.1:8090, читает hosts.json
-npm run web      # интерфейс на http://localhost:5173
+npm run up
 ```
 
-При первом запуске `npm run host` VS Code CLI скачивает серверную сборку (~600 МБ) в `~/.vscode/cli/servers`.
+Она запускает оба локальных хоста (`local` на 8089, `gemini` на 8091), backend на 8090
+(и phone listener на 8092, если настроен `.local/phone-access.json`) и Vite на 5173.
+Готовность объявляется по наблюдаемому состоянию: хосты найдены в реестре VS Code, backend
+прислал `overview` с `connected` для обоих, Vite отдал `200` на `/`. Затем в терминале видны
+адреса; `Ctrl+C`, `SIGTERM` и `SIGHUP` гасят всё, включая `code-tunnel` и `code-server`.
+
+Повторный `npm run up` при полностью живом стенде ничего не запускает и возвращает `0`.
+Если стенд поднят частично или порт занят чужим процессом, команда перечисляет состояния,
+ничего не запускает и возвращает `1`: `up` управляет только своими процессами.
+
+Перед запуском проверяются:
+
+- `.local/model-provider.env` с `API_KEY` и `BASE_URL` (шаблон — `model-provider.env.example`);
+- VS Code Stable по стандартному пути; `VSCODE_CLI` принимается, только если указывает на его
+  `code-tunnel` или `bin/code` — иначе панель не найдёт запущенный хост, и `up` предложит
+  ручной `npm run host`;
+- свободные порты 8089, 8091, 8090, 5173 (и 8092, если включён доступ с телефона).
+
+`ACC_PORT` с другим портом и `ACC_MOCK_HOST_URL` для `npm run up` отклоняются: стенд должен
+слушать `listen.port` из `hosts.json`. Журналы хостов остаются в `.local/host.log` и
+`.local/gemini-host.log`; вывод backend и Vite идёт в терминал с префиксами `[backend]`/`[web]`.
+Первый запуск может скачать серверную сборку VS Code (~600 МБ); `up` ждёт до 10 минут и печатает
+прогресс.
+
+`--prod` не поддерживается: production-панель и телефон — это `npm run build` и `npm run server`
+(phone listener отдаёт `dist` на 8092 через Tailscale).
+
+Ручной запуск в отдельных терминалах остаётся для отладки:
+
+```bash
+npm run host        # Agent Host VS Code на ws://127.0.0.1:8089, данные в .local/host-data
+npm run host:gemini # второй Agent Host на ws://127.0.0.1:8091 для CheapVibeCode
+npm run server      # backend на 127.0.0.1:8090, читает hosts.json
+npm run web         # интерфейс на http://localhost:5173
+```
+
+`up` не переживает внешнюю замену процессов: под работающим `up` не запускайте
+`npm run restart:services`, `npm run update:agents` и кнопки «Перезапустить службы»/«Обновления»
+в панели — он заметит выход дочернего процесса и погасит остальных. Остановите `up` и запустите
+снова.
 
 VS Code CLI выводит адрес хоста с токеном подключения. `npm run host -- --log` и
 `npm run host:gemini -- --log` добавляют вывод в `.local/host.log` и `.local/gemini-host.log`
@@ -201,7 +238,7 @@ Codex показывает модели только после первой с�
 
 ## Модели CheapVibeCode через Codex
 
-Дополнительный хост запускается четвёртым процессом:
+Дополнительный хост `npm run up` поднимает вместе с остальными; отдельная команда остаётся для отладки:
 
 ```bash
 npm run host:gemini  # ws://127.0.0.1:8091

@@ -353,7 +353,13 @@ async function handlePushCall(browser: Browser, call: PushCall): Promise<unknown
 }
 
 await hub.start(config.hosts.map(toHostConfig));
+const onListenError = (error: Error): void => {
+  console.error(`[acc] Backend не запустился на ${config.listen.host}:${config.listen.port}: ${error.message}`);
+  void shutdown(1);
+};
+server.once('error', onListenError);
 server.listen(config.listen.port, config.listen.host, () => {
+  server.off('error', onListenError);
   console.log(`[acc] backend слушает ws://${config.listen.host}:${config.listen.port}/ws, хостов: ${config.hosts.length}`);
 });
 if (phone) {
@@ -364,14 +370,14 @@ if (phone) {
 }
 
 let shuttingDown = false;
-async function shutdown(): Promise<void> {
+async function shutdown(exitCode = 0): Promise<void> {
   if (shuttingDown) return;
   shuttingDown = true;
-  server.close();
-  phone?.server.close();
+  if (server.listening) server.close();
+  if (phone?.server.listening) phone.server.close();
   for (const browser of browsers) browser.socket.close();
   await hub.stop();
-  process.exit(0);
+  process.exit(exitCode);
 }
 process.on('SIGINT', () => void shutdown());
 process.on('SIGTERM', () => void shutdown());

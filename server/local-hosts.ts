@@ -2,7 +2,7 @@ import { execFile, spawn, type ChildProcess } from 'node:child_process';
 import { once } from 'node:events';
 import { readFile, readdir } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { relative, resolve, sep } from 'node:path';
+import { dirname, relative, resolve, sep } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { promisify } from 'node:util';
 import { agentPackages, defaultServerData, managedCache, platform, projectRoot, stableVersion } from '../scripts/agent-sdks.mjs';
@@ -12,7 +12,10 @@ import type { HostBuild } from './host-build.js';
 type Agent = keyof typeof agentPackages;
 type AgentRoots = Partial<Record<Agent, string>>;
 
-const nativeCli = '/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code-tunnel';
+/** Нативный CLI: им пользуются `localInstance` и `npm run up`. */
+export const nativeVSCodeCli = '/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code-tunnel';
+/** Bash-обёртка Stable: допускается в `VSCODE_CLI`, потому что запускает тот же `code-tunnel`. */
+export const stableVSCodeCli = resolve(dirname(nativeVSCodeCli), 'code');
 const claudeShim = resolve(projectRoot, '.local/claude-sdk');
 const userData = process.env.VSCODE_PORTABLE
   ? resolve(process.env.VSCODE_PORTABLE, 'user-data')
@@ -83,7 +86,7 @@ export async function localInstance(host: LocalHost): Promise<HostInstance | und
     let command: string;
     try { command = (await readProcess('/bin/ps', ['eww', '-p', String(entry.pid), '-o', 'command='], { timeout: 5000 })).stdout.trim(); }
     catch { continue; }
-    if (!command.startsWith(`${nativeCli} `) || !command.includes(' agent host ') ||
+    if (!command.startsWith(`${nativeVSCodeCli} `) || !command.includes(' agent host ') ||
         !hasArgument(command, '--server-data-dir', host.serverData) ||
         ![host.tokenFile, relative(projectRoot, host.tokenFile)].some(path => hasArgument(command, '--connection-token-file', path))) continue;
     return {
@@ -174,7 +177,7 @@ export async function startLocalHost(host: LocalHost, instance: HostInstance = d
     : ['--import', 'tsx', 'scripts/start-gemini-host.ts', '--log'], {
     cwd: projectRoot, detached: true, stdio: 'ignore',
     env: {
-      ...process.env, ...instance.env, VSCODE_CLI: nativeCli,
+      ...process.env, ...instance.env, VSCODE_CLI: nativeVSCodeCli,
       [main ? 'AHP_PORT' : 'GEMINI_AHP_PORT']: String(host.port),
       VSCODE_AGENT_HOST_CODEX_SDK_ROOT: customRoot('codex', instance.roots.codex, host, instance),
       VSCODE_AGENT_HOST_CLAUDE_SDK_ROOT: customRoot('claude', instance.roots.claude, host, instance),
@@ -192,7 +195,7 @@ async function startHost(host: LocalHost, instance: HostInstance, fallback?: { b
     : ['--import', 'tsx', 'scripts/start-gemini-host.ts', '--log'], {
     cwd: projectRoot, detached: true, stdio: 'ignore',
     env: {
-      ...process.env, ...instance.env, VSCODE_CLI: nativeCli,
+      ...process.env, ...instance.env, VSCODE_CLI: nativeVSCodeCli,
       [main ? 'AHP_PORT' : 'GEMINI_AHP_PORT']: String(host.port),
       VSCODE_AGENT_HOST_CODEX_SDK_ROOT: fallback ? fallback.roots.codex : customRoot('codex', instance.roots.codex, host, instance),
       VSCODE_AGENT_HOST_CLAUDE_SDK_ROOT: fallback ? fallback.roots.claude : customRoot('claude', instance.roots.claude, host, instance),

@@ -4,6 +4,7 @@ import WebSocket from 'ws';
 import { loadConfig } from '../server/config.js';
 import { localHosts } from '../server/local-hosts.js';
 import { parseServerMessage, type Overview } from '../shared/protocol.js';
+import { probeBackendOverview } from './backend-probe.js';
 
 const projectRoot = fileURLToPath(new URL('../', import.meta.url));
 process.chdir(projectRoot);
@@ -53,28 +54,8 @@ function backendCall(): Promise<void> {
 console.log(`[services] Перезапуск: ${hosts.map(host => host.label).join(', ')} и backend.`);
 await backendCall();
 
-async function overview(): Promise<Overview> {
-  return new Promise((resolve, reject) => {
-    const socket = new WebSocket(`ws://${base}/ws`, { headers: { origin } });
-    let settled = false;
-    const deadline = setTimeout(() => finish(new Error('Backend не вернул сводку.')), 5000);
-    function finish(error?: Error, value?: Overview): void {
-      if (settled) return;
-      settled = true;
-      clearTimeout(deadline);
-      socket.terminate();
-      if (error) reject(error);
-      else if (value) resolve(value);
-      else reject(new Error('Backend не вернул сводку.'));
-    }
-    socket.on('message', data => {
-      const message = parseServerMessage(String(data));
-      if (message?.t === 'overview') finish(undefined, message.overview);
-    });
-    socket.on('error', error => finish(error));
-    socket.on('close', () => finish(new Error('Backend закрыл соединение.')));
-    socket.on('unexpected-response', (_request, response) => finish(new Error(`HTTP ${response.statusCode}`)));
-  });
+function overview(): Promise<Overview> {
+  return probeBackendOverview({ base, origin, timeoutMs: 5000 });
 }
 
 for (;;) {
