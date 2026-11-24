@@ -10,6 +10,7 @@ import {
   type Overview,
   type SearchHistoryResult,
   type ServerMessage,
+  type UsageReport,
 } from '../shared/protocol';
 import { channelKey, reduceChannel } from '../shared/reduce';
 import { CallCancelled } from './errors';
@@ -111,11 +112,11 @@ class Store {
   }
 
   /**
-   * Поиск по истории — единственная отменяемая команда. Обычный `call` не
-   * принимает сигнал, чтобы случайно не оборвать `sendMessage`.
+   * Отменяемые команды (поиск и отчёт по расходу) делят одну логику: обычный `call`
+   * сигнал не принимает, чтобы случайно не оборвать `sendMessage`.
    */
-  search(query: string, signal: AbortSignal): Promise<SearchHistoryResult> {
-    return new Promise<SearchHistoryResult>((resolve, reject) => {
+  private abortable<T>(call: Call, signal: AbortSignal, cancel: 'cancelSearch' | 'cancelUsage'): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
       if (signal.aborted) {
         reject(new CallCancelled());
         return;
@@ -127,17 +128,26 @@ class Store {
       const id = this.nextId++;
       const onAbort = () => {
         this.pending.delete(id);
-        this.send({ t: 'cancelSearch', id });
+        if (cancel === 'cancelSearch') this.send({ t: 'cancelSearch', id });
+        else this.send({ t: 'cancelUsage', id });
         reject(new CallCancelled());
       };
       signal.addEventListener('abort', onAbort, { once: true });
       this.pending.set(id, {
-        resolve: data => resolve(data as SearchHistoryResult),
+        resolve: data => resolve(data as T),
         reject,
         cleanup: () => signal.removeEventListener('abort', onAbort),
       });
-      this.send({ t: 'call', id, call: { op: 'searchHistory', query } });
+      this.send({ t: 'call', id, call });
     });
+  }
+
+  search(query: string, signal: AbortSignal): Promise<SearchHistoryResult> {
+    return this.abortable({ op: 'searchHistory', query }, signal, 'cancelSearch');
+  }
+
+  usageReport(timeZone: string, signal: AbortSignal): Promise<UsageReport> {
+    return this.abortable({ op: 'usageReport', timeZone }, signal, 'cancelUsage');
   }
 
   cancelDirectoryPicker(): void {

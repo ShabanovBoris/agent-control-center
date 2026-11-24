@@ -263,10 +263,13 @@ export function SessionView(props: {
       {session.state && (
         <SessionUsage
           hostId={hostId}
-          chatUris={chats.map(chat => chat.resource)}
+          sessionUri={sessionUri}
+          sessionTitle={meta?.title || 'Новая сессия'}
+          chats={chats}
           currentChat={chat.state}
           provider={session.state.provider}
           connected={commandsAvailable}
+          backendConnected={backendConnected}
         />
       )}
     </section>

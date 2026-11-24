@@ -79,6 +79,8 @@ interface Browser {
   pickerAbort?: AbortController;
   /** Текущий поиск по истории: новый запрос отменяет предыдущий. */
   search?: { id: number; abort: AbortController };
+  /** Текущий отчёт по расходу: отдельный слот, чтобы отчёт не рвал поиск. */
+  usage?: { id: number; abort: AbortController };
   updatePlan?: UpdatePlan;
 }
 const browsers = new Set<Browser>();
@@ -202,6 +204,9 @@ async function onMessage(browser: Browser, message: ClientMessage): Promise<void
     case 'cancelSearch':
       if (browser.search?.id === message.id) browser.search.abort.abort();
       return;
+    case 'cancelUsage':
+      if (browser.usage?.id === message.id) browser.usage.abort.abort();
+      return;
     case 'presence':
       browser.visible = message.visible;
       browser.selection = message.selection
@@ -231,6 +236,7 @@ async function onMessage(browser: Browser, message: ClientMessage): Promise<void
     case 'call': {
       let pickerAbort: AbortController | undefined;
       let searchAbort: AbortController | undefined;
+      let usageAbort: AbortController | undefined;
       try {
         const call = message.call;
         if (backendRestarting) throw new Error('Backend перезапускается после обновления.');
@@ -298,7 +304,13 @@ async function onMessage(browser: Browser, message: ClientMessage): Promise<void
           searchAbort = new AbortController();
           browser.search = { id: message.id, abort: searchAbort };
         }
-        const signals = [browser.abort.signal, pickerAbort?.signal, searchAbort?.signal].filter((value): value is AbortSignal => value !== undefined);
+        if (call.op === 'usageReport') {
+          // Новый отчёт заменяет прежний; поиск живёт в своём слоте.
+          browser.usage?.abort.abort();
+          usageAbort = new AbortController();
+          browser.usage = { id: message.id, abort: usageAbort };
+        }
+        const signals = [browser.abort.signal, pickerAbort?.signal, searchAbort?.signal, usageAbort?.signal].filter((value): value is AbortSignal => value !== undefined);
         const signal = signals.length === 1 ? signals[0]! : AbortSignal.any(signals);
         const data = await hub.call(call, signal);
         send(browser, { t: 'result', id: message.id, ok: true, ...(data !== undefined ? { data } : {}) });
@@ -306,8 +318,9 @@ async function onMessage(browser: Browser, message: ClientMessage): Promise<void
         send(browser, { t: 'result', id: message.id, ok: false, error: toCallError(error) });
       } finally {
         if (pickerAbort) browser.pickerAbort = undefined;
-        // Новая поисковая команда могла уже заменить этот controller.
+        // Новая поисковая команда или отчёт могли уже заменить этот controller.
         if (searchAbort && browser.search?.id === message.id) browser.search = undefined;
+        if (usageAbort && browser.usage?.id === message.id) browser.usage = undefined;
       }
       return;
     }

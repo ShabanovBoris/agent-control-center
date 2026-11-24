@@ -1,5 +1,6 @@
 import type { ChatState } from '@microsoft/agent-host-protocol';
 import type { SearchField } from '../shared/search.js';
+import type { UsageSource } from '../shared/usage.js';
 
 /** Извлечённый из хода текст; не результат запроса, поэтому кэш переиспользуется при смене query. */
 export interface SearchDoc {
@@ -17,6 +18,12 @@ export interface ChatCorpus {
   /** Живой fingerprint на момент извлечения; для закрытого чата отсутствует. */
   liveFingerprint?: string;
   docs: SearchDoc[];
+  /**
+   * Расход по всем завершённым ходам, а не по `visibleTurns`: отчёт обязан совпадать
+   * с `sessionTokenUsage`. Активный ход сюда не входит — fingerprint его не видит,
+   * а живой чат отчёт читает из зеркала, не из кэша.
+   */
+  usage: UsageSource;
   storedAt: number;
   chars: number;
 }

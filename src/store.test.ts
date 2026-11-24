@@ -123,3 +123,30 @@ test('presence сообщает открытую сессию и видимос�
   store.setPresence(null);
   assert.deepEqual(sent().at(-1), { t: 'presence', visible: true });
 });
+
+test('отчёт по расходу уходит отдельным вызовом с часовым поясом', async () => {
+  const running = store.usageReport('Europe/Moscow', new AbortController().signal);
+  const call = JSON.parse(socket.sent.at(-1)!) as { id: number; call: { op: string; timeZone: string } };
+  assert.equal(call.call.op, 'usageReport');
+  assert.equal(call.call.timeZone, 'Europe/Moscow');
+  const report = { total: 110, timeZone: 'Europe/Moscow', sessions: [], reasons: [], issues: [] };
+  receive({ t: 'result', id: call.id, ok: true, data: report });
+  assert.deepEqual(await running, report);
+});
+
+test('отмена отчёта шлёт cancelUsage и не рвёт поиск', async () => {
+  const controller = new AbortController();
+  const running = store.usageReport('UTC', controller.signal);
+  const call = JSON.parse(socket.sent.at(-1)!) as { id: number };
+  controller.abort();
+  await assert.rejects(running, (error: Error) => error.name === 'CallCancelled');
+  assert.deepEqual(JSON.parse(socket.sent.at(-1)!), { t: 'cancelUsage', id: call.id });
+  receive({ t: 'result', id: call.id, ok: true, data: { total: 999 } });
+
+  const search = store.search('deploy', new AbortController().signal);
+  const searchCall = JSON.parse(socket.sent.at(-1)!) as { id: number; call: { op: string } };
+  assert.equal(searchCall.call.op, 'searchHistory');
+  assert.notEqual(searchCall.id, call.id);
+  receive({ t: 'result', id: searchCall.id, ok: true, data: { hits: [] } });
+  assert.deepEqual(await search, { hits: [] });
+});

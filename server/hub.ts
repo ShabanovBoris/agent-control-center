@@ -45,6 +45,7 @@ import {
   type SlashCompletions,
 } from '../shared/protocol.js';
 import { channelKey, isSupportedChannel } from '../shared/reduce.js';
+import { resolveTimeZone } from '../shared/usage.js';
 import { ChannelMirror } from './mirror.js';
 import type { DirectoryPicker } from './directory-picker.js';
 import { abortable } from './async.js';
@@ -410,6 +411,11 @@ export class Hub implements SearchEnvironment {
           throw new CallFailure('Лимит результатов должен быть целым числом от 1 до 100');
         }
         return this.historySearch.search(call.query, signal ?? new AbortController().signal, call.limit);
+      }
+      case 'usageReport': {
+        const timeZone = resolveTimeZone(call.timeZone);
+        if (!timeZone) throw new CallFailure('Неизвестный часовой пояс');
+        return this.historySearch.usageReport(timeZone, signal ?? new AbortController().signal);
       }
       case 'slashCompletions': {
         const { session } = this.historyChat(call);

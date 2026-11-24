@@ -15,6 +15,7 @@ import type {
   SessionSummary,
   StateAction,
 } from '@microsoft/agent-host-protocol';
+import type { UsageAggregate } from './usage.js';
 
 export type HostStatus = 'disconnected' | 'connecting' | 'connected' | 'reconnecting' | 'failed';
 export type SlashCompletions = CompletionsResult;
@@ -71,6 +72,7 @@ export type Call = HostCall
   | { op: 'applyUpdates' }
   | { op: 'restartServices' }
   | { op: 'searchHistory'; query: string; limit?: number }
+  | { op: 'usageReport'; timeZone: string }
   | { op: 'pushConfig' }
   | { op: 'pushSubscribe'; origin: string; subscription: PushSubscriptionPayload }
   | { op: 'pushUnsubscribe'; endpoint: string }
@@ -181,6 +183,40 @@ export interface HealthSnapshot {
 export type LogTail =
   | { status: 'ok'; hostId: string; fileName: string; lines: string[]; truncated: boolean; updatedAt?: string }
   | { status: 'missing' | 'unavailable'; hostId: string; fileName: string; message: string };
+/** Почему отчёт по расходу не покрыл всю историю: подмножество причин поиска. */
+export type UsageStopReason = Extract<SearchStopReason, 'chat-budget' | 'page-budget' | 'deadline'>;
+
+/** Расход чата в отчёте. `partial`/`hasMoreTurns` означают нижнюю границу, а не точную сумму. */
+export interface UsageReportChat extends UsageAggregate {
+  hostId: string;
+  sessionUri: string;
+  chatUri: string;
+  title: string;
+  /** Служебный чат (подагент/worker) тоже расходует токены, но не индексируется поиском. */
+  hidden: boolean;
+  issue?: string;
+}
+
+export interface UsageReportSession extends UsageAggregate {
+  hostId: string;
+  hostLabel: string;
+  sessionUri: string;
+  title: string;
+  provider: string;
+  archived: boolean;
+  chats: UsageReportChat[];
+}
+
+export interface UsageReport extends UsageAggregate {
+  timeZone: string;
+  generatedAt: string;
+  sessions: UsageReportSession[];
+  scannedChats: number;
+  candidateChats: number;
+  reasons: UsageStopReason[];
+  issues: SearchIssue[];
+}
+
 
 export type EditMessageResult =
   | { status: 'sent' }
@@ -210,6 +246,7 @@ export type HostCall =
 export type ClientMessage =
   | { t: 'cancelDirectoryPicker' }
   | { t: 'cancelSearch'; id: number }
+  | { t: 'cancelUsage'; id: number }
   | { t: 'watch'; hostId: string; uri: string }
   | { t: 'unwatch'; hostId: string; uri: string }
   | { t: 'presence'; visible: boolean; selection?: { hostId: string; sessionUri: string } }
@@ -281,8 +318,10 @@ export function parseClientMessage(raw: string): ClientMessage | undefined {
       break;
     }
     case 'cancelDirectoryPicker':
+      break;
     case 'cancelSearch':
-      if (message.t === 'cancelSearch' && (typeof message.id !== 'number' || !Number.isFinite(message.id))) return undefined;
+    case 'cancelUsage':
+      if (typeof message.id !== 'number' || !Number.isFinite(message.id)) return undefined;
       break;
     default:
       return undefined;
