@@ -7,6 +7,8 @@ import { HealthView } from './HealthView';
 import { CommandPalette } from './ui/CommandPalette';
 import { SessionView } from './SessionView';
 import { describeError, store, useAppState, usePresence } from './store';
+import { panelVisibility } from './panel-presence';
+import { pinnedKeys, sortSessions, unreadCounts } from './session-list';
 import { NotificationsButton } from './ui/NotificationsButton';
 import { recentDirectories, rememberDirectory } from './recent-directories';
 
@@ -14,7 +16,7 @@ type Filter = 'all' | 'active' | 'input' | 'archived';
 
 
 export function App() {
-  const { connection, overview, channels, notices } = useAppState();
+  const { connection, overview, channels, notices, sessionUserState } = useAppState();
   const backendConnected = connection === 'open';
   const [selection, setSelection] = useState(() => selectionFromHash(location.hash));
   const [creating, setCreating] = useState(false);
@@ -47,7 +49,10 @@ export function App() {
     window.addEventListener('hashchange', onHashChange);
     return () => window.removeEventListener('hashchange', onHashChange);
   }, []);
-  usePresence(selection);
+  const mobile = useMediaQuery('(max-width: 760px)');
+  // Presence и badge непрочитанных считаются от одного и того же «detail реально показан».
+  const { detailVisible, presence } = panelVisibility(selection, { creating, showHealth, sessionList: showSessionList, mobile });
+  usePresence(presence);
   const [filter, setFilter] = useState<Filter>('all');
 
   useEffect(() => {
@@ -71,10 +76,11 @@ export function App() {
     setPaletteOpen(false);
   };
 
+  const pinned = useMemo(() => pinnedKeys(sessionUserState.pinned), [sessionUserState.pinned]);
+  const unread = useMemo(() => unreadCounts(sessionUserState.unread), [sessionUserState.unread]);
   const sessions = useMemo(
-    () => overview.sessions
-      .toSorted((a, b) => b.summary.modifiedAt.localeCompare(a.summary.modifiedAt)),
-    [overview.sessions],
+    () => sortSessions(overview.sessions, pinned),
+    [overview.sessions, pinned],
   );
   const normal = sessions.filter(session => !isArchived(session.summary.status));
   const phases = normal.map(session => phaseOf(session.summary.status));
@@ -142,14 +148,21 @@ export function App() {
           {visible.map(session => {
             const { hostId, summary } = session;
             const sessionUri = summary.resource;
-            const live = channels.get(channelKey(hostId, sessionUri))?.state as SessionState | undefined;
+            const key = channelKey(hostId, sessionUri);
+            const live = channels.get(key)?.state as SessionState | undefined;
+            // Badge скрыт только когда detail этой сессии действительно на экране;
+            // на телефоне в списке detail скрыт, поэтому badge остаётся видимым.
+            const hideUnread = detailVisible && selection?.hostId === hostId && selection.sessionUri === sessionUri;
             return (
               <SessionRow
-                key={channelKey(hostId, sessionUri)}
+                key={key}
                 session={session}
                 catalog={live?.chats ?? summary.chats}
                 defaultChat={live?.defaultChat ?? summary.defaultChat}
                 connected={backendConnected && overview.hosts.some(host => host.id === hostId && host.status === 'connected')}
+                backendConnected={backendConnected}
+                pinned={pinned.has(key)}
+                unread={hideUnread ? 0 : unread.get(key) ?? 0}
                 selected={!creating && !showHealth && selection?.hostId === hostId && selection.sessionUri === sessionUri ? selection : null}
                 onSelect={chatUri => {
                   setCreating(false);
@@ -293,6 +306,19 @@ function UpdatesButton({ connected }: { connected: boolean }) {
   );
 }
 
+/** Тот же breakpoint, что `@media (max-width: 760px)` в стилях: detail на телефоне скрыт. */
+function useMediaQuery(query: string): boolean {
+  const [matches, setMatches] = useState(() => matchMedia(query).matches);
+  useEffect(() => {
+    const media = matchMedia(query);
+    const update = () => setMatches(media.matches);
+    update();
+    media.addEventListener('change', update);
+    return () => media.removeEventListener('change', update);
+  }, [query]);
+  return matches;
+}
+
 function Counter(props: { label: string; value: number; active: boolean; attention?: boolean; onSelect(): void }) {
   return (
     <button
@@ -310,12 +336,15 @@ export function PhaseBadge({ phase }: { phase: Phase }) {
   return <span className={`badge badge-${phase}`}>{PHASE_LABEL[phase]}</span>;
 }
 
-function SessionRow({ session, catalog, defaultChat, selected, connected, onSelect }: {
+function SessionRow({ session, catalog, defaultChat, selected, connected, backendConnected, pinned, unread, onSelect }: {
   session: SessionOverview;
   catalog: readonly SessionChatSummary[] | undefined;
   defaultChat: string | undefined;
   selected: Selection | null;
   connected: boolean;
+  backendConnected: boolean;
+  pinned: boolean;
+  unread: number;
   onSelect(chatUri?: string): void;
 }) {
   const { summary } = session;
@@ -333,9 +362,15 @@ function SessionRow({ session, catalog, defaultChat, selected, connected, onSele
   const archived = isArchived(summary.status);
   const phase = phaseOf(summary.status);
   const label = archived ? 'Вернуть' : 'В архив';
+  const title = summary.title || 'Без названия';
   const toggleArchive = async () => {
     setBusy(true);
     try { await store.run({ op: 'archiveSession', hostId: session.hostId, sessionUri: summary.resource, archived: !archived }); }
+    finally { setBusy(false); }
+  };
+  const togglePin = async () => {
+    setBusy(true);
+    try { await store.run({ op: 'pinSession', hostId: session.hostId, sessionUri: summary.resource, pinned: !pinned }); }
     finally { setBusy(false); }
   };
   return (
@@ -348,17 +383,37 @@ function SessionRow({ session, catalog, defaultChat, selected, connected, onSele
           </button>
         )}
         <button className="session-open" onClick={() => onSelect()} aria-current={mainSelected}>
-          <span className="session-title" title={summary.title || undefined}>{summary.title || 'Без названия'}</span>
-          {phase !== 'idle' && <PhaseBadge phase={phase} />}
+          <span className="session-title-line">
+            <span className="session-title" title={summary.title || undefined}>{title}</span>
+            {unread > 0 && (
+              <span className="session-unread" title={`Непрочитанных ходов: ${unread}`} aria-label={`Непрочитанных ходов: ${unread}`}>
+                {unread > 99 ? '99+' : unread}
+              </span>
+            )}
+            {phase !== 'idle' && <PhaseBadge phase={phase} />}
+          </span>
           <span className="session-meta">
             <span title={`${summary.provider} · ${session.hostLabel}`}>{summary.provider} · {session.hostLabel}</span>
             <time dateTime={summary.modifiedAt}>{timeAgo(summary.modifiedAt)}</time>
           </span>
           {summary.activity && <span className="session-activity">{summary.activity}</span>}
         </button>
-        <button className="session-archive" aria-label={`${label}: ${summary.title || 'Без названия'}`} title={archived ? 'Восстановить из архива' : label} disabled={!connected || busy} onClick={() => void toggleArchive()}>
-          {label}
-        </button>
+        <div className="session-row-actions">
+          <button
+            type="button"
+            className="session-pin"
+            aria-pressed={pinned}
+            aria-label={`${pinned ? 'Открепить' : 'Закрепить'}: ${title}`}
+            title={pinned ? 'Открепить' : 'Закрепить'}
+            disabled={!backendConnected || busy}
+            onClick={() => void togglePin()}
+          >
+            <span aria-hidden="true">{pinned ? '★' : '☆'}</span>
+          </button>
+          <button className="session-archive" aria-label={`${label}: ${title}`} title={archived ? 'Восстановить из архива' : label} disabled={!connected || busy} onClick={() => void toggleArchive()}>
+            {label}
+          </button>
+        </div>
       </div>
       {subchats.length > 0 && (
         <div id={treeId} hidden={!expanded}>

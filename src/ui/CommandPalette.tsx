@@ -16,6 +16,7 @@ import {
   type PaletteResult,
 } from '../search';
 import { CallCancelled } from '../errors';
+import { pinnedKeys } from '../session-list';
 import { describeError, store, useAppState } from '../store';
 import { HighlightedText } from './HighlightedText';
 
@@ -28,7 +29,7 @@ type DeepState =
 const DEBOUNCE_MS = 320;
 
 export function CommandPalette({ onClose, onNavigate }: { onClose(): void; onNavigate(selection: Selection): void }) {
-  const { overview, channels, connection } = useAppState();
+  const { overview, channels, connection, sessionUserState } = useAppState();
   const dialog = useRef<HTMLDialogElement>(null);
   const input = useRef<HTMLInputElement>(null);
   const heading = useId();
@@ -40,6 +41,7 @@ export function CommandPalette({ onClose, onNavigate }: { onClose(): void; onNav
   const controller = useRef<AbortController | undefined>(undefined);
 
   const prepared = useMemo(() => prepareQuery(deferredQuery), [deferredQuery]);
+  const pinned = useMemo(() => pinnedKeys(sessionUserState.pinned), [sessionUserState.pinned]);
   const corpus = useMemo(() => buildLoadedCorpus(overview, channels), [overview, channels]);
   const metadata = useMemo(() => searchOverview(overview, channels, prepared), [overview, channels, prepared]);
   const loaded = useMemo(() => searchLoaded(corpus, prepared), [corpus, prepared]);
@@ -50,7 +52,7 @@ export function CommandPalette({ onClose, onNavigate }: { onClose(): void; onNav
         { label: 'Сессии и чаты', items: metadata },
         { label: 'Сообщения', items: turns },
       ].filter(group => group.items.length > 0)
-    : [{ label: 'Недавние сессии', items: recentSessionResults(overview) }], [prepared, metadata, turns, overview]);
+    : [{ label: 'Недавние сессии', items: recentSessionResults(overview, 8, pinned) }], [prepared, metadata, turns, overview, pinned]);
   const flat = useMemo(() => groups.flatMap(group => group.items), [groups]);
   const active = flat.find(item => item.key === activeKey) ?? flat[0];
   const activeIndex = active ? flat.indexOf(active) : -1;

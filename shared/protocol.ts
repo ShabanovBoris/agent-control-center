@@ -62,6 +62,26 @@ export interface Overview {
   sessions: SessionOverview[];
 }
 
+/** Ключ пользовательского состояния панели: сессия конкретного хоста. */
+export interface SessionRef {
+  hostId: string;
+  sessionUri: string;
+}
+
+export interface UnreadSession extends SessionRef {
+  /** Всегда положительный: нулевой счётчик означает отсутствие записи, а не `count: 0`. */
+  count: number;
+}
+
+/**
+ * Состояние, которое принадлежит панели, а не AHP-хосту. `pinned` общее для всех устройств;
+ * `unread` уже отфильтрован для origin получателя.
+ */
+export interface SessionUserState {
+  pinned: SessionRef[];
+  unread: UnreadSession[];
+}
+
 export type ChannelState = RootState | SessionState | ChatState | ChangesetState;
 
 export interface UpdateCheck {
@@ -79,6 +99,7 @@ export type Call = HostCall
   | { op: 'pushSubscribe'; origin: string; subscription: PushSubscriptionPayload }
   | { op: 'pushUnsubscribe'; endpoint: string }
   | { op: 'pushTest'; origin: string }
+  | { op: 'pinSession'; hostId: string; sessionUri: string; pinned: boolean }
   | { op: 'health' }
   | { op: 'readLog'; hostId: string };
 
@@ -268,6 +289,7 @@ export type ServerMessage =
   | { t: 'rejected'; hostId: string; uri: string; actionType: string; reason: string }
   | { t: 'channelError'; hostId: string; uri: string; error: string; code?: number }
   | { t: 'sessionRemoved'; hostId: string; sessionUri: string; chatUris: string[] }
+  | { t: 'sessionUserState'; state: SessionUserState }
   | { t: 'result'; id: number; ok: true; data?: unknown }
   | { t: 'result'; id: number; ok: false; error: CallError };
 
@@ -298,6 +320,27 @@ function parseObject(raw: string): Record<string, unknown> | undefined {
 
 function hasChannelAddress(message: Record<string, unknown>): boolean {
   return typeof message.hostId === 'string' && typeof message.uri === 'string';
+}
+
+/** Ссылка на сессию в пользовательском состоянии панели; другие URI здесь недопустимы. */
+export function isSessionRef(value: unknown): value is SessionRef {
+  if (!isRecord(value)) return false;
+  const { hostId, sessionUri } = value;
+  return typeof hostId === 'string' && hostId.length > 0
+    && typeof sessionUri === 'string' && sessionUri.startsWith('ahp-session:');
+}
+
+function isUnreadSession(value: unknown): value is UnreadSession {
+  if (!isSessionRef(value)) return false;
+  const { count } = value as Partial<UnreadSession>;
+  return typeof count === 'number' && Number.isInteger(count) && count > 0;
+}
+
+function isSessionUserState(value: unknown): value is SessionUserState {
+  if (!isRecord(value)) return false;
+  const { pinned, unread } = value;
+  return Array.isArray(pinned) && pinned.every(isSessionRef)
+    && Array.isArray(unread) && unread.every(isUnreadSession);
 }
 
 export function parseClientMessage(raw: string): ClientMessage | undefined {
@@ -359,6 +402,11 @@ export function parseServerMessage(raw: string): ServerMessage | undefined {
       if (!Array.isArray(chatUris) || !chatUris.every(uri => typeof uri === 'string')) return undefined;
       break;
     }
+    case 'sessionUserState':
+      // Нулевые и дробные счётчики — признак рассинхронизации: сообщение отбрасывается целиком,
+      // чтобы клиент не показывал пустой badge и не терял pin из-за одной записи.
+      if (!isSessionUserState(message.state)) return undefined;
+      break;
     case 'result': {
       const { id, ok, error } = message;
       if (typeof id !== 'number' || !Number.isFinite(id)) return undefined;

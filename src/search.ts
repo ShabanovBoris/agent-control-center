@@ -14,6 +14,7 @@ import { pathOf } from '../shared/text';
 import { visibleTurns } from '../shared/turns';
 import { channelKey } from '../shared/reduce';
 import { timeAgo } from './format';
+import { sortSessions } from './session-list';
 
 export interface ChannelLike {
   state?: ChannelState;
@@ -392,8 +393,8 @@ export function searchStatusText(input: SearchStatusInput): string {
   return `${parts.join(' · ')}.`;
 }
 
-export function recentSessionResults(overview: Overview, limit = 8): PaletteResult[] {
-  return recentSessions(overview, limit).map(session => {
+export function recentSessionResults(overview: Overview, limit = 8, pinned: ReadonlySet<string> = new Set()): PaletteResult[] {
+  return recentSessions(overview, limit, pinned).map(session => {
     const title = session.summary.title;
     return {
       key: `session:${session.hostId}:${session.summary.resource}`,
@@ -410,10 +411,11 @@ export function recentSessionResults(overview: Overview, limit = 8): PaletteResu
   });
 }
 
-export function recentSessions(overview: Overview, limit = 8): SessionOverview[] {
-  return overview.sessions
-    .filter(session => !archived(session.summary.status))
-    .toSorted((left, right) => right.summary.modifiedAt.localeCompare(left.summary.modifiedAt))
+/** Архив по-прежнему исключён: pin меняет только порядок, а не состав «Недавних». */
+export function recentSessions(
+  overview: Overview, limit = 8, pinned: ReadonlySet<string> = new Set(),
+): SessionOverview[] {
+  return sortSessions(overview.sessions.filter(session => !archived(session.summary.status)), pinned)
     .slice(0, limit);
 }
 
