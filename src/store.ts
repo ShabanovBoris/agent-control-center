@@ -8,6 +8,7 @@ import {
   type Overview,
   type SearchHistoryResult,
   type ServerMessage,
+  type SessionUserState,
   type UsageReport,
 } from '../shared/protocol';
 import { channelKey, reduceChannel } from '../shared/reduce';
@@ -32,6 +33,8 @@ export interface Notice {
 export interface AppState {
   connection: Connection;
   overview: Overview;
+  /** Закрепления и непрочитанные этого устройства; приходят отдельным сообщением backend. */
+  sessionUserState: SessionUserState;
   channels: ReadonlyMap<string, ChannelView>;
   notices: readonly Notice[];
 }
@@ -49,6 +52,7 @@ class Store {
   private state: AppState = {
     connection: 'connecting',
     overview: { hosts: [], sessions: [] },
+    sessionUserState: { pinned: [], unread: [] },
     channels: new Map(),
     notices: [],
   };
@@ -247,12 +251,22 @@ class Store {
         const channels = new Map(this.state.channels);
         channels.set(channelKey(message.hostId, message.sessionUri), { missing: true });
         for (const uri of message.chatUris) channels.delete(channelKey(message.hostId, uri));
+        const matches = (ref: { hostId: string; sessionUri: string }) =>
+          ref.hostId === message.hostId && ref.sessionUri === message.sessionUri;
         this.update({
           channels,
           overview: { ...this.state.overview, sessions: this.state.overview.sessions.filter(session => session.hostId !== message.hostId || session.summary.resource !== message.sessionUri) },
+          // Badge не должен висеть до прихода очищенного состояния от backend.
+          sessionUserState: {
+            pinned: this.state.sessionUserState.pinned.filter(ref => !matches(ref)),
+            unread: this.state.sessionUserState.unread.filter(ref => !matches(ref)),
+          },
         });
         return;
       }
+      case 'sessionUserState':
+        this.update({ sessionUserState: message.state });
+        return;
       case 'rejected':
         this.notify(`Хост отклонил действие ${message.actionType}: ${message.reason}`);
         return;

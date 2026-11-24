@@ -1,7 +1,8 @@
-import { ChatInteractivity, SessionStatus, type SessionChatSummary } from '@microsoft/agent-host-protocol';
+import { SessionStatus } from '@microsoft/agent-host-protocol';
 import { channelKey } from '../shared/reduce.js';
 import { isArchived, phaseOf, type Phase } from '../shared/status.js';
 import type { Overview, SessionOverview } from '../shared/protocol.js';
+import { snapshotOf, type ChatSnapshot, type SessionSnapshot } from './session-snapshot.js';
 
 export interface PushTransition {
   hostId: string;
@@ -13,21 +14,6 @@ export interface PushTransition {
   chatTitle?: string;
 }
 
-interface ChatSnapshot {
-  status?: number;
-  title: string;
-  hidden: boolean;
-}
-
-interface SessionSnapshot {
-  status?: number;
-  modifiedAt?: string;
-  title: string;
-  hostLabel: string;
-  chats: Map<string, ChatSnapshot>;
-  defaultChat?: string;
-}
-
 interface Notified {
   kind: PushTransition['kind'];
   modifiedAt?: string;
@@ -37,9 +23,6 @@ interface ChatRef {
   chatUri: string;
   chatTitle?: string;
 }
-
-const TITLE_LIMIT = 80;
-const DEFAULT_TITLE = 'Сессия агента';
 
 /**
  * Сравнивает последовательные сводки и возвращает только реальные переходы.
@@ -167,34 +150,4 @@ function defaultChat(snapshot: SessionSnapshot): ChatRef | undefined {
   const uri = snapshot.defaultChat;
   if (!uri || snapshot.chats.get(uri)?.hidden) return undefined;
   return chatRef(uri, snapshot);
-}
-
-function snapshotOf({ hostLabel, summary }: SessionOverview): SessionSnapshot {
-  const chats = new Map<string, ChatSnapshot>();
-  for (const chat of summary.chats ?? []) {
-    chats.set(chat.resource, {
-      ...(typeof chat.status === 'number' ? { status: chat.status } : {}),
-      title: chatTitle(chat),
-      hidden: chat.interactivity === ChatInteractivity.Hidden,
-    });
-  }
-  return {
-    ...(typeof summary.status === 'number' ? { status: summary.status } : {}),
-    ...(typeof summary.modifiedAt === 'string' ? { modifiedAt: summary.modifiedAt } : {}),
-    title: sessionTitle(summary.title),
-    hostLabel,
-    chats,
-    ...(typeof summary.defaultChat === 'string' ? { defaultChat: summary.defaultChat } : {}),
-  };
-}
-
-function sessionTitle(title: string | undefined): string {
-  const trimmed = title?.trim();
-  if (!trimmed) return DEFAULT_TITLE;
-  return trimmed.length <= TITLE_LIMIT ? trimmed : `${trimmed.slice(0, TITLE_LIMIT - 1).trimEnd()}…`;
-}
-
-function chatTitle(chat: SessionChatSummary): string {
-  const trimmed = chat.title?.trim();
-  return trimmed || 'Чат';
 }

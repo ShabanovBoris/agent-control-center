@@ -26,6 +26,7 @@ test('парсер клиента проверяет обязательные п
     { t: 'call', id: 5, call: { op: 'pushTest', origin: 'https://mac.ts.net' } },
     { t: 'call', id: 6, call: { op: 'health' } },
     { t: 'call', id: 7, call: { op: 'readLog', hostId: 'local' } },
+    { t: 'call', id: 8, call: { op: 'pinSession', hostId, sessionUri: uri, pinned: true } },
     { t: 'cancelDirectoryPicker' },
   ];
   for (const message of valid) assert.deepEqual(parseClientMessage(JSON.stringify(message)), message);
@@ -54,6 +55,13 @@ test('парсер сервера проверяет обязательные п
     { t: 'rejected', hostId, uri, actionType: ActionType.SessionTitleChanged, reason: 'Отклонено' },
     { t: 'channelError', hostId, uri, error: 'Не найдено', code: -32001 },
     { t: 'sessionRemoved', hostId, sessionUri: uri, chatUris: ['ahp-chat:/test'] },
+    {
+      t: 'sessionUserState',
+      state: {
+        pinned: [{ hostId, sessionUri: uri }],
+        unread: [{ hostId, sessionUri: 'ahp-session:/other', count: 2 }],
+      },
+    },
     { t: 'result', id: 1, ok: true, data: null },
     { t: 'result', id: 2, ok: false, error: { message: 'Нужна авторизация', code: -32007 } },
   ];
@@ -64,6 +72,13 @@ test('парсер сервера проверяет обязательные п
     { t: 'snapshot', hostId, uri, state: null },
     { t: 'action', hostId, uri, action: {} },
     { t: 'sessionRemoved', hostId, sessionUri: uri, chatUris: [null] },
+    { t: 'sessionUserState', state: { pinned: [], unread: [{ hostId, sessionUri: uri, count: 0 }] } },
+    { t: 'sessionUserState', state: { pinned: [], unread: [{ hostId, sessionUri: uri, count: -1 }] } },
+    { t: 'sessionUserState', state: { pinned: [], unread: [{ hostId, sessionUri: uri, count: 1.5 }] } },
+    { t: 'sessionUserState', state: { pinned: [], unread: [{ hostId, sessionUri: '', count: 1 }] } },
+    { t: 'sessionUserState', state: { pinned: [{ hostId, sessionUri: 'ahp-chat:/x' }], unread: [] } },
+    { t: 'sessionUserState', state: { pinned: [], unread: null } },
+    { t: 'sessionUserState', state: null },
     { t: 'result', id: 1, ok: false },
     { t: 'result', id: 2, ok: 'true' },
   ]) {

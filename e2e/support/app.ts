@@ -24,7 +24,7 @@ export async function ensureHostConnected(page: Page): Promise<void> {
   if (await detailsOpen(details)) await summary.click();
 }
 
-export async function createSession(page: Page): Promise<void> {
+export async function createSession(page: Page): Promise<string> {
   await page.getByRole('button', { name: 'Новая сессия' }).click();
   await expect(page.getByRole('heading', { name: 'Новая сессия' })).toBeVisible();
   // Видимые подписи — «Учебный хост (e2e)» и «Mock Agent», значения селектов остаются mock.
@@ -36,8 +36,36 @@ export async function createSession(page: Page): Promise<void> {
   const previousHash = await page.evaluate(() => location.hash);
   await page.getByRole('button', { name: 'Создать' }).click();
   await expect.poll(() => page.evaluate(() => location.hash)).not.toBe(previousHash);
-  await expect(page.locator('.session-head h2')).toContainText('Учебная сессия');
+  const heading = page.locator('.session-head h2');
+  await expect(heading).toContainText('Учебная сессия');
   await expect(page.getByRole('textbox', { name: 'Сообщение агенту' })).toBeVisible();
+  return (await heading.textContent())?.trim() ?? '';
+}
+
+function escapeAttribute(value: string): string {
+  return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+}
+
+/**
+ * Строка конкретной сессии. Глобальный `getByTitle` не годится: тот же title есть у `<h2>`
+ * в открытой сессии, и строгий режим Playwright упадёт на двух совпадениях.
+ */
+export function sessionRow(page: Page, title: string): Locator {
+  return page.locator('.session-row').filter({ has: page.locator(`.session-title[title="${escapeAttribute(title)}"]`) });
+}
+
+export async function sessionTitles(page: Page): Promise<string[]> {
+  return page.locator('.session-title').allTextContents();
+}
+
+export async function openSession(page: Page, title: string): Promise<void> {
+  await sessionRow(page, title).locator('.session-open').click();
+}
+
+/** Возврат из открытой сессии к списку на телефоне. */
+export async function backToSessionList(page: Page): Promise<void> {
+  await page.locator('.mobile-back[aria-label="К списку сессий"]').click();
+  await expect(page.locator('.app')).toHaveAttribute('data-mobile-view', 'list');
 }
 
 export async function sendMessage(page: Page, text: string): Promise<void> {

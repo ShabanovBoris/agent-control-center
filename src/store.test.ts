@@ -150,3 +150,44 @@ test('отмена отчёта шлёт cancelUsage и не рвёт поиск
   receive({ t: 'result', id: searchCall.id, ok: true, data: { hits: [] } });
   assert.deepEqual(await search, { hits: [] });
 });
+
+test('состояние закреплений и непрочитанных приходит отдельным сообщением', () => {
+  assert.deepEqual(store.getState().sessionUserState, { pinned: [], unread: [] });
+  const state = {
+    pinned: [{ hostId: 'one', sessionUri: 'ahp-session:/pinned' }],
+    unread: [{ hostId: 'one', sessionUri: 'ahp-session:/unread', count: 2 }],
+  };
+  receive({ t: 'sessionUserState', state });
+  assert.deepEqual(store.getState().sessionUserState, state);
+
+  const beforeBroken = store.getState();
+  for (const data of [
+    '{"t":"sessionUserState","state":{"pinned":[],"unread":[{"hostId":"one","sessionUri":"ahp-session:/x","count":0}]}}',
+    '{"t":"sessionUserState","state":{"pinned":"x","unread":[]}}',
+    '{"t":"sessionUserState"}',
+  ]) socket.onmessage!({ data });
+  assert.equal(store.getState(), beforeBroken, 'битое состояние не должно менять pin и счётчики');
+});
+
+test('удаление сессии вычищает её закрепление и badge до ответа backend', () => {
+  const removed = 'ahp-session:/removed', kept = 'ahp-session:/kept';
+  receive({
+    t: 'sessionUserState',
+    state: {
+      pinned: [{ hostId: 'one', sessionUri: removed }, { hostId: 'one', sessionUri: kept }],
+      unread: [
+        { hostId: 'one', sessionUri: removed, count: 1 },
+        { hostId: 'two', sessionUri: removed, count: 3 },
+        { hostId: 'one', sessionUri: kept, count: 1 },
+      ],
+    },
+  });
+  receive({ t: 'sessionRemoved', hostId: 'one', sessionUri: removed, chatUris: [] });
+  assert.deepEqual(store.getState().sessionUserState, {
+    pinned: [{ hostId: 'one', sessionUri: kept }],
+    unread: [
+      { hostId: 'two', sessionUri: removed, count: 3 },
+      { hostId: 'one', sessionUri: kept, count: 1 },
+    ],
+  });
+});

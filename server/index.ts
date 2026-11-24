@@ -16,8 +16,9 @@ import { collectHealth, readAppVersion, type SdkVersionInspector } from './healt
 import { localLogSources, readLogTail } from './logs.js';
 import { createPhoneAccess, PHONE_ACCESS_PORT } from './phone-access.js';
 import { localHosts, localInstance, runningSdks } from './local-hosts.js';
-import { visibleOrigins } from './presence.js';
+import { visibleOrigins, visibleSessions } from './presence.js';
 import { createPushService } from './push.js';
+import { createSessionUserState } from './session-user-state.js';
 import { ProjectUpdates, type UpdatePlan } from './updates.js';
 import { restartServices, withRestarting } from './restart-services.js';
 import { BACKEND_RESTART_EXIT_CODE, UP_SUPERVISED_ENV } from './up-contract.js';
@@ -97,9 +98,23 @@ const push = await createPushService({ dir: stateDir }).catch((error: unknown) =
 });
 if (push) console.log(`[acc] Push-уведомления готовы, подписок: ${push.subscriptionCount}`);
 
+// Закрепление и непрочитанные — состояние панели, а не хоста: битый файл отключает их целиком,
+// но backend продолжает работать.
+const userState = await createSessionUserState({ dir: stateDir }).catch((error: unknown) => {
+  console.error('[acc] Закрепление и непрочитанные отключены.', error instanceof Error ? error.message : String(error));
+  return undefined;
+});
+if (userState) console.log('[acc] Закрепление и непрочитанные готовы.');
+
 function send(browser: Browser, message: ServerMessage, onSent?: () => void): void {
   if (browser.socket.readyState === browser.socket.OPEN) browser.socket.send(JSON.stringify(message), onSent);
   else onSent?.();
+}
+
+function broadcastSessionUserState(): void {
+  if (!userState) return;
+  // viewFor — единственный источник сообщения: он уже отфильтровал нулевые счётчики.
+  for (const browser of browsers) send(browser, { t: 'sessionUserState', state: userState.viewFor(browser.origin) });
 }
 
 const hub = new Hub(new MultiHostClient({ clientIdStore: new FileClientIdStore(join(stateDir, 'client-ids.json')) }), {
@@ -108,10 +123,23 @@ const hub = new Hub(new MultiHostClient({ clientIdStore: new FileClientIdStore(j
       ? { ...message, overview: withRestarting(message.overview, id => updates.isRestarting(id)) }
       : message;
     for (const browser of browsers) send(browser, outgoing);
-    if (outgoing.t === 'overview' && push) {
-      // Сбой push не должен ломать обновление сводки в браузерах.
-      void push.observe(outgoing.overview, transition => visibleOrigins(browsers, transition.hostId, transition.sessionUri))
-        .catch(error => console.warn('[acc] Не удалось обработать push-переходы.', error instanceof Error ? error.message : String(error)));
+    if (outgoing.t === 'overview') {
+      if (push) {
+        // Сбой push не должен ломать обновление сводки в браузерах.
+        void push.observe(outgoing.overview, transition => visibleOrigins(browsers, transition.hostId, transition.sessionUri))
+          .catch(error => console.warn('[acc] Не удалось обработать push-переходы.', error instanceof Error ? error.message : String(error)));
+      }
+      if (userState) {
+        const visible = visibleSessions(browsers);
+        void userState.observe(outgoing.overview, visible)
+          .then(changed => { if (changed) broadcastSessionUserState(); })
+          .catch(error => console.warn('[acc] Не удалось обновить непрочитанные.', error instanceof Error ? error.message : String(error)));
+      }
+    }
+    if (outgoing.t === 'sessionRemoved' && userState) {
+      void userState.forgetSession(outgoing.hostId, outgoing.sessionUri)
+        .then(changed => { if (changed) broadcastSessionUserState(); })
+        .catch(error => console.warn('[acc] Не удалось очистить состояние сессии.', error instanceof Error ? error.message : String(error)));
     }
   },
   toWatchers(hostId, uri, message) {
@@ -190,6 +218,12 @@ function onBrowser(socket: WebSocket, origin: string): void {
   const browser: Browser = { socket, origin, visible: false, watching: new Set(), abort: new AbortController() };
   browsers.add(browser);
   send(browser, { t: 'overview', overview: withRestarting(hub.overview(), id => updates.isRestarting(id)) });
+  if (userState) {
+    send(browser, { t: 'sessionUserState', state: userState.viewFor(origin) });
+    // Запись origin не задерживает первый кадр: pin и badge приходят сразу.
+    void userState.rememberOrigin(origin)
+      .catch(error => console.warn('[acc] Не удалось запомнить устройство.', error instanceof Error ? error.message : String(error)));
+  }
 
   socket.on('message', data => {
     const message = parseClientMessage(String(data));
@@ -225,6 +259,12 @@ async function onMessage(browser: Browser, message: ClientMessage): Promise<void
       browser.selection = message.selection
         ? { hostId: message.selection.hostId, sessionUri: message.selection.sessionUri }
         : undefined;
+      // Сброс при открытии сессии/чата и при возврате в видимую вкладку; повтор идемпотентен.
+      if (userState && message.visible && message.selection) {
+        void userState.markVisible(browser.origin, message.selection.hostId, message.selection.sessionUri)
+          .then(changed => { if (changed) broadcastSessionUserState(); })
+          .catch(error => console.warn('[acc] Не удалось сбросить непрочитанные.', error instanceof Error ? error.message : String(error)));
+      }
       return;
     case 'watch': {
       const { hostId, uri } = message;
@@ -278,6 +318,12 @@ async function onMessage(browser: Browser, message: ClientMessage): Promise<void
           || call.op === 'pushUnsubscribe' || call.op === 'pushTest') {
           const data = await handlePushCall(browser, call);
           send(browser, { t: 'result', id: message.id, ok: true, ...(data !== undefined ? { data } : {}) });
+          return;
+        }
+        // Pin не зависит от хоста и перезапуска агентов: состояние живёт в backend.
+        if (call.op === 'pinSession') {
+          if (await handlePinCall(call)) broadcastSessionUserState();
+          send(browser, { t: 'result', id: message.id, ok: true });
           return;
         }
         if (call.op === 'health') {
@@ -359,6 +405,21 @@ async function handlePushCall(browser: Browser, call: PushCall): Promise<unknown
       if (call.origin !== browser.origin) throw new CallFailure('Проверка пришла с другого адреса.');
       return push.test(call.origin);
   }
+}
+
+type PinCall = Extract<Call, { op: 'pinSession' }>;
+
+/**
+ * Pin — команда панели, а не хоста: аргументы проверяются здесь, потому что общий парсер
+ * клиентских сообщений не валидирует поля конкретных команд.
+ */
+async function handlePinCall(call: PinCall): Promise<boolean> {
+  if (!userState) throw new CallFailure('Пользовательское состояние сессий недоступно.');
+  const { hostId, sessionUri, pinned } = call;
+  if (typeof hostId !== 'string' || hostId.length === 0) throw new CallFailure('Не указан хост для закрепления.');
+  if (typeof sessionUri !== 'string' || !sessionUri.startsWith('ahp-session:')) throw new CallFailure('Некорректный адрес сессии.');
+  if (typeof pinned !== 'boolean') throw new CallFailure('Не указано состояние закрепления.');
+  return userState.setPinned(hostId, sessionUri, pinned);
 }
 
 await hub.start(config.hosts.map(toHostConfig));

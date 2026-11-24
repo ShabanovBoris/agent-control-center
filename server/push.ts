@@ -1,10 +1,11 @@
-import { randomUUID } from 'node:crypto';
-import { chmod, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { chmod, readFile } from 'node:fs/promises';
+import { join } from 'node:path';
 import { generateVAPIDKeys, sendNotification, WebPushError, type PushSubscription } from 'web-push';
 import type { Overview, PushSubscriptionPayload } from '../shared/protocol.js';
 import { selectionToHash } from '../shared/routing.js';
+import { deviceOrigin } from './origin.js';
 import { PushTransitions, type PushTransition } from './push-transitions.js';
+import { writePrivate } from './state-file.js';
 
 export const DEFAULT_VAPID_SUBJECT = 'https://github.com/ShabanovBoris/agent-control-center';
 export const MAX_SUBSCRIPTIONS = 20;
@@ -95,6 +96,7 @@ export class PushService {
 
   async subscribe({ origin, subscription }: { origin: string; subscription: PushSubscriptionPayload }): Promise<void> {
     const address = deviceOrigin(origin);
+    if (!address) throw new PushFailure('Некорректный адрес устройства.');
     const entry = validateSubscription(subscription, address, this.now().toISOString());
     await this.store.upsert(entry);
   }
@@ -120,6 +122,7 @@ export class PushService {
   /** Тестовая доставка на конкретное устройство; presence на явный тест не действует. */
   async test(origin: string): Promise<{ delivered: number }> {
     const address = deviceOrigin(origin);
+    if (!address) throw new PushFailure('Некорректный адрес устройства.');
     const subscriptions = this.store.list().filter(subscription => subscription.origin === address);
     return { delivered: await this.sendAll(subscriptions, () => ({
       title: 'Agent Control Center',
@@ -321,33 +324,6 @@ async function loadVapid(path: string, defaultSubject: string): Promise<Vapid> {
   return { subject, publicKey, privateKey };
 }
 
-/** Временный файл + rename: writeFile с mode не исправит права уже существующего файла. */
-async function writePrivate(path: string, value: unknown): Promise<void> {
-  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
-  const temp = `${path}.${randomUUID()}.tmp`;
-  try {
-    await writeFile(temp, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
-    await rename(temp, path);
-    await chmod(path, 0o600).catch(() => {});
-  } catch (error) {
-    await rm(temp, { force: true }).catch(() => {});
-    throw error;
-  }
-}
-
-function deviceOrigin(value: string): string {
-  let url: URL;
-  try {
-    url = new URL(value);
-  } catch {
-    throw new PushFailure('Некорректный адрес устройства.');
-  }
-  if ((url.protocol !== 'https:' && url.protocol !== 'http:') || url.origin !== value) {
-    throw new PushFailure('Некорректный адрес устройства.');
-  }
-  return url.origin;
-}
-
 function validateSubscription(subscription: PushSubscriptionPayload, origin: string, createdAt: string): StoredSubscription {
   if (!isRecord(subscription)) throw new PushFailure('Некорректная подписка на push.');
   const { endpoint, keys, expirationTime } = subscription;
@@ -378,11 +354,7 @@ function parseStoredSubscription(value: unknown): StoredSubscription | undefined
   if (typeof endpoint !== 'string' || !endpoint.startsWith('https:') || endpoint.length > 2048) return undefined;
   if (typeof p256dh !== 'string' || typeof auth !== 'string' || !decodeKey(p256dh) || !decodeKey(auth)) return undefined;
   if (typeof origin !== 'string' || typeof createdAt !== 'string') return undefined;
-  try {
-    if (deviceOrigin(origin) !== origin) return undefined;
-  } catch {
-    return undefined;
-  }
+  if (deviceOrigin(origin) !== origin) return undefined;
   return {
     endpoint,
     ...(expirationTime === null || typeof expirationTime === 'number' ? { expirationTime } : {}),

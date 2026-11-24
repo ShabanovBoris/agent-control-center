@@ -9,9 +9,10 @@ import { channelKey } from '../shared/reduce';
 import { highlightRanges, makeSnippet, makeField, prepareQuery, scoreFields, turnSearchFields, type SearchField } from '../shared/search';
 import { visibleTurns } from '../shared/turns';
 import {
-  DEFAULT_PALETTE_LIMITS, buildLoadedCorpus, deepToPalette, mergeSearchResults, searchComplete,
-  searchLoaded, searchOverview, searchStatusText, type PaletteResult,
+  DEFAULT_PALETTE_LIMITS, buildLoadedCorpus, deepToPalette, mergeSearchResults, recentSessionResults,
+  recentSessions, searchComplete, searchLoaded, searchOverview, searchStatusText, type PaletteResult,
 } from './search';
+import { pinnedKeys } from './session-list';
 
 const at = '2026-11-20T10:00:00.000Z';
 
@@ -172,4 +173,35 @@ test('статус не обещает «ничего не найдено», п�
   assert.match(searchStatusText({ phase: 'done', result: complete, localIncomplete: false, localErrors: [], ready: true }), /^Ничего не найдено\./);
   assert.match(searchStatusText({ phase: 'error', error: 'нет связи', localIncomplete: false, localErrors: [], ready: true }), /нет связи/);
   assert.match(searchStatusText({ phase: 'done', result: complete, localIncomplete: true, localErrors: [], ready: true }), /проверена не полностью/);
+});
+
+test('закреплённая сессия идёт первой в «Недавних», остальной порядок прежний', () => {
+  const older = session({ resource: 'ahp-session:/older', title: 'Старая', modifiedAt: '2026-11-01T10:00:00.000Z' });
+  const newer = session({ resource: 'ahp-session:/newer', title: 'Новая', modifiedAt: '2026-11-20T10:00:00.000Z' });
+  const pinned = pinnedKeys([{ hostId: 'h', sessionUri: 'ahp-session:/older' }]);
+
+  assert.deepEqual(recentSessions(overview([newer, older]), 8, pinned).map(item => item.summary.resource), [
+    'ahp-session:/older', 'ahp-session:/newer',
+  ]);
+  assert.deepEqual(recentSessions(overview([newer, older])).map(item => item.summary.resource), [
+    'ahp-session:/newer', 'ahp-session:/older',
+  ]);
+  // Pin меняет порядок, но не состав: ограничение применяется после сортировки.
+  assert.deepEqual(recentSessions(overview([newer, older]), 1, pinned).map(item => item.summary.resource), [
+    'ahp-session:/older',
+  ]);
+});
+
+test('закреплённая архивная сессия не попадает в «Недавние»', () => {
+  const active = session({ resource: 'ahp-session:/active', modifiedAt: '2026-11-01T10:00:00.000Z' });
+  const archivedSession = session({
+    resource: 'ahp-session:/archived', title: 'Архивная', modifiedAt: '2026-11-20T10:00:00.000Z',
+    status: SessionStatus.IsArchived,
+  });
+  const pinned = pinnedKeys([{ hostId: 'h', sessionUri: 'ahp-session:/archived' }]);
+  assert.deepEqual(recentSessions(overview([archivedSession, active]), 8, pinned).map(item => item.summary.resource), [
+    'ahp-session:/active',
+  ]);
+  assert.deepEqual(recentSessionResults(overview([archivedSession, active]), 8, pinned).map(item => item.kind), ['session']);
+  assert.equal(recentSessionResults(overview([archivedSession, active]), 8, pinned)[0]?.sessionUri, 'ahp-session:/active');
 });

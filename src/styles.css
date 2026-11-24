@@ -204,6 +204,23 @@ a { color: var(--accent); }
   background: transparent;
 }
 .session-archive { font-size: 12px; padding: 4px 6px; color: var(--muted); background: transparent; border-color: transparent; }
+.session-row-actions { display: flex; align-items: center; gap: 2px; }
+.session-pin { font-size: 12px; padding: 4px 6px; color: var(--muted); background: transparent; border-color: transparent; }
+.session-pin[aria-pressed="true"] { color: var(--accent); }
+.session-title-line { display: flex; align-items: center; gap: 4px; min-width: 0; }
+.session-title-line > .session-title { min-width: 0; }
+.session-title-line > .badge { align-self: center; }
+.session-unread {
+  flex-shrink: 0;
+  min-width: 18px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: var(--accent);
+  color: var(--accent-text);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+}
 .session-row-selected { border-color: var(--accent); background: var(--soft); }
 .session-title { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .session-meta { display: flex; gap: 8px; }
