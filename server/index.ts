@@ -12,6 +12,7 @@ import { installedAhpVersion } from '../scripts/update-agents.mjs';
 import { FileClientIdStore, loadConfig, toHostConfig } from './config.js';
 import { CallFailure, Hub, toCallError } from './hub.js';
 import { DirectoryPicker } from './directory-picker.js';
+import { LocalDirectoryLister } from './directory-listing.js';
 import { collectHealth, readAppVersion, type SdkVersionInspector } from './health.js';
 import { localLogSources, readLogTail } from './logs.js';
 import { createPhoneAccess, PHONE_ACCESS_PORT } from './phone-access.js';
@@ -148,7 +149,11 @@ const hub = new Hub(new MultiHostClient({ clientIdStore: new FileClientIdStore(j
       if (browser.watching.has(key)) send(browser, message);
     }
   },
-}, config.agents, new DirectoryPicker(config.hosts.filter(host => host.localFilesystem).map(host => host.id)), defaultModels);
+}, config.agents, {
+  picker: new DirectoryPicker(config.hosts.filter(host => host.localFilesystem).map(host => host.id)),
+  // Fallback листинга — только хосты, которые панель запускает сама.
+  lister: new LocalDirectoryLister(locals.map(host => host.id)),
+}, defaultModels);
 const updates = new ProjectUpdates(locals, hub, ahpVersion);
 // Backend под launchd не порождает второй процесс: супервизор `up` поднимет его
 // после штатного выхода с кодом BACKEND_RESTART_EXIT_CODE.

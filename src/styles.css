@@ -365,6 +365,45 @@ a { color: var(--accent); }
 .directory-field { display: flex; gap: 8px; }
 .directory-field input { flex: 1; min-width: 0; }
 .directory-field button { white-space: nowrap; }
+.directory-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.directory-tree { flex: 1 1 100%; min-width: 0; display: flex; flex-direction: column; align-items: stretch; gap: 8px; }
+.directory-tree-toggle { align-self: flex-start; }
+.directory-tree-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  min-width: 0;
+}
+.directory-tree-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-width: 0; }
+.directory-tree-path { flex: 1 1 12em; min-width: 0; overflow-wrap: anywhere; font-size: 12px; }
+.directory-tree-source, .directory-tree-status { margin: 0; color: var(--muted); font-size: 12px; }
+.directory-tree-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; min-width: 0; }
+.directory-tree-entry {
+  display: block;
+  width: 100%;
+  min-height: 36px;
+  padding: 8px;
+  text-align: left;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  border: 1px solid transparent;
+  border-bottom-color: var(--line);
+}
+.directory-tree-file {
+  display: block;
+  padding: 8px;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+  border-bottom: 1px solid var(--line);
+}
+/* На десктопе прокручивается только список: путь и кнопки остаются на месте. */
+@media (min-width: 761px) and (pointer: fine) {
+  .directory-tree-panel { max-height: 50dvh; }
+  .directory-tree-list { overflow-y: auto; min-height: 0; }
+}
 
 .session { --conversation-width: 920px; flex: 1; min-height: 0; display: flex; flex-direction: column; }
 .session-head {
@@ -887,6 +926,13 @@ a { color: var(--accent); }
   .composer-model-options > :first-child { flex: 1; }
   .composer-model-options > :nth-child(2) { max-width: 42%; }
   .composer-controls select { min-height: 32px; }
+}
+
+/* Finder — нативный диалог хоста; с телефона он недоступен даже в широкой альбомной ориентации. */
+@media (max-width: 760px), (pointer: coarse) {
+  .finder-picker { display: none; }
+  .directory-tree button { min-height: 40px; }
+  .directory-tree .directory-tree-entry { min-height: 44px; padding: 10px 8px; }
 }
 
 .visually-hidden {

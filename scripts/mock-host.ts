@@ -33,6 +33,20 @@ import {
   type StateAction,
 } from '@microsoft/agent-host-protocol';
 import { WebSocketServer, type WebSocket } from 'ws';
+import { normalizeDirectoryPath, type DirectoryEntry } from '../shared/directory.js';
+import { pathOf } from '../shared/text.js';
+
+/** Детерминированное дерево для e2e; порядок нарочно не отсортирован, чтобы проверять сортировку UI. */
+const MOCK_DIRECTORIES = new Map<string, readonly DirectoryEntry[]>([
+  ['/mock/workspace', [
+    { name: 'README.md', type: 'file' },
+    { name: 'src', type: 'directory' },
+    { name: 'docs', type: 'directory' },
+  ]],
+  ['/mock/workspace/src', [{ name: 'components', type: 'directory' }]],
+  ['/mock/workspace/src/components', []],
+  ['/mock/workspace/docs', [{ name: 'guide.md', type: 'file' }]],
+]);
 
 function parsePort(value: string | undefined): number {
   const port = value === undefined || value.trim() === '' ? 8189 : Number(value);
@@ -362,6 +376,14 @@ function handleRequest(connection: Connection, method: string, params: any): unk
     }
     case 'listSessions':
       return { items: [...summaries.values()] };
+    case 'resourceList': {
+      if (typeof params?.uri !== 'string' || !params.uri.startsWith('file:')) invalidParams('resourceList: нужен file: URI');
+      const path = normalizeDirectoryPath(pathOf(params.uri));
+      if (!path) invalidParams(`resourceList: не удалось разобрать путь ${params.uri}`);
+      const entries = MOCK_DIRECTORIES.get(path);
+      if (!entries) throw { code: AhpErrorCodes.NotFound, message: `No such directory: ${path}` };
+      return { entries };
+    }
     case 'createSession': {
       const sessionUri: string = params.channel;
       if (sessions.has(sessionUri)) throw { code: AhpErrorCodes.SessionAlreadyExists, message: 'Session already exists' };

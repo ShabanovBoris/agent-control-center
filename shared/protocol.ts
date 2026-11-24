@@ -15,7 +15,10 @@ import type {
   SessionSummary,
   StateAction,
 } from '@microsoft/agent-host-protocol';
+import type { DirectoryEntry } from './directory.js';
 import type { UsageAggregate } from './usage.js';
+
+export type { DirectoryEntry } from './directory.js';
 
 export type HostStatus = 'disconnected' | 'connecting' | 'connected' | 'reconnecting' | 'failed';
 export type SlashCompletions = CompletionsResult;
@@ -245,9 +248,18 @@ export type EditMessageResult =
   | { status: 'sent' }
   | { status: 'truncated'; retainedTurnId: string | null; error: string };
 
+/** Прямые дети каталога хоста. `source` говорит, кто ответил: AHP-хост или backend-листинг. */
+export interface DirectoryListing {
+  path: string;
+  source: 'host' | 'backend';
+  /** Порядок не гарантирован: UI сортирует каталоги раньше файлов. */
+  entries: DirectoryEntry[];
+}
+
 export type HostCall =
   | { op: 'createSession'; hostId: string; provider: string; workingDirectory: string }
   | { op: 'pickDirectory'; hostId: string; initialDirectory?: string }
+  | { op: 'listDirectory'; hostId: string; path: string }
   | { op: 'archiveSession'; hostId: string; sessionUri: string; archived: boolean }
   | { op: 'refreshSession'; hostId: string; sessionUri: string }
   | { op: 'fetchTurns'; hostId: string; chatUri: string; cursor: string }

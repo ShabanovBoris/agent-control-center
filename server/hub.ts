@@ -10,6 +10,7 @@ import {
   ConfirmationOptionKind,
   CompletionItemKind,
   ContentEncoding,
+  JsonRpcErrorCodes,
   MessageKind,
   ToolCallCancellationReason,
   ToolCallConfirmationReason,
@@ -36,6 +37,7 @@ import {
   type Call,
   type CallError,
   type ChannelState,
+  type DirectoryListing,
   type EditMessageResult,
   type HostIssue,
   type HostOverview,
@@ -45,9 +47,11 @@ import {
   type SlashCompletions,
 } from '../shared/protocol.js';
 import { channelKey, isSupportedChannel } from '../shared/reduce.js';
+import { normalizeDirectoryPath, parseDirectoryEntries } from '../shared/directory.js';
 import { resolveTimeZone } from '../shared/usage.js';
 import { ChannelMirror } from './mirror.js';
 import type { DirectoryPicker } from './directory-picker.js';
+import type { LocalDirectoryLister } from './directory-listing.js';
 import { abortable } from './async.js';
 import { CallFailure, errorMessage, toCallError } from './errors.js';
 import { readHostBuild, type HostBuild } from './host-build.js';
@@ -124,7 +128,11 @@ export class Hub implements SearchEnvironment {
     private readonly sink: HubSink,
     /** Показываемые агенты (provider); `undefined` — все, что предлагает хост. */
     private readonly visibleAgents?: readonly string[],
-    private readonly directoryPicker?: Pick<DirectoryPicker, 'availableFor' | 'choose'>,
+    /** Разные права: Finder — desktop/`localFilesystem`, листинг — только allowlist `locals`. */
+    private readonly directories?: {
+      picker?: Pick<DirectoryPicker, 'availableFor' | 'choose'>;
+      lister?: Pick<LocalDirectoryLister, 'availableFor' | 'list'>;
+    },
     private readonly defaultModels?: ReadonlyMap<string, Readonly<Record<string, string>>>,
     searchLimits?: SearchLimits,
   ) {
@@ -377,8 +385,29 @@ export class Hub implements SearchEnvironment {
   private async execute(call: Call, signal?: AbortSignal): Promise<unknown> {
     switch (call.op) {
       case 'pickDirectory':
-        if (!this.multi.host(call.hostId) || !this.directoryPicker) throw new CallFailure('Выбор папки через Finder недоступен');
-        return { directory: await this.directoryPicker.choose(call.hostId, call.initialDirectory, signal) };
+        if (!this.multi.host(call.hostId) || !this.directories?.picker) throw new CallFailure('Выбор папки через Finder недоступен');
+        return { directory: await this.directories.picker.choose(call.hostId, call.initialDirectory, signal) };
+      case 'listDirectory': {
+        if (typeof call.path !== 'string') throw new CallFailure('Не указан путь к папке');
+        const path = normalizeDirectoryPath(call.path);
+        if (!path) throw new CallFailure('Укажите абсолютный путь к папке на хосте');
+        if (!this.multi.host(call.hostId)) throw new CallFailure('Хост не подключён');
+        let result: unknown;
+        try {
+          result = await this.client(call.hostId).request('resourceList', { channel: ROOT_URI, uri: toFileUri(path) });
+        } catch (error) {
+          if (!(error instanceof RpcError) || error.code !== JsonRpcErrorCodes.MethodNotFound) throw directoryFailure(error);
+          // Нет capability-флага: поддержку узнаём по отказу и не кэшируем — хост мог обновиться.
+          const lister = this.directories?.lister;
+          if (!lister?.availableFor(call.hostId)) {
+            throw new CallFailure('Хост не поддерживает просмотр папок. Укажите путь вручную.', error.code);
+          }
+          return { path, source: 'backend', entries: await lister.list(call.hostId, path, signal) } satisfies DirectoryListing;
+        }
+        const entries = parseDirectoryEntries((result as { entries?: unknown } | null)?.entries);
+        if (!entries) throw new CallFailure('Хост вернул некорректный список папок');
+        return { path, source: 'host', entries } satisfies DirectoryListing;
+      }
       case 'createSession': {
         const sessionUri = `ahp-session:/${randomUUID()}`;
         await this.client(call.hostId).request('createSession', {
@@ -898,7 +927,7 @@ export class Hub implements SearchEnvironment {
       ...(host.lastError ? { error: redactSecrets(host.lastError.message) } : {}),
       ...(host.protocolVersion ? { protocolVersion: host.protocolVersion } : {}),
       ...(host.defaultDirectory ? { defaultDirectory: host.defaultDirectory } : {}),
-      canPickDirectory: this.directoryPicker?.availableFor(host.id) ?? false,
+      canPickDirectory: this.directories?.picker?.availableFor(host.id) ?? false,
       agents: host.agents.filter(agent => !this.visibleAgents || this.visibleAgents.includes(agent.provider)).map((agent): AgentOverview => {
         const setup = readSdkSetup(configValues[`${SDK_STATUS_KEY_PREFIX}${agent.provider}`]);
         const configuredModel = this.defaultModels?.get(host.id)?.[agent.provider];
@@ -952,6 +981,20 @@ function readSdkSetup(value: unknown): { sdk?: AgentSdkDownload; setupDocsUrl?: 
     sdk: download as AgentSdkDownload,
     ...(typeof setupDocsUrl === 'string' ? { setupDocsUrl } : {}),
   };
+}
+
+/**
+ * Отказ хоста при листинге: сохраняем код, чтобы UI мог отличить причины,
+ * но переводим текст. `AuthRequired` идёт без кода: `describeCallError` подменяет
+ * любой -32007 подсказкой про SDK агента, которая здесь неверна.
+ */
+function directoryFailure(error: unknown): unknown {
+  if (error instanceof RpcError) {
+    if (error.code === AhpErrorCodes.NotFound) return new CallFailure('Папка не найдена на хосте', error.code);
+    if (error.code === AhpErrorCodes.PermissionDenied) return new CallFailure('Хост не разрешает просмотр этой папки', error.code);
+    if (error.code === AhpErrorCodes.AuthRequired) return new CallFailure('Хост требует авторизации для просмотра папок. Проверьте вход на хосте.');
+  }
+  return error;
 }
 
 /** Абсолютный POSIX-путь на хосте -> file: URI. Путь принадлежит хосту, а не машине backend. */
