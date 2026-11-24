@@ -9,7 +9,12 @@ import type {
   ChangesetState,
   Message,
   ModelSelection,
+  ResolveSessionConfigResult,
   RootState,
+  SessionConfigCompletionsResult,
+  SessionConfigPropertySchema,
+  SessionConfigSchema,
+  SessionConfigValueItem,
   SessionModelInfo,
   SessionState,
   SessionSummary,
@@ -19,6 +24,13 @@ import type { DirectoryEntry } from './directory.js';
 import type { UsageAggregate } from './usage.js';
 
 export type { DirectoryEntry } from './directory.js';
+export type {
+  ResolveSessionConfigResult,
+  SessionConfigCompletionsResult,
+  SessionConfigPropertySchema,
+  SessionConfigSchema,
+  SessionConfigValueItem,
+};
 
 export type HostStatus = 'disconnected' | 'connecting' | 'connected' | 'reconnecting' | 'failed';
 export type SlashCompletions = CompletionsResult;
@@ -257,7 +269,9 @@ export interface DirectoryListing {
 }
 
 export type HostCall =
-  | { op: 'createSession'; hostId: string; provider: string; workingDirectory: string }
+  | { op: 'createSession'; hostId: string; provider: string; workingDirectory: string; config?: Record<string, unknown> }
+  | { op: 'resolveSessionConfig'; hostId: string; provider: string; workingDirectory: string; config?: Record<string, unknown> }
+  | { op: 'sessionConfigCompletions'; hostId: string; provider: string; workingDirectory: string; config?: Record<string, unknown>; property: string; query?: string }
   | { op: 'pickDirectory'; hostId: string; initialDirectory?: string }
   | { op: 'listDirectory'; hostId: string; path: string }
   | { op: 'archiveSession'; hostId: string; sessionUri: string; archived: boolean }
@@ -307,6 +321,8 @@ export type ServerMessage =
 
 export const ROOT_URI = 'ahp-root://';
 export const AUTH_REQUIRED_CODE = -32007;
+/** Хост не реализует метод AHP: для конфигурации сессии это штатная деградация. */
+export const METHOD_NOT_FOUND_CODE = -32601;
 export const SIDE_CHAT_FIRST_EDIT_UNAVAILABLE = 'При обрезке первого сообщения хост сбрасывает исходный контекст бокового чата.';
 
 function isRecord(value: unknown): value is Record<string, unknown> {

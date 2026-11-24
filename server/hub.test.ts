@@ -530,6 +530,84 @@ test('usageReport считает расход через слой истории
   }
 });
 
+test('resolveSessionConfig и completions идут в root-канал с путём хоста', async () => {
+  const { hub, requests } = setup();
+
+  await hub.call({
+    op: 'resolveSessionConfig', hostId: 'h', provider: 'codex', workingDirectory: '/Users/me/project',
+    config: { target: 'worktree' },
+  });
+  await hub.call({
+    op: 'sessionConfigCompletions', hostId: 'h', provider: 'codex', workingDirectory: '/Users/me/project',
+    config: { target: 'worktree' }, property: 'baseBranch', query: 'dev',
+  });
+  await hub.call({
+    op: 'sessionConfigCompletions', hostId: 'h', provider: 'codex', workingDirectory: '/Users/me/project',
+    property: 'baseBranch',
+  });
+
+  assert.deepEqual(requests, [
+    {
+      method: 'resolveSessionConfig',
+      params: { channel: 'ahp-root://', provider: 'codex', workingDirectory: 'file:///Users/me/project', config: { target: 'worktree' } },
+    },
+    {
+      method: 'sessionConfigCompletions',
+      params: {
+        channel: 'ahp-root://', provider: 'codex', workingDirectory: 'file:///Users/me/project',
+        config: { target: 'worktree' }, property: 'baseBranch', query: 'dev',
+      },
+    },
+    {
+      method: 'sessionConfigCompletions',
+      params: { channel: 'ahp-root://', provider: 'codex', workingDirectory: 'file:///Users/me/project', property: 'baseBranch' },
+    },
+  ]);
+});
+
+test('createSession передаёт config и не отправляет его без выбора', async () => {
+  const { hub, requests } = setup();
+
+  await hub.call({ op: 'createSession', hostId: 'h', provider: 'codex', workingDirectory: '/Users/me/project' });
+  await hub.call({
+    op: 'createSession', hostId: 'h', provider: 'codex', workingDirectory: '/Users/me/project',
+    config: { isolation: 'worktree', branch: 'develop' },
+  });
+
+  assert.equal(requests.length, 2);
+  const [plain, configured] = requests.map(request => request.params as Record<string, unknown>);
+  assert.deepEqual(plain, {
+    channel: (plain?.channel as string), provider: 'codex', workingDirectories: ['file:///Users/me/project'],
+  });
+  assert.equal(Object.hasOwn(plain ?? {}, 'config'), false);
+  assert.deepEqual(configured, {
+    channel: (configured?.channel as string), provider: 'codex', workingDirectories: ['file:///Users/me/project'],
+    config: { isolation: 'worktree', branch: 'develop' },
+  });
+  assert.match(plain?.channel as string, /^ahp-session:\//);
+});
+
+test('ошибка конфигурации сохраняет код хоста и теряет технический префикс', async () => {
+  const { hub } = setup([], method => {
+    if (method === 'resolveSessionConfig') throw new RpcError(-32601, 'Method not found: resolveSessionConfig');
+    throw new RpcError(-32000, 'Хост занят');
+  });
+
+  await assert.rejects(
+    hub.call({ op: 'resolveSessionConfig', hostId: 'h', provider: 'codex', workingDirectory: '/Users/me/project' }),
+    (error: unknown) => error instanceof CallFailure && error.code === -32601
+      && error.message === 'Method not found: resolveSessionConfig',
+  );
+  await assert.rejects(
+    hub.call({ op: 'sessionConfigCompletions', hostId: 'h', provider: 'codex', workingDirectory: '/Users/me/project', property: 'baseBranch' }),
+    (error: unknown) => error instanceof CallFailure && error.code === -32000 && error.message === 'Хост занят',
+  );
+  await assert.rejects(
+    hub.call({ op: 'sessionConfigCompletions', hostId: 'h', provider: 'codex', workingDirectory: '/Users/me/project', property: '' }),
+    /свойство конфигурации/,
+  );
+});
+
 test('отмена usageReport освобождает канал и не превращается в issue хоста', async () => {
   const { hub, sessions, states, unsubscribed } = setup();
   const { session, chat } = usageSession('ahp-session:/cancel', 'ahp-chat:/cancel', 'p1');

@@ -404,6 +404,9 @@ a { color: var(--accent); }
   .directory-tree-panel { max-height: 50dvh; }
   .directory-tree-list { overflow-y: auto; min-height: 0; }
 }
+.session-branch { margin: 0; font-size: 13px; color: var(--muted); overflow-wrap: anywhere; }
+.session-config { display: flex; flex-direction: column; gap: 12px; }
+.session-config input, .session-config select { width: 100%; min-width: 0; }
 
 .session { --conversation-width: 920px; flex: 1; min-height: 0; display: flex; flex-direction: column; }
 .session-head {

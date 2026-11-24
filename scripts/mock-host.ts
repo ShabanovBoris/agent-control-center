@@ -62,6 +62,15 @@ const ROOT = 'ahp-root://';
 const TURN_PAGE_SIZE = 6;
 /** Канал гарантирует, что его action относится к редьюсеру этого канала; emit принимает их общим объектом. */
 const cast = <T>(value: object) => value as T;
+/** Детерминированный «репозиторий» для e2e: текущая ветка отличается от default. */
+const MOCK_BRANCHES = ['main', 'develop', 'feature/mock-current', 'release/next'] as const;
+const MOCK_CURRENT_BRANCH = 'feature/mock-current';
+const MOCK_DEFAULT_BRANCH = 'main';
+/**
+ * Настоящий хост собирает git-info не мгновенно, а панель ждёт ответа 300 мс debounce.
+ * Задержка фиксирует это окно в e2e: выбор worktree и немедленный submit не должны терять config.
+ */
+const WORKTREE_RESOLVE_DELAY_MS = 600;
 
 let serverSeq = 0;
 let root: RootState = {
@@ -154,6 +163,9 @@ const pause = (ms: number, signal: AbortSignal) => new Promise<void>((resolve, r
   const timer = setTimeout(resolve, ms);
   signal.addEventListener('abort', () => { clearTimeout(timer); reject(new Error('cancelled')); }, { once: true });
 });
+
+/** Пауза без сигнала отмены: задержка ответа хоста не относится к ходу агента и не отменяется. */
+const wait = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 
 /**
  * Ждёт ответа пользователя и снимает ожидание при отмене хода,
@@ -351,7 +363,8 @@ function createChat(params: any): null {
   return null;
 }
 
-function handleRequest(connection: Connection, method: string, params: any): unknown {
+/** Ответ может ждать git-info (см. WORKTREE_RESOLVE_DELAY_MS), как настоящий хост. */
+async function handleRequest(connection: Connection, method: string, params: any): Promise<unknown> {
   switch (method) {
     case 'initialize':
     case 'reconnect': {
@@ -384,12 +397,59 @@ function handleRequest(connection: Connection, method: string, params: any): unk
       if (!entries) throw { code: AhpErrorCodes.NotFound, message: `No such directory: ${path}` };
       return { entries };
     }
+    case 'resolveSessionConfig': {
+      const config: Record<string, unknown> = params.config && typeof params.config === 'object' ? params.config : {};
+      const worktree = config.target === 'worktree' || config.isolation === 'worktree';
+      // Хост уточняет git-параметры не мгновенно: панель должна пережить это окно без потери выбора.
+      if (worktree) await wait(WORKTREE_RESOLVE_DELAY_MS);
+      const selected = (worktree && (typeof config.baseBranch === 'string' && config.baseBranch
+        || typeof config.branch === 'string' && config.branch)) || MOCK_DEFAULT_BRANCH;
+      return {
+        schema: {
+          type: 'object',
+          properties: {
+            target: {
+              type: 'string', title: 'Куда создать сессию', enum: ['workspace', 'worktree'],
+              enumLabels: ['В текущей папке', 'В новом worktree'],
+              enumDescriptions: ['Изменения останутся в рабочей папке', 'Хост создаст отдельный worktree'],
+            },
+            baseBranch: {
+              type: 'string', title: 'Базовая ветка', description: 'Ветка, от которой создаётся worktree',
+              enum: [worktree ? selected : MOCK_CURRENT_BRANCH], enumLabels: [worktree ? selected : MOCK_CURRENT_BRANCH],
+              enumDynamic: true,
+            },
+          },
+          ...(worktree ? { required: ['baseBranch'] } : {}),
+        },
+        values: {
+          target: worktree ? 'worktree' : 'workspace',
+          // В режиме текущей папки хост отвечает headName — здесь это текущая ветка репозитория.
+          baseBranch: worktree ? selected : MOCK_CURRENT_BRANCH,
+        },
+      };
+    }
+    case 'sessionConfigCompletions': {
+      if (params.property !== 'baseBranch') {
+        throw { code: JsonRpcErrorCodes.InvalidParams, message: `sessionConfigCompletions: неизвестное свойство ${String(params.property)}` };
+      }
+      const query = typeof params.query === 'string' ? params.query.trim().toLowerCase() : '';
+      return {
+        items: MOCK_BRANCHES
+          .filter(branch => branch.toLowerCase().includes(query))
+          .map(branch => ({ value: branch, label: branch, ...(branch === MOCK_CURRENT_BRANCH ? { description: 'Текущая ветка рабочей папки' } : {}) })),
+      };
+    }
     case 'createSession': {
       const sessionUri: string = params.channel;
       if (sessions.has(sessionUri)) throw { code: AhpErrorCodes.SessionAlreadyExists, message: 'Session already exists' };
       const chatUri = `ahp-chat:/${randomUUID()}`;
       const now = new Date().toISOString();
-      const title = `Учебная сессия ${sessions.size + 1}`;
+      // Маркер доказывает в e2e, что config дошёл до хоста; без config заголовок прежний.
+      const config: Record<string, unknown> | undefined = params.config && typeof params.config === 'object' ? params.config : undefined;
+      const marker = config && Object.keys(config).length > 0
+        ? ` · ${Object.entries(config).map(([key, value]) => `${key}=${String(value)}`).join(' ')}`
+        : '';
+      const title = `Учебная сессия ${sessions.size + 1}${marker}`;
       const metadata = { provider: params.provider ?? 'mock', title, status: SessionStatus.Idle, workingDirectories: params.workingDirectories ?? [] };
       const chatSummary: ChatSummary = { resource: chatUri, title, status: SessionStatus.Idle, modifiedAt: now };
       sessions.set(sessionUri, { ...metadata, lifecycle: SessionLifecycle.Ready, activeClients: [], chats: [chatSummary], defaultChat: chatUri });
@@ -435,11 +495,19 @@ server.on('connection', socket => {
   socket.on('message', data => {
     const message = JSON.parse(String(data));
     if (message.id !== undefined) {
-      try {
-        socket.send(JSON.stringify({ jsonrpc: '2.0', id: message.id, result: handleRequest(connection, message.method, message.params) }));
-      } catch (error) {
-        socket.send(JSON.stringify({ jsonrpc: '2.0', id: message.id, error }));
-      }
+      // Запросы отвечают асинхронно (git-info в resolveSessionConfig), ответы и ошибки — по id.
+      // Сокет мог закрыться, пока хост готовил ответ; иначе send бросил бы unhandled rejection.
+      const respond = (payload: { result?: unknown } | { error: unknown }) => {
+        if (socket.readyState !== socket.OPEN) return;
+        socket.send(JSON.stringify({ jsonrpc: '2.0', id: message.id, ...payload }));
+      };
+      void (async () => {
+        try {
+          respond({ result: await handleRequest(connection, message.method, message.params) });
+        } catch (error) {
+          respond({ error });
+        }
+      })();
     } else if (message.method === 'unsubscribe') {
       connection.subscriptions.delete(message.params.channel);
     } else if (message.method === 'dispatchAction') {
