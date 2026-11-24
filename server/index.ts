@@ -19,7 +19,8 @@ import { localHosts, localInstance, runningSdks } from './local-hosts.js';
 import { visibleOrigins } from './presence.js';
 import { createPushService } from './push.js';
 import { ProjectUpdates, type UpdatePlan } from './updates.js';
-import { restartServices } from './restart-services.js';
+import { restartServices, withRestarting } from './restart-services.js';
+import { BACKEND_RESTART_EXIT_CODE, UP_SUPERVISED_ENV } from './up-contract.js';
 
 const previousBackend = Number(process.env.ACC_PREVIOUS_BACKEND_PID);
 delete process.env.ACC_PREVIOUS_BACKEND_PID;
@@ -103,10 +104,13 @@ function send(browser: Browser, message: ServerMessage, onSent?: () => void): vo
 
 const hub = new Hub(new MultiHostClient({ clientIdStore: new FileClientIdStore(join(stateDir, 'client-ids.json')) }), {
   broadcast(message) {
-    for (const browser of browsers) send(browser, message);
-    if (message.t === 'overview' && push) {
+    const outgoing = message.t === 'overview'
+      ? { ...message, overview: withRestarting(message.overview, id => updates.isRestarting(id)) }
+      : message;
+    for (const browser of browsers) send(browser, outgoing);
+    if (outgoing.t === 'overview' && push) {
       // Сбой push не должен ломать обновление сводки в браузерах.
-      void push.observe(message.overview, transition => visibleOrigins(browsers, transition.hostId, transition.sessionUri))
+      void push.observe(outgoing.overview, transition => visibleOrigins(browsers, transition.hostId, transition.sessionUri))
         .catch(error => console.warn('[acc] Не удалось обработать push-переходы.', error instanceof Error ? error.message : String(error)));
     }
   },
@@ -118,6 +122,10 @@ const hub = new Hub(new MultiHostClient({ clientIdStore: new FileClientIdStore(j
   },
 }, config.agents, new DirectoryPicker(config.hosts.filter(host => host.localFilesystem).map(host => host.id)), defaultModels);
 const updates = new ProjectUpdates(locals, hub, ahpVersion);
+// Backend под launchd не порождает второй процесс: супервизор `up` поднимет его
+// после штатного выхода с кодом BACKEND_RESTART_EXIT_CODE.
+const supervised = process.env[UP_SUPERVISED_ENV] === '1';
+const backendExitCode = supervised ? BACKEND_RESTART_EXIT_CODE : 0;
 let backendRestarting = false;
 
 function restartAllServices(): Promise<void> {
@@ -128,6 +136,7 @@ function restartAllServices(): Promise<void> {
 
 async function startReplacementBackend(): Promise<void> {
   backendRestarting = true;
+  if (supervised) return;
   try {
     const next = spawn(process.execPath, ['--import', 'tsx', fileURLToPath(import.meta.url)], {
       env: { ...process.env, ACC_PREVIOUS_BACKEND_PID: String(process.pid) },
@@ -180,7 +189,7 @@ if (phone) acceptBrowserConnections(phone.server, phone.isTrustedUpgrade);
 function onBrowser(socket: WebSocket, origin: string): void {
   const browser: Browser = { socket, origin, visible: false, watching: new Set(), abort: new AbortController() };
   browsers.add(browser);
-  send(browser, { t: 'overview', overview: hub.overview() });
+  send(browser, { t: 'overview', overview: withRestarting(hub.overview(), id => updates.isRestarting(id)) });
 
   socket.on('message', data => {
     const message = parseClientMessage(String(data));
@@ -256,12 +265,12 @@ async function onMessage(browser: Browser, message: ClientMessage): Promise<void
           if (!plan) throw new Error('Сначала проверьте доступные обновления.');
           const restartBackend = await updates.apply(plan);
           if (restartBackend) await startReplacementBackend();
-          send(browser, { t: 'result', id: message.id, ok: true, data: { restartBackend } }, restartBackend ? () => void shutdown() : undefined);
+          send(browser, { t: 'result', id: message.id, ok: true, data: { restartBackend } }, restartBackend ? () => void shutdown(backendExitCode) : undefined);
           return;
         }
         if (call.op === 'restartServices') {
           await restartAllServices();
-          send(browser, { t: 'result', id: message.id, ok: true, data: { restartBackend: true } }, () => void shutdown());
+          send(browser, { t: 'result', id: message.id, ok: true, data: { restartBackend: true } }, () => void shutdown(backendExitCode));
           return;
         }
         // Push не зависит от перезапуска хоста: ключи и подписки живут в backend.

@@ -1,5 +1,6 @@
 import { setTimeout as delay } from 'node:timers/promises';
 import type { ChildProcess } from 'node:child_process';
+import type { Overview } from '../shared/protocol.js';
 import type { Hub } from './hub.js';
 import { readHostBuild, type HostBuild } from './host-build.js';
 import {
@@ -13,6 +14,18 @@ import {
 import type { ProjectUpdates } from './updates.js';
 
 export const RESTART_TIMEOUT_MS = 240_000;
+
+/**
+ * Помечает хосты, которые backend перезапускает планово. `up --supervised` по этому
+ * флагу отличает плановый перезапуск от падения и не спавнит второй процесс.
+ */
+export function withRestarting(overview: Overview, isRestarting: (hostId: string) => boolean): Overview {
+  if (!overview.hosts.some(host => isRestarting(host.id))) return overview;
+  return {
+    ...overview,
+    hosts: overview.hosts.map(host => isRestarting(host.id) ? { ...host, restarting: true } : host),
+  };
+}
 
 export interface RestartHost extends LocalHost {
   instance?: HostInstance;

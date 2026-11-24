@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { constants } from 'node:fs';
-import { mkdir, open, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, open, readFile, writeFile, type FileHandle } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseEnv } from 'node:util';
@@ -78,8 +78,27 @@ export function providerArgs(baseUrl: string, catalogPath: string, model: string
   return Object.entries(config).flatMap(([key, value]) => ['-c', `${key}=${JSON.stringify(value)}`]);
 }
 
+/** Журнал обёртки при `--log`; используется и в обработчике ошибок после main. */
+let wrapperLog: FileHandle | undefined;
+
+async function say(line: string): Promise<void> {
+  if (wrapperLog) await wrapperLog.write(`${line}\n`);
+  else console.log(line);
+}
+
 async function main() {
   process.chdir(fileURLToPath(new URL('../', import.meta.url)));
+  // Обёртка тоже пишет в журнал: у принятого хоста не должно оставаться
+  // stdout/stderr, ведущих в pipe умершего `up`.
+  if (process.argv[2] === '--log') {
+    // В свежем checkout `.local` может отсутствовать: открытие журнала не должно
+    // падать раньше проверки провайдера и давать непонятный ENOENT.
+    await mkdir('.local', { recursive: true });
+    wrapperLog = await open('.local/gemini-host.log', constants.O_WRONLY | constants.O_CREAT | constants.O_APPEND | constants.O_NOFOLLOW, 0o600);
+  } else {
+    wrapperLog = undefined;
+  }
+  await wrapperLog?.chmod(0o600);
   const file = process.env.AHP_PROVIDER_ENV_FILE ?? '.local/model-provider.env';
   const provider = parseEnv(await readFile(file, 'utf8'));
   if (!provider.BASE_URL || !provider.API_KEY) throw new Error(`Укажите BASE_URL и API_KEY в ${file}`);
@@ -118,12 +137,9 @@ async function main() {
   };
   const cli = process.env.VSCODE_CLI ?? '/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code';
   const port = process.env.GEMINI_AHP_PORT ?? '8091';
-  console.log(`[cheapvibecode] ${url.host}: ${catalog.models.length} моделей, по умолчанию ${model}`);
-  const log = process.argv[2] === '--log'
-    ? await open('.local/gemini-host.log', constants.O_WRONLY | constants.O_CREAT | constants.O_APPEND | constants.O_NOFOLLOW, 0o600)
-    : undefined;
+  await say(`[cheapvibecode] ${url.host}: ${catalog.models.length} моделей, по умолчанию ${model}`);
+  const log = wrapperLog;
   try {
-    await log?.chmod(0o600);
     const child = spawn(cli, [
       'agent', 'host', '--host', '127.0.0.1', '--port', port,
       '--connection-token-file', tokenPath,
@@ -148,12 +164,20 @@ async function main() {
     }
   } finally {
     await log?.close();
+    if (wrapperLog === log) wrapperLog = undefined;
   }
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
-  main().catch(error => {
-    console.error(`[cheapvibecode] ${error instanceof Error ? error.message : String(error)}`);
+  main().catch(async error => {
+    const line = `[cheapvibecode] ${error instanceof Error ? error.message : String(error)}`;
+    if (wrapperLog) {
+      await wrapperLog.write(`${line}\n`).catch(() => undefined);
+      await wrapperLog.close().catch(() => undefined);
+      wrapperLog = undefined;
+    } else {
+      console.error(line);
+    }
     process.exitCode = 1;
   });
 }

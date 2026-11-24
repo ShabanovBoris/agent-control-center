@@ -1,18 +1,21 @@
 import { spawn } from 'node:child_process';
 import { constants } from 'node:fs';
 import { access, readFile } from 'node:fs/promises';
-import { createServer } from 'node:net';
 import { resolve } from 'node:path';
 import { createInterface } from 'node:readline';
 import type { Readable } from 'node:stream';
 import { pathToFileURL } from 'node:url';
 import { parseEnv } from 'node:util';
 import { loadConfig } from '../server/config.js';
+import { startKeepAwake } from '../server/keep-awake.js';
 import { localHosts, localInstance, type LocalHost } from '../server/local-hosts.js';
 import { localLogSources, readLogTail } from '../server/logs.js';
+import { portFree, probeWeb } from '../server/net.js';
 import { PHONE_ACCESS_PORT } from '../server/phone-access.js';
+import { UP_SUPERVISED_ENV } from '../server/up-contract.js';
+import { processTable, upOwnershipSource } from '../server/up-state.js';
 import {
-  formatHostPort, parseUpArgs, runUp, UP_USAGE, UpStop,
+  formatHostPort, parseUpArgs, runUp, UP_USAGE, UpStop, WEB_PORT,
   type UpChild, type UpDeps, type UpExit, type UpService,
 } from '../server/up.js';
 import { projectRoot } from './agent-sdks.mjs';
@@ -25,8 +28,6 @@ const SERVICE_PREFIX: Record<UpService, string> = {
   web: '[web]',
 };
 
-const WEB_PORT = 5173;
-
 function exists(path: string): Promise<boolean> {
   return access(path).then(() => true, () => false);
 }
@@ -36,25 +37,6 @@ function isExecutable(path: string): Promise<boolean> {
 }
 
 /** Проверка bind'ом: занятый порт не даст запуститься и останется сиротой. */
-function portFree(port: number, host: string): Promise<boolean> {
-  return new Promise(resolveFree => {
-    const server = createServer();
-    server.unref();
-    server.once('error', () => resolveFree(false));
-    server.listen({ port, host, exclusive: true }, () => server.close(() => resolveFree(true)));
-  });
-}
-
-async function probeWeb(): Promise<boolean> {
-  try {
-    const response = await fetch(`http://127.0.0.1:${WEB_PORT}/`, { signal: AbortSignal.timeout(2000) });
-    const html = response.headers.get('content-type')?.includes('text/html') ?? false;
-    await response.body?.cancel();
-    return response.status === 200 && html;
-  } catch {
-    return false;
-  }
-}
 
 function pumpLines(stream: Readable, log: (line: string) => void): void {
   const lines = createInterface({ input: stream, crlfDelay: Infinity });
@@ -69,11 +51,13 @@ function pumpLines(stream: Readable, log: (line: string) => void): void {
   })();
 }
 
-function spawnService(service: UpService, command: string, args: string[], env: NodeJS.ProcessEnv): UpChild {
+function spawnService(service: UpService, command: string, args: string[], env: NodeJS.ProcessEnv, log: (line: string) => void): UpChild {
   const child = spawn(command, args, { cwd: projectRoot, env, detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
   const prefix = SERVICE_PREFIX[service];
   const streams = [child.stdout, child.stderr].filter((stream): stream is Readable => stream !== null);
-  for (const stream of streams) pumpLines(stream, line => console.log(`${prefix} ${line}`));
+  // Через общий `log`: в supervised каждая строка (не только собственные сообщения up)
+  // получает ISO-время, иначе журнал launchd не сопоставить по времени.
+  for (const stream of streams) pumpLines(stream, line => log(`${prefix} ${line}`));
   let settled = false;
   const exited = new Promise<UpExit>(resolveExit => {
     child.once('error', error => {
@@ -157,6 +141,10 @@ async function main(): Promise<number> {
   const backend = formatHostPort(config.listen.host, config.listen.port);
   const logSources = localLogSources(hosts);
   const serviceOf = (host: LocalHost): UpService => host.id === 'local' ? 'host:local' : 'host:gemini';
+  // launchd пишет stdout в файл без времени; ISO-метка делает журнал пригодным для диагностики.
+  const log = (line: string): void => {
+    console.log(args.supervised ? `${new Date().toISOString()} ${line}` : line);
+  };
 
   const deps: UpDeps = {
     inspectHost: async host => {
@@ -169,7 +157,7 @@ async function main(): Promise<number> {
       }
     },
     probeBackend: () => probeBackendOverview({ base: backend, origin: `http://${backend}`, timeoutMs: 2000 }),
-    probeWeb,
+    probeWeb: () => probeWeb(WEB_PORT),
     portFree,
     hostLog: async host => {
       const source = logSources.find(item => item.hostId === host.id);
@@ -186,14 +174,46 @@ async function main(): Promise<number> {
         if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error;
       }
     },
+    signalGroup: (pid, signal) => {
+      try {
+        // Отрицательный pid — группа лидера: дети прежнего up тоже завершатся.
+        process.kill(-pid, signal);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error;
+      }
+    },
+    isAlive: pid => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch (error) {
+        return (error as NodeJS.ErrnoException).code === 'EPERM';
+      }
+    },
     spawnHost: (host, env) => serviceOf(host) === 'host:local'
-      ? spawnService('host:local', '/bin/bash', ['scripts/start-host.sh', '--log'], env)
-      : spawnService('host:gemini', process.execPath, ['--import', 'tsx', 'scripts/start-gemini-host.ts', '--log'], env),
-    spawnBackend: env => spawnService('backend', process.execPath, ['--import', 'tsx', 'server/index.ts'], env),
-    spawnWeb: env => spawnService('web', process.execPath, ['node_modules/vite/bin/vite.js'], env),
+      ? spawnService('host:local', '/bin/bash', ['scripts/start-host.sh', '--log'], env, log)
+      : spawnService('host:gemini', process.execPath, ['--import', 'tsx', 'scripts/start-gemini-host.ts', '--log'], env, log),
+    spawnBackend: env => spawnService('backend', process.execPath, ['--import', 'tsx', 'server/index.ts'], {
+      ...env,
+      ...(args.supervised ? { [UP_SUPERVISED_ENV]: '1' } : {}),
+    }, log),
+    spawnWeb: env => spawnService('web', process.execPath, ['node_modules/vite/bin/vite.js'], env, log),
     isExecutable,
-    log: line => console.log(line),
+    log,
   };
+
+  const ownership = args.supervised
+    ? upOwnershipSource({
+      file: resolve(stateDir, 'up-state.json'),
+      ownerPid: process.pid,
+      table: processTable,
+      log,
+    })
+    : undefined;
+
+  const keepAwake = args.keepAwake
+    ? startKeepAwake({ platform: process.platform, pid: process.pid, spawn, log })
+    : undefined;
 
   const controller = new AbortController();
   let fatal = false;
@@ -212,9 +232,12 @@ async function main(): Promise<number> {
       config, hosts, env: process.env, providerEnvFile, providerEnv: provider.env,
       webPort: WEB_PORT, ...(phonePort !== undefined ? { phonePort } : {}),
       signal: controller.signal, deps,
+      supervised: args.supervised,
+      ...(ownership ? { ownership } : {}),
     });
     return fatal ? 1 : code;
   } finally {
+    keepAwake?.stop();
     for (const signal of signals) process.off(signal, onSignal);
     process.off('uncaughtException', onFatal);
     process.off('unhandledRejection', onFatal);

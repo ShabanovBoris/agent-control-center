@@ -46,6 +46,8 @@ export interface HostOverview {
   slashCompletions?: boolean;
   defaultDirectory?: string;
   canPickDirectory?: boolean;
+  /** Backend сейчас планово перезапускает хост (restart:services или обновление). */
+  restarting?: boolean;
   agents: AgentOverview[];
 }
 

@@ -25,6 +25,10 @@ Web Push отправляет backend через `web-push@4.0.0` (ESM, типы
 | Команда | Назначение |
 | --- | --- |
 | `npm run up` | Оба локальных хоста, backend и Vite одной командой; Ctrl+C/SIGTERM гасит всё, повторный запуск — no-op |
+| `npm run up -- --supervised` | Режим launchd: принимает живые хосты и перезапускает только упавший сервис после готовности |
+| `npm run autostart:install` | LaunchAgent `com.agentcontrolcenter.up`: plist в `~/Library/LaunchAgents`, логи в `.local/up.log` |
+| `npm run autostart:uninstall` | Выгружает job, ждёт выхода `up` и свободных портов, удаляет plist |
+| `npm run autostart:status` | Плист, job, keep-awake, журнал и состояние стенда |
 | `npm run host` | `code agent host` на `127.0.0.1:8089` для Claude и Codex |
 | `npm run host:gemini` | Отдельный `code agent host` на `127.0.0.1:8091` для Gemini |
 | `npm run server` | Backend на `127.0.0.1:8090`, конфигурация из `hosts.json` |
@@ -52,6 +56,45 @@ CLI читает `hosts.json`/`ACC_CONFIG`, `.local/model-provider.env` и со�
 потому что `localInstance` его не найдёт), `ACC_PORT`/`ACC_MOCK_HOST_URL` отклоняются, `--prod` не
 поддерживается, внешние `restart:services`/`update:agents` под работающим `up` ломают владение.
 Тесты — [server/up.test.ts](../server/up.test.ts) и [server/backend-probe.test.ts](../server/backend-probe.test.ts).
+
+Режим `--supervised` ([server/up-restart.ts](../server/up-restart.ts)) включается только launchd.
+После готовности выход child не гасит стенд: супервизор сериализует перезапуски по сервису,
+держит бюджет [RestartBudget](../server/up-restart.ts) (5 попыток, backoff 1–30 с, сброс после
+10 минут стабильной работы) и не сигналит соседние процессы. Владение — `.local/up-state.json`
+([server/up-state.ts](../server/up-state.ts)): `pid` + `lstart`, режим 0600, публикация через
+`link` (атомарно и без пустого placeholder, иначе второй запуск мог бы удалить чужую запись),
+обновления через уникальный temp+rename; живой владелец или другой `scripts/up.ts` дают код 0
+без сигналов. Запись backend/Vite создаётся сразу после `spawn`, до ожидания готовности: `up`,
+убитый в этом окне, не оставляет процессы, которые следующий запуск принял бы за чужой стенд.
+Сбой записи (`ps` не отдал `lstart`) гасит только что запущенный процесс и даёт код 1. Любой
+живой хост принимается по `localInstance` (в том числе без записи в состоянии), подтверждённый
+backend/Vite пересоздаётся даже если проба не отвечает (зависший процесс); живой неучтённый
+backend/Vite — чужой стенд, код 0 без сигналов. Backend под супервизором получает
+`ACC_UP_SUPERVISED=1` и вместо второго процесса
+завершается кодом `BACKEND_RESTART_EXIT_CODE=75` ([server/up-contract.ts](../server/up-contract.ts));
+`up` поднимает его заново. Флаг `HostOverview.restarting` ([shared/protocol.ts](../shared/protocol.ts),
+[withRestarting](../server/restart-services.ts)) отличает плановый перезапуск хоста от падения.
+`--keep-awake` запускает `caffeinate -i -m -s -w <pid up>` ([server/keep-awake.ts](../server/keep-awake.ts)).
+
+LaunchAgent собирает [server/launchd.ts](../server/launchd.ts) (без прямых вызовов macOS — fs/run
+инжектятся): `launchdSpec` формирует plist с `RunAtLoad`, `KeepAlive={SuccessfulExit:false}`,
+`ThrottleInterval=30`, `PATH` с каталогом `process.execPath`, логами в `.local/up.log` и без
+секретов. Установка идемпотентна (running / loaded-not-running → `kickstart` без `-k` /
+not-loaded → `bootstrap` / different → lint, `bootout` до rename, ожидание исчезновения job);
+изменённый plist при работающем job без `--force` не трогается: перезапись перезапускает `up`
+и прерывает активные ходы. Удаление ждёт job, pid и порты 8089/8091/8090/5173/8092 и при
+таймауте оставляет plist. CLI — [scripts/autostart.ts](../scripts/autostart.ts), команды
+`autostart:install|uninstall|status`; он всегда читает `hosts.json` и `.local` (launchd не
+наследует окружение shell), предупреждает о заданных `ACC_CONFIG`/`ACC_STATE_DIR`/`VSCODE_CLI`,
+а `status` сравнивает plist с текущей сборкой (`launchdStatus.matchesSpec`) и предупреждает о
+смене пути `node` после nvm. `launchctl kill SIGTERM` — штатная остановка `up` (код 0,
+`KeepAlive` не поднимает job), `launchctl bootout` выгружает job до следующего входа; проверено
+на macOS вместе с перезапуском после exit 1 и `kill -9`.
+Тесты: `up.test.ts`, [up-state.test.ts](../server/up-state.test.ts),
+[up-restart.test.ts](../server/up-restart.test.ts), [keep-awake.test.ts](../server/keep-awake.test.ts),
+[launchd.test.ts](../server/launchd.test.ts), `restart-services.test.ts`.
+Ручной `npm run up` остаётся fail-fast: восстановление и внешние `restart:services`/`update:agents`
+поддерживаются только в `--supervised`.
 
 Mock-контур не требует VS Code CLI, AHP-токенов и `.local`: `hosts.dev.json` и `hosts.e2e.json`
 содержат только хост `mock` (`ws://127.0.0.1:8189`), без `tokenFile`, `localFilesystem`, `local`

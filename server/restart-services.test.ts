@@ -3,8 +3,9 @@ import type { ChildProcess } from 'node:child_process';
 import { setImmediate } from 'node:timers/promises';
 import { test } from 'node:test';
 import type { RootState } from '@microsoft/agent-host-protocol';
+import type { Overview } from '../shared/protocol.js';
 import { ProjectUpdates } from './updates.js';
-import { restartServices, waitForConnections, type RestartServicesOptions } from './restart-services.js';
+import { restartServices, waitForConnections, withRestarting, type RestartServicesOptions } from './restart-services.js';
 import type { HostInstance, LocalHost } from './local-hosts.js';
 import type { Hub } from './hub.js';
 
@@ -116,4 +117,19 @@ test('ожидание требует определённое новое пок
   generations.set('gemini', 2);
   await pending;
   assert.equal(completed, true);
+});
+
+test('withRestarting помечает только планово перезапускаемый хост и не мутирует сводку', () => {
+  const original: Overview = {
+    hosts: [
+      { id: 'local', label: 'Основной', status: 'connected', agents: [] },
+      { id: 'gemini', label: 'CheapVibeCode', status: 'connected', agents: [] },
+    ],
+    sessions: [],
+  };
+  const marked = withRestarting(original, id => id === 'gemini');
+  assert.equal(marked.hosts[0]?.restarting, undefined);
+  assert.equal(marked.hosts[1]?.restarting, true);
+  assert.equal(original.hosts[1]?.restarting, undefined, 'исходная сводка не меняется');
+  assert.equal(withRestarting(original, () => false), original, 'без перезапусков возвращается та же сводка');
 });
