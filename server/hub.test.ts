@@ -3,11 +3,15 @@ import { EventEmitter, on } from 'node:events';
 import { setImmediate } from 'node:timers/promises';
 import { test } from 'node:test';
 import {
-  ActionType, ChatOriginKind, ChatSourceKind, MessageAttachmentKind, MessageKind, SessionLifecycle, SessionStatus, TurnState,
+  ActionType, AhpErrorCodes, ChatOriginKind, ChatSourceKind, JsonRpcErrorCodes, MessageAttachmentKind, MessageKind, SessionLifecycle, SessionStatus, TurnState,
   type ActionEnvelope, type ChatState, type MessageEmbeddedResourceAttachment, type SessionModelInfo, type SessionState, type SessionSummary, type StateAction, type Turn,
 } from '@microsoft/agent-host-protocol';
+import { RpcError } from '@microsoft/agent-host-protocol/client';
 import type { MultiHostClient } from '@microsoft/agent-host-protocol/hosts';
 import type { SessionOverview, UsageReport } from '../shared/protocol.js';
+import { CallFailure } from './errors.js';
+import type { DirectoryPicker } from './directory-picker.js';
+import type { LocalDirectoryLister } from './directory-listing.js';
 import { Hub } from './hub.js';
 
 const model: SessionModelInfo = {
@@ -21,7 +25,16 @@ const model: SessionModelInfo = {
   },
 };
 
-function setup(models: SessionModelInfo[] = [model], request?: (method: string, params: unknown) => unknown) {
+interface HubDirectories {
+  picker?: Pick<DirectoryPicker, 'availableFor' | 'choose'>;
+  lister?: Pick<LocalDirectoryLister, 'availableFor' | 'list'>;
+}
+
+function setup(
+  models: SessionModelInfo[] = [model],
+  request?: (method: string, params: unknown) => unknown,
+  directories?: HubDirectories,
+) {
   const actions: StateAction[] = [];
   const targets: string[] = [];
   const requests: { method: string; params: unknown }[] = [];
@@ -51,7 +64,7 @@ function setup(models: SessionModelInfo[] = [model], request?: (method: string, 
     async *events() { for await (const [event] of on(events, 'action', { close: ['shutdown'] })) yield event; },
     async shutdown() { hostEvents.emit('shutdown'); events.emit('shutdown'); },
   } as unknown as MultiHostClient;
-  const hub = new Hub(multi, { broadcast() {}, toWatchers() {} });
+  const hub = new Hub(multi, { broadcast() {}, toWatchers() {} }, undefined, directories);
   const echo = (channel: string, action: StateAction, origin: ActionEnvelope['origin'], rejectionReason?: string) => {
     events.emit('action', { hostId: host.id, channel, event: { type: 'action', params: { channel, action, origin, serverSeq: ++serverSeq, rejectionReason } } });
   };
@@ -530,4 +543,79 @@ test('отмена usageReport освобождает канал и не пре�
   controller.abort();
   await assert.rejects(running, /Отчёт отменён/);
   assert.ok(unsubscribed.includes(chat.resource), 'подписка отчёта снята');
+});
+
+test('listDirectory: resourceList хоста, нормализованный путь и валидные записи', async () => {
+  const entries = [
+    { name: 'src', type: 'directory' },
+    { name: 'README.md', type: 'file' },
+  ];
+  const fixture = setup([model], method => method === 'resourceList' ? { entries: [...entries, { name: 'src', type: 'file' }, null] } : null);
+  assert.deepEqual(await fixture.hub.call({ op: 'listDirectory', hostId: 'h', path: '/work/' }), { path: '/work', source: 'host', entries });
+  assert.deepEqual(fixture.requests, [{ method: 'resourceList', params: { channel: 'ahp-root://', uri: 'file:///work' } }]);
+});
+
+test('listDirectory: -32601 у локального хоста переключает на backend-листинг', async () => {
+  const listed: { hostId: string; path: string }[] = [];
+  const fixture = setup([model], () => { throw new RpcError(JsonRpcErrorCodes.MethodNotFound, 'Method not found'); }, {
+    lister: {
+      availableFor: hostId => hostId === 'h',
+      list: async (hostId, path) => { listed.push({ hostId, path }); return [{ name: 'docs', type: 'directory' }]; },
+    },
+  });
+  assert.deepEqual(await fixture.hub.call({ op: 'listDirectory', hostId: 'h', path: '/work//src' }), {
+    path: '/work/src', source: 'backend', entries: [{ name: 'docs', type: 'directory' }],
+  });
+  assert.deepEqual(listed, [{ hostId: 'h', path: '/work/src' }]);
+});
+
+test('listDirectory: удалённый хост без resourceList получает понятный отказ', async () => {
+  const fixture = setup([model], () => { throw new RpcError(JsonRpcErrorCodes.MethodNotFound, 'Method not found'); }, {
+    lister: { availableFor: () => false, list: async () => { throw new Error('не должен вызываться'); } },
+  });
+  await assert.rejects(fixture.hub.call({ op: 'listDirectory', hostId: 'h', path: '/work' }), (error: unknown) => {
+    assert.ok(error instanceof CallFailure);
+    assert.match(error.message, /не поддерживает просмотр папок/);
+    assert.equal(error.code, JsonRpcErrorCodes.MethodNotFound);
+    return true;
+  });
+});
+
+test('listDirectory: ошибки хоста переведены, код сохранён', async () => {
+  for (const [code, expected] of [
+    [AhpErrorCodes.NotFound, /Папка не найдена на хосте/],
+    [AhpErrorCodes.PermissionDenied, /Хост не разрешает просмотр этой папки/],
+  ] as const) {
+    const fixture = setup([model], () => { throw new RpcError(code, 'failure'); });
+    await assert.rejects(fixture.hub.call({ op: 'listDirectory', hostId: 'h', path: '/work' }), (error: unknown) => {
+      assert.ok(error instanceof CallFailure);
+      assert.match(error.message, expected);
+      assert.equal(error.code, code);
+      return true;
+    });
+  }
+});
+
+test('listDirectory: AuthRequired остаётся без кода, чтобы UI не подменял текст подсказкой SDK', async () => {
+  const fixture = setup([model], () => { throw new RpcError(AhpErrorCodes.AuthRequired, 'auth'); });
+  await assert.rejects(fixture.hub.call({ op: 'listDirectory', hostId: 'h', path: '/work' }), (error: unknown) => {
+    assert.ok(error instanceof CallFailure);
+    assert.match(error.message, /требует авторизации/);
+    assert.equal(error.code, undefined);
+    return true;
+  });
+});
+
+test('listDirectory: некорректный ответ хоста не превращается в пустое дерево', async () => {
+  const fixture = setup([model], () => ({ entries: 'nope' }));
+  await assert.rejects(fixture.hub.call({ op: 'listDirectory', hostId: 'h', path: '/work' }), /некорректный список/);
+  const empty = setup([model], () => ({ entries: [] }));
+  assert.deepEqual(await empty.hub.call({ op: 'listDirectory', hostId: 'h', path: '/work' }), { path: '/work', source: 'host', entries: [] });
+});
+
+test('listDirectory: путь проверяется до обращения к хосту', async () => {
+  const fixture = setup();
+  await assert.rejects(fixture.hub.call({ op: 'listDirectory', hostId: 'h', path: 42 as unknown as string }), /Не указан путь/);
+  await assert.rejects(fixture.hub.call({ op: 'listDirectory', hostId: 'h', path: 'relative' }), /абсолютный путь/);
+  assert.deepEqual(fixture.requests, []);
 });

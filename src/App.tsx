@@ -10,6 +10,7 @@ import { describeError, store, useAppState, usePresence } from './store';
 import { panelVisibility } from './panel-presence';
 import { pinnedKeys, sortSessions, unreadCounts } from './session-list';
 import { NotificationsButton } from './ui/NotificationsButton';
+import { DirectoryTree } from './ui/DirectoryTree';
 import { recentDirectories, rememberDirectory } from './recent-directories';
 
 type Filter = 'all' | 'active' | 'input' | 'archived';
@@ -635,7 +636,10 @@ function NewSessionForm({ host, hosts, backendConnected, onHostChange, onCancel,
         <label htmlFor="working-directory">Рабочая папка на хосте</label>
         <div className="directory-field">
           <input id="working-directory" value={directory} onChange={event => setDirectory(event.target.value)} placeholder="/Users/me/project" spellCheck={false} required disabled={pending} />
-          {host.canPickDirectory && <button type="button" disabled={!commandsAvailable || pending} onClick={() => void chooseDirectory()}>{picking ? 'Выбор папки…' : 'Выбрать в Finder…'}</button>}
+          {host.canPickDirectory && <button type="button" className="finder-picker" disabled={!commandsAvailable || pending} onClick={() => void chooseDirectory()}>{picking ? 'Выбор папки…' : 'Выбрать в Finder…'}</button>}
+        </div>
+        <div className="directory-actions">
+          <DirectoryTree hostId={hostId} initialPath={directory} disabled={!commandsAvailable || pending} onChoose={setDirectory} />
         </div>
       </div>
       {recent.paths.length > 0 && (
