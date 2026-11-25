@@ -379,14 +379,15 @@ a { color: var(--accent); }
   overflow-x: hidden;
   min-width: 0;
 }
-.terminal-list > li { min-width: 0; }
+.terminal-list > li { position: relative; min-width: 0; }
 .terminal-row {
   display: flex;
   flex-direction: column;
   gap: 2px;
   width: 100%;
   min-width: 0;
-  padding: 6px 8px;
+  /* Справа оставлено место под `×` на самой строке: заголовок обрезается до неё. */
+  padding: 6px 34px 6px 8px;
   text-align: left;
   /* Прозрачная рамка той же толщины: список не дёргается при смене выбора. */
   border: 2px solid transparent;
@@ -424,6 +425,32 @@ a { color: var(--accent); }
   text-overflow: ellipsis;
   white-space: nowrap;
   font-size: 11px;
+}
+/* Закрытие — на самой строке: отдельная кнопка поверх её правого края, всегда видима
+   (на телефоне hover нет). Внутрь `.terminal-row` её не вложить: там уже `<button>`. */
+.terminal-row-close {
+  position: absolute;
+  top: 50%;
+  right: 8px;
+  transform: translateY(-50%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /* Зона нажатия 24×24 при компактной точке: палец не промахивается мимо строки. */
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+}
+.terminal-row-close:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--text) 10%, transparent);
+  color: var(--text);
 }
 /* Сцена: все эмуляторы смонтированы, видима только выбранная панель. */
 .terminal-stage { position: relative; flex: 1; min-height: 0; }
@@ -1058,6 +1085,9 @@ a { color: var(--accent); }
   .terminal-form { width: 100%; padding-bottom: 12px; }
   .terminal-screen { padding: 4px; }
   .terminal-actions button { min-height: 34px; }
+  /* Палец крупнее пикселя: `×` на телефоне растёт, текст строки сдвигается вместе с ней. */
+  .terminal-row { padding-right: 46px; }
+  .terminal-row-close { width: 34px; height: 34px; right: 6px; font-size: 20px; }
   .icon-button, .composer-action { min-height: 40px; }
   .icon-button { min-width: 40px; }
   .composer-send { width: 40px; padding: 0; font-size: 20px; }

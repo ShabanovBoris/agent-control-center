@@ -16,6 +16,12 @@ function terminalRow(page: Page, title: string) {
   return page.locator('.terminal-row').filter({ has: page.locator('.terminal-row-title', { hasText: new RegExp(`^${title}$`) }) });
 }
 
+/** Кнопка закрытия конкретной строки: `×` лежит рядом с `.terminal-row` внутри `li`. */
+function terminalRowClose(page: Page, title: string) {
+  const item = page.locator('.terminal-list > li').filter({ has: page.locator('.terminal-row-title', { hasText: new RegExp(`^${title}$`) }) });
+  return item.getByRole('button', { name: `Закрыть терминал «${title}»` });
+}
+
 async function openTerminal(page: Page): Promise<void> {
   const heading = page.getByRole('heading', { name: 'Терминал', exact: true });
   // На мобильном открытый detail скрывает сайдбар с кнопкой «Терминал»:
@@ -27,17 +33,18 @@ async function openTerminal(page: Page): Promise<void> {
 
 /**
  * Чистый старт теста: mock-хост и backend общие на worker, поэтому PTY предыдущего
- * теста видны следующему через overview. Закрываем их до открытия нового.
+ * теста видны следующему через overview. Закрываем их до открытия нового — кнопкой
+ * на строке, без переключения экрана.
  */
 async function closeAllTerminals(page: Page): Promise<void> {
   await openTerminal(page);
   await expect(page.locator('.terminal-list, .terminal-form').first()).toBeVisible();
   const rows = page.locator('.terminal-row');
+  const closes = page.locator('.terminal-row-close');
   for (let guard = 0; guard < 12; guard += 1) {
     const count = await rows.count();
     if (count === 0) return;
-    await rows.first().click();
-    await page.getByRole('button', { name: 'Закрыть терминал' }).click();
+    await closes.first().click();
     await expect(rows).toHaveCount(count - 1);
   }
 }
@@ -87,9 +94,10 @@ test('F5 и возврат на страницу подхватывают тот
   await expect(app.getByRole('heading', { name: 'Терминал', exact: true })).toBeVisible();
   await expect.poll(() => screenText(app)).toContain('marker-42');
 
-  await app.getByRole('button', { name: 'Закрыть терминал' }).click();
+  // Закрытие кнопкой на строке: она одна, поэтому подпись — имя единственного PTY.
+  await app.locator('.terminal-row-close').click();
   await expect(app.getByRole('button', { name: 'Открыть терминал' })).toBeVisible();
-  // После «Закрыть» сохранённый URI забыт: повторное открытие создаёт новый PTY.
+  // После закрытия сохранённый URI забыт: повторное открытие создаёт новый PTY.
   await app.getByRole('button', { name: 'Открыть терминал' }).click();
   await expect.poll(() => screenText(app)).not.toContain('marker-42');
 });
@@ -159,6 +167,20 @@ test('телефон 390×844: терминал без горизонтальн�
   expect(overflow.list, 'список терминалов шире viewport').toBeLessThanOrEqual(0);
   // Уменьшение visualViewport (клавиатура) не выносит экран за пределы видимой области.
   expect(overflow.height).toBeLessThanOrEqual(overflow.keyboard + 1);
+
+  // Кнопка закрытия живёт на самой строке: не вылезает за её край и остаётся нажимаемой.
+  const close = await app.locator('.terminal-list > li').first().evaluate(item => {
+    const row = item.querySelector('.terminal-row')!.getBoundingClientRect();
+    const button = item.querySelector('.terminal-row-close')!.getBoundingClientRect();
+    return {
+      inside: button.left >= row.left && button.right <= row.right && button.top >= row.top && button.bottom <= row.bottom,
+      width: button.width,
+      height: button.height,
+    };
+  });
+  expect(close.inside, '× вылезла за строку').toBe(true);
+  expect(close.width, '× слишком узкая для пальца').toBeGreaterThanOrEqual(24);
+  expect(close.height, '× слишком низкая для пальца').toBeGreaterThanOrEqual(24);
 });
 
 test('два терминала: переключение без закрытия, чёрная обводка, F5 и закрытие одного', async ({ app }) => {
@@ -230,9 +252,9 @@ test('два терминала: переключение без закрыти�
   expect(overflow.list).toBeLessThanOrEqual(0);
   expect(overflow.screen).toBeLessThanOrEqual(0);
 
-  // Закрытие выбранного не убивает второй: остаётся workspace с прежним выводом
-  // и принимает новые команды.
-  await app.getByRole('button', { name: 'Закрыть терминал' }).click();
+  // Закрытие выбранного кнопкой на его строке не убивает второй: остаётся workspace
+  // с прежним выводом и принимает новые команды.
+  await terminalRowClose(app, 'src').click();
   await expect(app.locator('.terminal-row')).toHaveCount(1);
   await expect(terminalRow(app, 'workspace')).toHaveAttribute('aria-current', 'true');
   await expect(app.locator('.terminal-status .terminal-cwd')).toHaveText('/mock/workspace');
@@ -240,9 +262,40 @@ test('два терминала: переключение без закрыти�
   await typeInTerminal(app, 'echo still-alive');
   await expect.poll(() => screenText(app)).toContain('still-alive');
 
-  await app.getByRole('button', { name: 'Закрыть терминал' }).click();
+  await terminalRowClose(app, 'workspace').click();
   await expect(app.locator('.terminal-row')).toHaveCount(0);
   await expect(app.getByRole('button', { name: 'Открыть терминал' })).toBeVisible();
+});
+
+test('кнопка × на строке закрывает именно её: неактивная строка не меняет выбранный экран', async ({ app }) => {
+  await openTerminal(app);
+  await expect(app.getByRole('textbox', { name: 'Папка терминала на хосте' })).toHaveValue('/mock/workspace');
+  await app.getByRole('button', { name: 'Открыть терминал' }).click();
+  await expect(app.locator('.terminal-row')).toHaveCount(1);
+  await typeInTerminal(app, 'echo keep-one');
+  await expect.poll(() => screenText(app)).toContain('keep-one');
+
+  await app.getByRole('button', { name: 'Новый терминал' }).click();
+  await app.getByRole('textbox', { name: 'Папка терминала на хосте' }).fill('/mock/workspace/src');
+  await app.getByRole('button', { name: 'Открыть терминал' }).click();
+  await expect(app.locator('.terminal-row')).toHaveCount(2);
+  await typeInTerminal(app, 'echo keep-two');
+  await expect.poll(() => screenText(app)).toContain('keep-two');
+  await expect(terminalRow(app, 'src')).toHaveAttribute('aria-current', 'true');
+
+  // Кнопка есть у каждой строки и называет свой терминал, а не выбранный.
+  await expect(app.locator('.terminal-row-close')).toHaveCount(2);
+  await expect(app.getByRole('button', { name: 'Закрыть терминал «workspace»' })).toBeVisible();
+  await expect(app.getByRole('button', { name: 'Закрыть терминал «src»' })).toBeVisible();
+
+  // Закрываем невыбранную строку: экран остаётся на src, вывод не подменяется.
+  await terminalRowClose(app, 'workspace').click();
+  await expect(app.locator('.terminal-row')).toHaveCount(1);
+  await expect(terminalRow(app, 'src')).toHaveAttribute('aria-current', 'true');
+  await expect(app.locator('.terminal-status .terminal-cwd')).toHaveText('/mock/workspace/src');
+  await expect.poll(() => screenText(app)).toContain('keep-two');
+  await typeInTerminal(app, 'echo src-alive');
+  await expect.poll(() => screenText(app)).toContain('src-alive');
 });
 
 test('два PTY в одной папке: строки различимы и не превращаются в title хоста после overview', async ({ app }) => {
@@ -284,8 +337,8 @@ test('два PTY в одной папке: строки различимы и н
   await expect(terminalRow(app, 'workspace 2')).toHaveAttribute('aria-current', 'true');
   await expect.poll(() => screenText(app)).toContain('same-folder-two');
 
-  // Закрытие одного PTY не убивает соседний в той же папке.
-  await app.getByRole('button', { name: 'Закрыть терминал' }).click();
+  // Закрытие одного PTY кнопкой на его строке не убивает соседний в той же папке.
+  await terminalRowClose(app, 'workspace 2').click();
   await expect(app.locator('.terminal-row')).toHaveCount(1);
   await expect(terminalRow(app, 'workspace')).toHaveAttribute('aria-current', 'true');
   await expect.poll(() => screenText(app)).toContain('same-folder-one');

@@ -58,8 +58,8 @@ function readLabels(): ReadonlyMap<string, string> {
 
 /**
  * Страница `#terminal`: общий список всех своих PTY backend и один активный экран.
- * Набор приходит из overview (backend читает root хоста), поэтому PTY живут до
- * «Закрыть терминал», а F5 и возврат на страницу восстанавливают те же сессии.
+ * Набор приходит из overview (backend читает root хоста), поэтому PTY живут до `×`
+ * на своей строке, а F5 и возврат на страницу восстанавливают те же сессии.
  */
 export function TerminalView({ hosts, connected, overviewLoaded, onClose }: {
   hosts: readonly HostOverview[];
@@ -72,6 +72,8 @@ export function TerminalView({ hosts, connected, overviewLoaded, onClose }: {
   const [pending, setPending] = useState<ReadonlyMap<string, PendingTerminal>>(() => new Map());
   const [labels, setLabels] = useState(readLabels);
   const [closing, setClosing] = useState<ReadonlySet<string>>(() => new Set());
+  /** Строки с `disposeTerminal` в полёте: их `×` заблокирована до ответа хоста. */
+  const [closingBusy, setClosingBusy] = useState<ReadonlySet<string>>(() => new Set());
   const [formOpen, setFormOpen] = useState(false);
   const [formHostId, setFormHostId] = useState(() => readForm()?.hostId ?? '');
   const [formDirectory, setFormDirectory] = useState(() => readForm()?.directory ?? '');
@@ -265,12 +267,18 @@ export function TerminalView({ hosts, connected, overviewLoaded, onClose }: {
     }
   }, [busy, channels, connected, formDirectory, formHostId, hosts, labels, rows, select]);
 
-  const close = useCallback(async () => {
-    if (!active || busy) return;
-    const key = rowKey(active.hostId, active.uri);
-    setBusy(true);
+  /**
+   * Закрывает строку, на которой нажали `×`, а не только выбранную. Выбор меняется
+   * лишь если закрыли активный терминал: следующим становится первый терминал того же
+   * хоста, иначе первый в списке. Закрытие неактивной строки оставляет экран как есть.
+   */
+  const closeTerminal = useCallback(async (hostId: string, uri: string) => {
+    const key = rowKey(hostId, uri);
+    if (closingBusy.has(key) || closing.has(key)) return;
+    const wasActive = activeKey === key;
+    setClosingBusy(previous => new Set(previous).add(key));
     try {
-      await store.call({ op: 'disposeTerminal', hostId: active.hostId, terminalUri: active.uri });
+      await store.call({ op: 'disposeTerminal', hostId, terminalUri: uri });
       // `closing` ставится после успешного ответа: иначе неудачное закрытие
       // размонтировало бы живой xterm и потеряло бы контекст.
       setClosing(previous => new Set(previous).add(key));
@@ -280,30 +288,45 @@ export function TerminalView({ hosts, connected, overviewLoaded, onClose }: {
         next.delete(key);
         return next;
       });
-      store.forgetChannelData(active.hostId, active.uri);
+      store.forgetChannelData(hostId, uri);
       // Имя закрытого PTY больше не нужно: URI не вернётся под тем же shell.
-      try { forgetTerminalLabel(window.localStorage, active.uri); } catch { /* приватный режим */ }
+      try { forgetTerminalLabel(window.localStorage, uri); } catch { /* приватный режим */ }
       setLabels(previous => {
-        if (!previous.has(active.uri)) return previous;
+        if (!previous.has(uri)) return previous;
         const next = new Map(previous);
-        next.delete(active.uri);
+        next.delete(uri);
         return next;
       });
+      if (!wasActive) return;
       const remaining = rows.filter(entry => rowKey(entry.hostId, entry.uri) !== key);
-      const next = remaining.find(entry => entry.hostId === active.hostId) ?? remaining[0];
+      // Закрываемые прямо сейчас строки не годятся в преемники: иначе выбор перескочил бы
+      // на терминал, который исчезнет следующим кадром overview.
+      const candidates = remaining.filter(entry => {
+        const entryKey = rowKey(entry.hostId, entry.uri);
+        return !closing.has(entryKey) && !closingBusy.has(entryKey);
+      });
+      const next = candidates.find(entry => entry.hostId === hostId) ?? candidates[0];
       if (next) {
         select(next.hostId, next.uri);
-      } else {
+      } else if (remaining.length === 0) {
         setSelected(undefined);
         setFormOpen(true);
         try { forgetSelectedTerminal(window.localStorage); } catch { /* приватный режим */ }
       }
+      // Иначе все оставшиеся строки закрываются в этот момент: выбор оставляем как есть,
+      // его переставит эффект сверки с overview, когда набор устоится.
     } catch (failure) {
       store.notify(`Терминал не закрыт: ${describeError(failure)}`);
     } finally {
-      setBusy(false);
+      // Строка уже скрыта через `closing`; флаг в полёте снимается в любом исходе.
+      setClosingBusy(previous => {
+        if (!previous.has(key)) return previous;
+        const next = new Set(previous);
+        next.delete(key);
+        return next;
+      });
     }
-  }, [active, busy, rows, select]);
+  }, [activeKey, closing, closingBusy, rows, select]);
 
   const changeHost = (nextId: string) => {
     setFormHostId(nextId);
@@ -350,11 +373,6 @@ export function TerminalView({ hosts, connected, overviewLoaded, onClose }: {
           {!waitingOverview && !showForm && (
             <button type="button" className="terminal-new" disabled={busy} onClick={openForm}>Новый терминал</button>
           )}
-          {active && !showForm && (
-            <button type="button" className="terminal-close" disabled={busy} onClick={() => void close()}>
-              Закрыть терминал
-            </button>
-          )}
           <button type="button" onClick={onClose}>Закрыть</button>
         </div>
       </header>
@@ -373,7 +391,15 @@ export function TerminalView({ hosts, connected, overviewLoaded, onClose }: {
             </div>
           )}
           {activeView?.error && <p className="error-text" role="alert">{activeView.error}</p>}
-          {listItems.length > 0 && <TerminalList items={listItems} activeKey={activeKey} onSelect={select} />}
+          {listItems.length > 0 && (
+            <TerminalList
+              items={listItems}
+              activeKey={activeKey}
+              onSelect={select}
+              onClose={(hostId, uri) => void closeTerminal(hostId, uri)}
+              closeInFlight={closingBusy}
+            />
+          )}
           <div className="terminal-stage">
             <div className="terminal-stack">
               {rows.map(entry => {
@@ -440,8 +466,9 @@ export function TerminalView({ hosts, connected, overviewLoaded, onClose }: {
                   </label>
                 )}
                 <p className="muted terminal-note">
-                  Shell запускается на выбранном хосте без подтверждений команд и живёт до кнопки «Закрыть терминал».
-                  Каждое открытие создаёт новый PTY: в одной папке можно держать несколько агентов.
+                  Shell запускается на выбранном хосте без подтверждений команд и живёт до нажатия «×»
+                  на строке списка. Каждое открытие создаёт новый PTY: в одной папке можно держать
+                  несколько агентов.
                 </p>
                 {recent.error && <p className="error-text" role="alert">{recent.error}</p>}
                 {error && <p className="error-text" role="alert">{error}</p>}
