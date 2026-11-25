@@ -135,6 +135,17 @@ export function TerminalView({ hosts, connected, overviewLoaded, onClose }: {
     setError(undefined);
   }, [rememberSelection]);
 
+  /**
+   * Выбор строки из списка. Строку, чей `disposeTerminal` ещё в полёте, выбрать нельзя:
+   * её панель вот-вот исчезнет, и экран мигнул бы пустотой. Клик просто игнорируется —
+   * строка уйдёт из списка ответом хоста.
+   */
+  const selectRow = useCallback((hostId: string, uri: string) => {
+    const key = rowKey(hostId, uri);
+    if (closing.has(key) || closingBusy.has(key)) return;
+    select(hostId, uri);
+  }, [closing, closingBusy, select]);
+
   // Первая сводка — точка, после которой можно сверять сохранённый выбор со списком.
   // До неё эффект молчит: иначе F5 терял бы выбранный URI ещё до прихода overview.
   useEffect(() => {
@@ -395,7 +406,7 @@ export function TerminalView({ hosts, connected, overviewLoaded, onClose }: {
             <TerminalList
               items={listItems}
               activeKey={activeKey}
-              onSelect={select}
+              onSelect={selectRow}
               onClose={(hostId, uri) => void closeTerminal(hostId, uri)}
               closeInFlight={closingBusy}
             />
