@@ -3,6 +3,10 @@
 // Строка — это сессия PTY, а не папка: в одной папке можно держать несколько
 // терминалов. Выбранная строка обведена чёрным (border-color), остальные —
 // прозрачной рамкой той же толщины, чтобы список не дёргался при выборе.
+//
+// Закрытие живёт на самой строке: кнопка `×` — сосед кнопки выбора внутри `li`,
+// положена поверх её правого края. Вложить её в `.terminal-row` нельзя: строка уже
+// `<button>`, а вложенная кнопка невалидна и ломает клики с фокусом.
 export interface TerminalListEntry {
   key: string;
   hostId: string;
@@ -15,10 +19,13 @@ export interface TerminalListEntry {
   status: string;
 }
 
-export function TerminalList({ items, activeKey, onSelect }: {
+export function TerminalList({ items, activeKey, onSelect, onClose, closeInFlight }: {
   items: readonly TerminalListEntry[];
   activeKey: string | undefined;
   onSelect(hostId: string, uri: string): void;
+  onClose(hostId: string, uri: string): void;
+  /** Строки с запросом `disposeTerminal` в полёте: их `×` недоступна до ответа. */
+  closeInFlight: ReadonlySet<string>;
 }) {
   return (
     <ul className="terminal-list" aria-label="Открытые терминалы">
@@ -37,6 +44,13 @@ export function TerminalList({ items, activeKey, onSelect }: {
               <span className="terminal-row-status">{item.status}</span>
             </span>
           </button>
+          <button
+            type="button"
+            className="terminal-row-close"
+            aria-label={`Закрыть терминал «${item.title}»`}
+            disabled={closeInFlight.has(item.key)}
+            onClick={() => onClose(item.hostId, item.uri)}
+          >×</button>
         </li>
       ))}
     </ul>

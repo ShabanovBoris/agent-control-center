@@ -16,11 +16,11 @@ test.beforeEach(async ({ app }) => {
   await openTerminalPage(app);
   await expect(app.locator('.terminal-list, .terminal-form').first()).toBeVisible();
   const rows = app.locator('.terminal-row');
+  const closes = app.locator('.terminal-row-close');
   for (let guard = 0; guard < 12; guard += 1) {
     const count = await rows.count();
     if (count === 0) break;
-    await rows.first().click();
-    await app.getByRole('button', { name: 'Закрыть терминал' }).click();
+    await closes.first().click();
     await expect(rows).toHaveCount(count - 1);
   }
 });
