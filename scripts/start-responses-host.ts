@@ -7,6 +7,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseEnv } from 'node:util';
 import { isResponsesProvider, responsesProviders, type ResponsesProviderId } from './responses-providers.js';
 import { defaultServerData, resolveAgentSdk } from './agent-sdks.mjs';
+import { terminalEnv } from '../server/terminal-env.js';
 
 interface VendorModel {
   id: string;
@@ -162,8 +163,9 @@ async function main() {
 
   const sdkRoot = process.env.VSCODE_AGENT_HOST_CODEX_SDK_ROOT
     || await resolveAgentSdk('codex', process.env.AHP_SERVER_DATA_DIR ?? defaultServerData);
-  const env = {
-    ...process.env,
+  // PTY терминалов наследует env процесса хоста, поэтому чистим его только для дочернего
+  // `code agent host`: сам wrapper по-прежнему видит ключи провайдера и свой журнал.
+  const env = terminalEnv(process.env, {
     // Отдельное хранилище Codex: основной вход ChatGPT и его сессии сюда не попадают.
     CODEX_HOME: codexHome,
     [provider.envKey]: apiKey,
@@ -171,7 +173,7 @@ async function main() {
     VSCODE_AGENT_HOST_CODEX_AGENT_ENABLED: 'true',
     VSCODE_AGENT_HOST_CODEX_APP_SERVER_ARGS: JSON.stringify(providerArgs(providerId, catalogPath, model)),
     ...(sdkRoot ? { VSCODE_AGENT_HOST_CODEX_SDK_ROOT: sdkRoot } : {}),
-  };
+  });
   const cli = process.env.VSCODE_CLI ?? '/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code';
   const port = process.env.RESPONSES_AHP_PORT ?? String(provider.port);
   await say(`[${providerId}] ${new URL(provider.endpoint).host}: ${catalog.models.length} моделей, по умолчанию ${model}`);

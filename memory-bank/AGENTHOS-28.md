@@ -1,6 +1,88 @@
 # AGENTHOS-28: подсветка выбора в TUI-агентах
 
-Статус: backlog. Создана после приёмки AGENTHOS-26.
+Статус: реализовано. Создана после приёмки AGENTHOS-26.
+
+## Причина и исправление
+
+PTY терминалов панели наследует окружение процесса AHP-хоста, а хост запускается из
+agent-раннера с `TERM=dumb`, `NO_COLOR=1`, `CLICOLOR=0`, `CLICOLOR_FORCE=0`, `FORCE_COLOR=0`,
+`CI=1`. Из-за этого TUI на lipgloss/termenv/colorprofile (`kent`) и Node-TUI выбирают
+Ascii/NoColor: выбранный пункт диалога не подсвечивается. `src/ui/TerminalEmulator.tsx`,
+`server/terminal-stream.ts` и клавиши были исправны: SGR в панели рисуется, `ArrowDown`
+в чистом окружении переносит подсветку.
+
+В AHP 1.1.0 у `CreateTerminalParams` нет поля `env`, поэтому задать окружение отдельному PTY
+нельзя. Чиним на единственной общей точке — лаунчерах хостов:
+
+- `server/terminal-env.ts` — `TERMINAL_ENV_UNSET`, `TERMINAL_ENV_SET`, `terminalEnv(env, overrides)`;
+- `scripts/start-responses-host.ts` — env дочернего `code agent host` строится через `terminalEnv`
+  (сам wrapper по-прежнему видит ключи провайдера и свой журнал);
+- `scripts/start-host.sh` — `unset NO_COLOR CLICOLOR CLICOLOR_FORCE FORCE_COLOR CI`,
+  `TERM=xterm-256color`, `COLORTERM=truecolor` до `exec "$CODE"`.
+
+Внутри PTY `TERM` выставляет сам хост (в замерах при `TERM=dumb` у хоста PTY всё равно
+получал `xterm-256color`); остальные переменные PTY наследует от процесса хоста.
+Лаунчеры нормализуют именно env хоста.
+
+## Замеры (kent v2.14.0, codex v0.163.0, нативный PTY с чистым HOME/PATH)
+
+| Окружение | SGR на стартовом экране `kent` | Что видно |
+| --- | --- | --- |
+| `TERM=xterm-256color`, `COLORTERM=truecolor` | ≈120 truecolor (`38;2;…`) | выбранный пункт `\x1b[1;38;2;48;133;252m◈ Create a new session` |
+| грязное (5 переменных + `TERM=dumb`, `COLORTERM=`) | 0 | выбора цветом нет |
+| только `NO_COLOR=1` / только `CLICOLOR=0` / только `CI=1` | 0 | каждая сама отключает цвет |
+| только `CLICOLOR_FORCE=0` / только `FORCE_COLOR=0` | ≈120 truecolor | цвет есть |
+| `TERM=dumb` + `COLORTERM=truecolor` | truecolor есть | `TERM=dumb` сам по себе не решает |
+| `TERM=xterm-256color` без `COLORTERM` | 256 цветов (`38;5;…`) | хуже, чем truecolor |
+
+`ArrowDown` в чистом окружении добавляет ~315 байт перерисовки и переносит SGR выбранного пункта.
+`codex --help`: чистое окружение — 136 SGR, грязное — 0. `CODEX_HOME=$(mktemp -d) codex`
+(login-пикер): чистое — выбранная строка `\x1b[38;5;6;49m> 2. Sign in with Device Code`,
+после `ArrowDown` подсветка переезжает; грязное — цветового SGR нет.
+
+Поправка к раннему Recon: утверждения «0 SGR при отсутствующем `NO_COLOR`» и «на стартовом экране
+0 SGR в любом окружении» не воспроизвелись на текущей сборке — нулевой результат давало грязное
+окружение (в частности `CI`/`CLICOLOR`) и методика замера. Пустой `NO_COLOR=` цвет не отключает,
+`NO_COLOR=0` — отключает; поэтому переменная удаляется, а не выставляется пустой.
+
+## Проверки
+
+- `npm test` — новый `server/terminal-env.test.ts`: unit на `terminalEnv` (вход не мутируется,
+  `overrides` применяются, `TERM`/`COLORTERM` не перебиваются) и запуск настоящего
+  `scripts/start-host.sh` из временной копии со stub-CLI (`exec /usr/bin/env -0`): грязный env
+  на входе, на выходе только `TERM=xterm-256color`, `COLORTERM=truecolor` и без пяти переменных.
+  Тест падает, если убрать любую строку `unset`/`export` (проверено вручную: без `unset`
+  `NO_COLOR` и `CI` доезжают до stub).
+- `e2e/terminal-ansi.spec.ts` — SGR из mock-хоста (`\x1b[32m$`) доезжает до DOM xterm
+  (`.xterm-fg-2`), то есть кадры `terminalData` и эмулятор байты не теряют.
+- Живьём (стенд `npm run up`, панель `http://127.0.0.1:5173/#terminal`, хост local):
+  `ps eww` у всех трёх хостов показывает `TERM=xterm-256color` и `COLORTERM=truecolor`, пяти
+  переменных нет; внутри PTY `env` отдаёт `TERM=xterm-256color` и `COLORTERM=truecolor`;
+  `kent` рисует выбранный пункт `rgb(48,133,252)` (`#3085fc`), после `ArrowDown` подсветка
+  переезжает на следующую сессию, после `ArrowUp` возвращается; `CODEX_HOME=$(mktemp -d) codex`
+  показывает login-пикер с выбранным пунктом `xterm-fg-6` (cyan) и переносит его по стрелкам.
+  Проверка шла Playwright-скриптом по живому стенду (`.local/live-check.mjs`, вне репозитория):
+  снимались inline-цвета и классы span'ов xterm до и после нажатий.
+- Наблюдение по рестарту: `npm run restart:services` на стенде под `up` останавливает весь стенд —
+  супервизор видит SIGINT-завершение хоста как падение («Запуск прерван из-за ошибки»), после чего
+  нужен `npm run up`. Для этой задачи env-фикс применяется именно рестартом хостов; стенд поднят
+  заново и проверен (все три хоста `connected`, web 200).
+
+## Граница и остаточные риски
+
+- Прямой `code agent host` в обход лаунчеров остаётся без гарантии — записано в README.
+- Уже запущенный хост сохраняет старое окружение до рестарта хостов; на стенде под `up`
+  `npm run restart:services` останавливает весь стенд (см. «Проверки»), поэтому нужен новый `npm run up`.
+- `CI` снимается у всего процесса хоста: в репозитории его читает только `playwright.config.ts`,
+  но env инструментов агента внутри хоста отдельно не проверялся (они пишут в pipe, а не в TTY).
+- `TERM_PROGRAM` не нормализуется: на цвет проверенных TUI не влияет.
+- Форсированные `xterm-256color`/`truecolor` верны, пока панель — единственный клиент этих
+  локальных хостов.
+
+## Исходная постановка и Recon
+
+Ниже — история задачи: симптом, первые замеры и план проверки. Часть ранних выводов
+опровергнута разделом «Замеры» выше (там актуальные числа).
 
 ## Симптом от владельца
 

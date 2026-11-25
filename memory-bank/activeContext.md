@@ -17,6 +17,18 @@ backend через `ACC_STATE_DIR=test-results/state`. Job `e2e` добавле�
 
 25 ноября 2026 появился терминал на отдельной странице `#terminal`: [shared/reduce.ts](../shared/reduce.ts) знает `ahp-terminal:`, [server/terminal-stream.ts](../server/terminal-stream.ts) склеивает `terminal/data` в кадры `terminalData` (33 мс, ≤128 КБ, без потерь), [server/hub.ts](../server/hub.ts) открывает и закрывает PTY и следит за лимитом 8 своих терминалов, [server/terminal-cleanup.ts](../server/terminal-cleanup.ts) закрывает брошенные без наблюдателей, [src/TerminalView.tsx](../src/TerminalView.tsx) и ленивый [TerminalEmulator.tsx](../src/ui/TerminalEmulator.tsx) (xterm.js) дают shell в браузере и на телефоне. Shell запускается без approvals — осознанное решение владельца, отражено в README. После ревью лимит восьми PTY стал атомарным (слот резервируется до создания, вытеснение дожидается dispose), второй наблюдатель больше не получает кадр дважды, буфер вывода не рвёт суррогатную пару, а `ACC_TERMINAL_IDLE_MS` проверяется при старте. Подробности — [AGENTHOS-26.md](AGENTHOS-26.md).
 
+25 ноября 2026 починена подсветка выбора в TUI-агентах панели: PTY наследует env процесса
+AHP-хоста, а раннер выставлял `TERM=dumb`, `NO_COLOR`, `CLICOLOR`, `CI` и `FORCE_COLOR`, из-за
+чего `kent`/`codex` выбирали Ascii/NoColor. В AHP 1.1.0 у `createTerminal` нет поля `env`,
+поэтому нормализация сделана в лаунчерах: [server/terminal-env.ts](../server/terminal-env.ts)
+и [scripts/start-responses-host.ts](../scripts/start-responses-host.ts) для wbllm/glm,
+[scripts/start-host.sh](../scripts/start-host.sh) для local — `unset` пяти переменных,
+`TERM=xterm-256color`, `COLORTERM=truecolor`. Регрессию ловят
+[server/terminal-env.test.ts](../server/terminal-env.test.ts) (реальный запуск лаунчера со stub-CLI)
+и [e2e/terminal-ansi.spec.ts](../e2e/terminal-ansi.spec.ts) (SGR доезжает до xterm). Переменные
+и требование рестарта хостов описаны в README в разделе «Окружение PTY». Подробности —
+[AGENTHOS-28.md](AGENTHOS-28.md).
+
 - Основной хост `8089` обслуживает Claude через cheapvibecode и Codex через ChatGPT. Gemini изолирован на `8091` и работает в среде Codex. Адреса провайдера читаются из локальной конфигурации при запуске.
 - 17 ноября сверили опубликованные версии AHP. На дату проверки `1.1.0` была актуальной стабильной версией SDK и спецификации, а `1.2.0` оставалась в разработке. Для текущей версии проекта смотри lockfile, для новых релизов — [changelog AHP](https://github.com/microsoft/agent-host-protocol/blob/main/CHANGELOG.md).
 - Версия AHP, согласованная работающими хостами, и фактический список активных skills и MCP по сессиям отдельно не проверялись.
