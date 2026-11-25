@@ -1,6 +1,7 @@
 # AGENTHOS-28: подсветка выбора в TUI-агентах
 
-Статус: реализовано. Создана после приёмки AGENTHOS-26.
+Статус: сделано и слито — PR [#20](https://github.com/ShabanovBoris/agent-control-center/pull/20),
+squash `f6cd10e`, Gate `pass` без блокеров. Создана после приёмки AGENTHOS-26.
 
 ## Причина и исправление
 

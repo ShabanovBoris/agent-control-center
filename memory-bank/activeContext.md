@@ -27,7 +27,8 @@ AHP-хоста, а раннер выставлял `TERM=dumb`, `NO_COLOR`, `CLI
 [server/terminal-env.test.ts](../server/terminal-env.test.ts) (реальный запуск лаунчера со stub-CLI)
 и [e2e/terminal-ansi.spec.ts](../e2e/terminal-ansi.spec.ts) (SGR доезжает до xterm). Переменные
 и требование рестарта хостов описаны в README в разделе «Окружение PTY». Подробности —
-[AGENTHOS-28.md](AGENTHOS-28.md).
+[AGENTHOS-28.md](AGENTHOS-28.md). Слито PR
+[#20](https://github.com/ShabanovBoris/agent-control-center/pull/20) (squash `f6cd10e`).
 
 - Основной хост `8089` обслуживает Claude через cheapvibecode и Codex через ChatGPT. Gemini изолирован на `8091` и работает в среде Codex. Адреса провайдера читаются из локальной конфигурации при запуске.
 - 17 ноября сверили опубликованные версии AHP. На дату проверки `1.1.0` была актуальной стабильной версией SDK и спецификации, а `1.2.0` оставалась в разработке. Для текущей версии проекта смотри lockfile, для новых релизов — [changelog AHP](https://github.com/microsoft/agent-host-protocol/blob/main/CHANGELOG.md).

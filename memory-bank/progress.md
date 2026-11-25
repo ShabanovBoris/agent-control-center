@@ -25,3 +25,13 @@ URI, форму и подписи строк (`acc.terminals.v2.labels`), все
 Проверки: `npm test` — 489/489, `npm run typecheck`, `npm run build`,
 `npm run test:e2e -- e2e/terminal.spec.ts` — 7/7; живой smoke на local подтвердил подписи
 «tmp»/«tmp 2», F5 и закрытие. Детали — [AGENTHOS-27.md](AGENTHOS-27.md).
+
+25 ноября 2026, AGENTHOS-28: подсветка выбора в TUI-агентах. Корень оказался не в панели и не в
+ANSI: хост наследовал от лаунчера `TERM=dumb`, `NO_COLOR=1`, `FORCE_COLOR=0`, `CI=1`, и TUI
+выбирали NoColor. В AHP 1.1.0 у `CreateTerminalParams` нет `env`, поэтому окружение нормализуют
+лаунчеры: `server/terminal-env.ts` (`TERMINAL_ENV_UNSET`/`TERMINAL_ENV_SET`/`terminalEnv`),
+`scripts/start-host.sh` и `scripts/start-responses-host.ts`. `TerminalEmulator.tsx` по цвету не
+менялся. Проверки: `npm test` — 489/489, typecheck, e2e; на живом стенде `ps eww` трёх хостов
+показывает `TERM=xterm-256color`/`COLORTERM=truecolor` без вредных переменных, `kent` в панели
+красит выбранный пункт `rgb(48,133,252)`, `ArrowDown` переносит подсветку.
+Детали — [AGENTHOS-28.md](AGENTHOS-28.md).
