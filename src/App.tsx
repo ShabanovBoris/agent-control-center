@@ -12,6 +12,7 @@ import type {
 import { channelKey } from '../shared/reduce';
 import { HOST_STATUS_LABEL, PHASE_LABEL, ellipsize, isArchived, pathOf, phaseOf, selectionFromHash, selectionToHash, timeAgo, type Phase, type Selection } from './format';
 import { HealthView } from './HealthView';
+import { TerminalView } from './TerminalView';
 import { CommandPalette } from './ui/CommandPalette';
 import { SessionView } from './SessionView';
 import { describeError, store, useAppState, usePresence } from './store';
@@ -19,7 +20,7 @@ import { panelVisibility } from './panel-presence';
 import { pinnedKeys, sortSessions, unreadCounts } from './session-list';
 import { NotificationsButton } from './ui/NotificationsButton';
 import { DirectoryTree } from './ui/DirectoryTree';
-import { recentDirectories, rememberDirectory } from './recent-directories';
+import { directoryHistory, rememberDirectory } from './recent-directories';
 import {
   branchFieldOf,
   completionOptions,
@@ -44,19 +45,21 @@ export function App() {
   const [selection, setSelection] = useState(() => selectionFromHash(location.hash));
   const [creating, setCreating] = useState(false);
   const [showHealth, setShowHealth] = useState(() => location.hash === '#health');
+  const [showTerminal, setShowTerminal] = useState(() => location.hash === '#terminal');
   const [showSessionList, setShowSessionList] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [revealSeq, setRevealSeq] = useState(0);
-  const hasDetail = creating || selection !== null || showHealth;
+  const hasDetail = creating || selection !== null || showHealth || showTerminal;
   useEffect(() => {
-    const hash = showHealth ? '#health' : selectionToHash(selection);
+    const hash = showHealth ? '#health' : showTerminal ? '#terminal' : selectionToHash(selection);
     history.replaceState(null, '', `${location.pathname}${location.search}${hash}`);
-  }, [selection, showHealth]);
+  }, [selection, showHealth, showTerminal]);
   // Клик по push-уведомлению в уже открытой вкладке меняет только hash.
   useEffect(() => {
     const onHashChange = () => {
-      if (location.hash === '#health') {
-        setShowHealth(true);
+      if (location.hash === '#health' || location.hash === '#terminal') {
+        setShowHealth(location.hash === '#health');
+        setShowTerminal(location.hash === '#terminal');
         setCreating(false);
         setShowSessionList(false);
         return;
@@ -64,6 +67,7 @@ export function App() {
       const next = selectionFromHash(location.hash);
       setSelection(next);
       setShowHealth(false);
+      setShowTerminal(false);
       if (next) {
         setCreating(false);
         setShowSessionList(false);
@@ -74,7 +78,7 @@ export function App() {
   }, []);
   const mobile = useMediaQuery('(max-width: 760px)');
   // Presence и badge непрочитанных считаются от одного и того же «detail реально показан».
-  const { detailVisible, presence } = panelVisibility(selection, { creating, showHealth, sessionList: showSessionList, mobile });
+  const { detailVisible, presence } = panelVisibility(selection, { creating, showHealth, showTerminal, sessionList: showSessionList, mobile });
   usePresence(presence);
   const [filter, setFilter] = useState<Filter>('all');
 
@@ -135,8 +139,14 @@ export function App() {
               <button
                 type="button"
                 className="updates-button"
+                aria-pressed={showTerminal}
+                onClick={() => { setShowTerminal(true); setShowHealth(false); setCreating(false); setShowSessionList(false); }}
+              >Терминал</button>
+              <button
+                type="button"
+                className="updates-button"
                 aria-pressed={showHealth}
-                onClick={() => { setShowHealth(true); setShowSessionList(false); }}
+                onClick={() => { setShowHealth(true); setShowTerminal(false); setShowSessionList(false); }}
               >Диагностика</button>
               <NotificationsButton connected={backendConnected} />
               <UpdatesButton connected={backendConnected} />
@@ -158,9 +168,9 @@ export function App() {
           <button type="button" className="search-button" aria-keyshortcuts="Meta+K Control+K" title="Поиск по сессиям и истории" onClick={() => setPaletteOpen(true)}>
             Поиск <span className="palette-kbd">{navigator.userAgent.includes('Mac') ? '⌘K' : 'Ctrl K'}</span>
           </button>
-          <button className="primary" onClick={() => { setCreating(true); setShowHealth(false); setShowSessionList(false); }}>Новая сессия</button>
+          <button className="primary" onClick={() => { setCreating(true); setShowHealth(false); setShowTerminal(false); setShowSessionList(false); }}>Новая сессия</button>
           {hasDetail && showSessionList && (
-            <button className="mobile-return" onClick={() => setShowSessionList(false)}>{creating ? 'К форме' : showHealth ? 'К диагностике' : 'К открытому чату'}</button>
+            <button className="mobile-return" onClick={() => setShowSessionList(false)}>{creating ? 'К форме' : showTerminal ? 'К терминалу' : showHealth ? 'К диагностике' : 'К открытому чату'}</button>
           )}
         </div>
 
@@ -186,10 +196,11 @@ export function App() {
                 backendConnected={backendConnected}
                 pinned={pinned.has(key)}
                 unread={hideUnread ? 0 : unread.get(key) ?? 0}
-                selected={!creating && !showHealth && selection?.hostId === hostId && selection.sessionUri === sessionUri ? selection : null}
+                selected={!creating && !showHealth && !showTerminal && selection?.hostId === hostId && selection.sessionUri === sessionUri ? selection : null}
                 onSelect={chatUri => {
                   setCreating(false);
                   setShowHealth(false);
+                  setShowTerminal(false);
                   setSelection({ hostId, sessionUri, ...(chatUri ? { chatUri } : {}) });
                   setShowSessionList(false);
                 }}
@@ -202,7 +213,13 @@ export function App() {
       </aside>
 
       <main className="detail">
-        {showHealth ? (
+        {showTerminal ? (
+          <TerminalView
+            hosts={overview.hosts}
+            connected={backendConnected}
+            onClose={() => { setShowTerminal(false); setShowSessionList(true); }}
+          />
+        ) : showHealth ? (
           <HealthView onClose={() => { setShowHealth(false); setShowSessionList(true); }} />
         ) : creating ? (
           <>
@@ -553,11 +570,6 @@ function AgentRow({ hostId, agent, backendConnected }: { hostId: string; agent: 
   );
 }
 
-function directoryHistory(hostId: string): { paths: string[]; error?: string } {
-  try { return { paths: recentDirectories(window.localStorage, hostId) }; }
-  catch (error) { return { paths: [], error: `Не удалось прочитать недавние папки: ${describeError(error)}` }; }
-}
-
 interface NewSessionProps {
   hosts: readonly HostOverview[];
   backendConnected: boolean;
@@ -606,7 +618,7 @@ function NewSessionForm({ host, hosts, backendConnected, onHostChange, onCancel,
   const directory = pickedDirectory ?? pathOf(host.defaultDirectory);
   const [busy, setBusy] = useState(false);
   const [picking, setPicking] = useState(false);
-  const [recent] = useState(() => directoryHistory(hostId));
+  const [recent] = useState(() => directoryHistory(window.localStorage, hostId));
   const [error, setError] = useState<string>();
   const commandsAvailable = backendConnected && host.status === 'connected';
   const pending = busy || picking;

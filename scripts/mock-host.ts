@@ -16,8 +16,12 @@ import {
   chatReducer,
   rootReducer,
   sessionReducer,
+  terminalReducer,
   SessionLifecycle,
   SessionStatus,
+  TerminalClaim,
+  TerminalClaimKind,
+  TerminalLifecycleStatus,
   type ActionEnvelope,
   type ChatAction,
   type ChatInputCompletedAction,
@@ -31,6 +35,8 @@ import {
   type SessionState,
   type SessionSummary,
   type StateAction,
+  type TerminalAction,
+  type TerminalState,
 } from '@microsoft/agent-host-protocol';
 import { WebSocketServer, type WebSocket } from 'ws';
 import { normalizeDirectoryPath, type DirectoryEntry } from '../shared/directory.js';
@@ -93,6 +99,13 @@ const awaitingConfirmation = new Map<string, (approved: boolean) => void>();
 const awaitingInput = new Map<string, (action: ChatInputCompletedAction) => void>();
 const scripts = new Map<string, AbortController>();
 
+/** Терминалы mock-хоста: «PTY» без настоящего процесса, но с теми же действиями AHP. */
+const terminals = new Map<string, TerminalState>();
+/** Недописанные до перевода строки команды: фейковый shell обрабатывает ввод построчно. */
+const terminalBuffers = new Map<string, string>();
+
+const PROMPT = '\u001b[32m$\u001b[0m ';
+
 interface Connection {
   socket: WebSocket;
   clientId: string;
@@ -130,6 +143,8 @@ function stateOf(channel: string): unknown {
   if (channel === ROOT) return root;
   const chat = chats.get(channel);
   if (chat) return chatSnapshot(chat);
+  const terminal = terminals.get(channel);
+  if (terminal) return terminal;
   return sessions.get(channel);
 }
 
@@ -144,11 +159,71 @@ function emit(channel: string, action: object, origin?: ActionEnvelope['origin']
   if (channel === ROOT) root = rootReducer(root, cast<RootAction>(action));
   else if (sessions.has(channel)) sessions.set(channel, sessionReducer(sessions.get(channel)!, cast<SessionAction>(action)));
   else if (chats.has(channel)) chats.set(channel, chatReducer(chats.get(channel)!, cast<ChatAction>(action)));
+  else if (terminals.has(channel)) terminals.set(channel, terminalReducer(terminals.get(channel)!, cast<TerminalAction>(action)));
   else return;
   const envelope = { channel, action, serverSeq: ++serverSeq, origin };
   for (const connection of connections) {
     if (connection.subscriptions.has(channel)) notify(connection, 'action', envelope);
   }
+}
+
+/** Список терминалов в root: полная замена, как у настоящего хоста. */
+function publishTerminals(): void {
+  emit(ROOT, {
+    type: ActionType.RootTerminalsChanged,
+    terminals: [...terminals.entries()].map(([resource, state]) => ({
+      resource,
+      title: state.title,
+      claim: state.claim,
+      lifecycle: state.lifecycle,
+    })),
+  });
+}
+
+/** Фейковый shell: эхо строки, `echo ...`, `exit N` и приглашение с ANSI-цветом. */
+function runTerminalLine(uri: string, line: string): void {
+  const state = terminals.get(uri);
+  if (!state || state.lifecycle.status !== TerminalLifecycleStatus.Running) return;
+  // Эхо строки целиком: так вывод не зависит от того, пришёл ввод одним действием или по символу.
+  emit(uri, { type: ActionType.TerminalData, data: `${line}\r\n` });
+  const command = line.trim();
+  const exit = /^exit(?:\s+(-?\d+))?$/.exec(command);
+  if (exit) {
+    emit(uri, { type: ActionType.TerminalExited, exitCode: exit[1] === undefined ? 0 : Number(exit[1]) });
+    publishTerminals();
+    return;
+  }
+  const echo = /^echo\s+(.*)$/.exec(command);
+  if (command) emit(uri, { type: ActionType.TerminalData, data: `${echo ? echo[1] : command}\r\n` });
+  emit(uri, { type: ActionType.TerminalData, data: PROMPT });
+}
+
+/** Ввод PTY построчно: как shell с эхом на уровне строки, а не символа. */
+function writeTerminal(uri: string, data: string): void {
+  const state = terminals.get(uri);
+  if (!state || state.lifecycle.status !== TerminalLifecycleStatus.Running) return;
+  let buffer = terminalBuffers.get(uri) ?? '';
+  for (const char of data) {
+    if (char === '\r' || char === '\n') {
+      const line = buffer;
+      buffer = '';
+      terminalBuffers.set(uri, buffer);
+      runTerminalLine(uri, line);
+      continue;
+    }
+    if (char === '\u0003') {
+      // Ctrl-C: новая строка и приглашение, без выхода — как у настоящего shell.
+      buffer = '';
+      emit(uri, { type: ActionType.TerminalData, data: `^C\r\n${PROMPT}` });
+      continue;
+    }
+    if (char === '\u007f') {
+      if (buffer.length > 0) buffer = buffer.slice(0, -1);
+      continue;
+    }
+    buffer += char;
+  }
+  terminalBuffers.set(uri, buffer);
 }
 
 function setSummary(sessionUri: string, changes: Partial<SessionSummary>): void {
@@ -302,6 +377,27 @@ function acceptDispatch(connection: Connection, channel: string, action: StateAc
       setSummary(chatSession.get(channel)!, { status: SessionStatus.Idle, activity: '' });
       return undefined;
     }
+    case ActionType.TerminalInput: {
+      if (!terminals.has(channel)) return 'unknown terminal';
+      writeTerminal(channel, action.data);
+      return undefined;
+    }
+    case ActionType.TerminalResized: {
+      if (!terminals.has(channel)) return 'unknown terminal';
+      emit(channel, action, origin);
+      return undefined;
+    }
+    case ActionType.TerminalCleared: {
+      if (!terminals.has(channel)) return 'unknown terminal';
+      emit(channel, action, origin);
+      return undefined;
+    }
+    case ActionType.TerminalClaimed: {
+      if (!terminals.has(channel)) return 'unknown terminal';
+      emit(channel, action, origin);
+      publishTerminals();
+      return undefined;
+    }
     default:
       return `mock host does not accept ${action.type} from ${connection.clientId}`;
   }
@@ -360,6 +456,33 @@ function createChat(params: any): null {
   // sessionReducer заменяет объект сессии, поэтому каталог читается после emit.
   const updated = sessions.get(sessionUri)!;
   setSummary(sessionUri, { chats: updated.chats.map(toSessionChatSummary) });
+  return null;
+}
+
+/** Создаёт «PTY» mock-хоста: без процесса, но с теми же действиями AHP. */
+function createTerminal(params: any): null {
+  const uri: string = params.channel;
+  if (typeof uri !== 'string' || !uri.startsWith('ahp-terminal:')) invalidParams('createTerminal: нужен ahp-terminal: URI');
+  if (terminals.has(uri)) throw { code: AhpErrorCodes.AlreadyExists, message: `Terminal already exists: ${uri}` };
+  const cwd = typeof params.cwd === 'string' && params.cwd.startsWith('file:') ? params.cwd : 'file:///mock/workspace';
+  const path = normalizeDirectoryPath(pathOf(cwd));
+  if (path && !MOCK_DIRECTORIES.has(path)) throw { code: AhpErrorCodes.NotFound, message: `No such directory: ${path}` };
+  const claim: TerminalClaim = params.claim?.kind === TerminalClaimKind.Session
+    ? { kind: TerminalClaimKind.Session, session: String(params.claim.session), chat: String(params.claim.chat) }
+    : { kind: TerminalClaimKind.Client, clientId: String(params.claim?.clientId ?? '') };
+  terminals.set(uri, {
+    title: typeof params.name === 'string' && params.name ? params.name : 'Терминал',
+    cwd,
+    cols: Number.isInteger(params.cols) ? params.cols : 80,
+    rows: Number.isInteger(params.rows) ? params.rows : 24,
+    content: [{ type: 'unclassified', value: `${PROMPT}` }],
+    lifecycle: { status: TerminalLifecycleStatus.Running },
+    claim,
+    isPty: true,
+    supportsCommandDetection: false,
+  });
+  terminalBuffers.set(uri, '');
+  publishTerminals();
   return null;
 }
 
@@ -465,6 +588,15 @@ async function handleRequest(connection: Connection, method: string, params: any
     }
     case 'createChat':
       return createChat(params);
+    case 'createTerminal':
+      return createTerminal(params);
+    case 'disposeTerminal': {
+      const uri: string = params.channel;
+      if (!terminals.delete(uri)) throw { code: AhpErrorCodes.NotFound, message: `No such terminal: ${uri}` };
+      terminalBuffers.delete(uri);
+      publishTerminals();
+      return null;
+    }
     case 'fetchTurns': {
       const chat = chats.get(params.channel);
       if (!chat) throw { code: AhpErrorCodes.NotFound, message: `No such chat: ${params.channel}` };

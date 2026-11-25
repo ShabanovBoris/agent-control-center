@@ -19,11 +19,13 @@ import type {
   SessionState,
   SessionSummary,
   StateAction,
+  TerminalState,
 } from '@microsoft/agent-host-protocol';
 import type { DirectoryEntry } from './directory.js';
 import type { UsageAggregate } from './usage.js';
 
 export type { DirectoryEntry } from './directory.js';
+export type { TerminalState } from '@microsoft/agent-host-protocol';
 export type {
   ResolveSessionConfigResult,
   SessionConfigCompletionsResult,
@@ -97,7 +99,7 @@ export interface SessionUserState {
   unread: UnreadSession[];
 }
 
-export type ChannelState = RootState | SessionState | ChatState | ChangesetState;
+export type ChannelState = RootState | SessionState | ChatState | ChangesetState | TerminalState;
 
 export interface UpdateCheck {
   changes: { name: string; current: string | null; available: string }[];
@@ -270,6 +272,10 @@ export interface DirectoryListing {
 
 export type HostCall =
   | { op: 'createSession'; hostId: string; provider: string; workingDirectory: string; config?: Record<string, unknown> }
+  | { op: 'createTerminal'; hostId: string; directory: string; title?: string; cols?: number; rows?: number }
+  | { op: 'disposeTerminal'; hostId: string; terminalUri: string }
+  | { op: 'terminalInput'; hostId: string; terminalUri: string; data: string }
+  | { op: 'terminalResize'; hostId: string; terminalUri: string; cols: number; rows: number }
   | { op: 'resolveSessionConfig'; hostId: string; provider: string; workingDirectory: string; config?: Record<string, unknown> }
   | { op: 'sessionConfigCompletions'; hostId: string; provider: string; workingDirectory: string; config?: Record<string, unknown>; property: string; query?: string }
   | { op: 'pickDirectory'; hostId: string; initialDirectory?: string }
@@ -311,6 +317,11 @@ export type ServerMessage =
   | { t: 'overview'; overview: Overview }
   | { t: 'snapshot'; hostId: string; uri: string; state: ChannelState }
   | { t: 'action'; hostId: string; uri: string; action: StateAction }
+  /**
+   * Фрагмент вывода PTY. Идёт мимо `action`, потому что тысячи `terminal/data`
+   * в секунду нельзя протаскивать через React-состояние: браузер пишет их прямо в терминал.
+   */
+  | { t: 'terminalData'; hostId: string; uri: string; data: string }
   /** Хост отклонил действие (например, чужой клиент уже ответил на approval). */
   | { t: 'rejected'; hostId: string; uri: string; actionType: string; reason: string }
   | { t: 'channelError'; hostId: string; uri: string; error: string; code?: number }
@@ -320,6 +331,8 @@ export type ServerMessage =
   | { t: 'result'; id: number; ok: false; error: CallError };
 
 export const ROOT_URI = 'ahp-root://';
+/** Терминальные каналы хоста: префикс общий, конкретный URI выбирает клиент при создании PTY. */
+export const TERMINAL_PREFIX = 'ahp-terminal:';
 export const AUTH_REQUIRED_CODE = -32007;
 /** Хост не реализует метод AHP: для конфигурации сессии это штатная деградация. */
 export const METHOD_NOT_FOUND_CODE = -32601;
@@ -416,6 +429,9 @@ export function parseServerMessage(raw: string): ServerMessage | undefined {
       break;
     case 'action':
       if (!hasChannelAddress(message) || !isRecord(message.action) || typeof message.action.type !== 'string') return undefined;
+      break;
+    case 'terminalData':
+      if (!hasChannelAddress(message) || typeof message.data !== 'string') return undefined;
       break;
     case 'rejected':
       if (!hasChannelAddress(message) || typeof message.actionType !== 'string' || typeof message.reason !== 'string') return undefined;

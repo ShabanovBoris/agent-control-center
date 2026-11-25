@@ -1,7 +1,7 @@
 /// <reference lib="dom" />
 import assert from 'node:assert/strict';
 import { after, test } from 'node:test';
-import type { SessionSummary } from '@microsoft/agent-host-protocol';
+import { ActionType, TerminalClaimKind, TerminalLifecycleStatus, type SessionSummary, type TerminalState } from '@microsoft/agent-host-protocol';
 import type { ChannelState, ServerMessage } from '../shared/protocol.js';
 import { channelKey } from '../shared/reduce.js';
 
@@ -132,6 +132,79 @@ test('отчёт по расходу уходит отдельным вызов�
   const report = { total: 110, timeZone: 'Europe/Moscow', sessions: [], reasons: [], issues: [] };
   receive({ t: 'result', id: call.id, ok: true, data: report });
   assert.deepEqual(await running, report);
+});
+
+test('поток терминала идёт мимо состояния React и переживает timing подписки', () => {
+  const terminal = 'ahp-terminal:/one';
+  const release = store.watch('one', terminal);
+  snapshot('one', terminal);
+  const before = store.getState();
+  // До подписки эмулятора кадр не создаёт новое состояние: React не перерисовывается.
+  receive({ t: 'terminalData', hostId: 'one', uri: terminal, data: 'early' });
+  assert.equal(store.getState(), before);
+
+  const seen: string[] = [];
+  const unsubscribe = store.subscribeChannelData((hostId, uri, data) => seen.push(`${hostId}:${uri}:${data}`));
+  assert.deepEqual(seen, [`one:${terminal}:early`], 'кадр, пришедший до подписки, не теряется');
+  receive({ t: 'terminalData', hostId: 'one', uri: terminal, data: 'late' });
+  assert.deepEqual(seen.at(-1), `one:${terminal}:late`);
+  assert.equal(store.getState(), before, 'кадры не меняют channels');
+
+  // Кадр чужого канала не должен попасть в этот эмулятор.
+  store.forgetChannelData('one', terminal);
+  unsubscribe();
+  release();
+});
+
+test('буфер вывода до подписки не рвёт суррогатную пару', () => {
+  const terminal = 'ahp-terminal:/buffer';
+  const release = store.watch('one', terminal);
+  snapshot('one', terminal);
+  receive({ t: 'terminalData', hostId: 'one', uri: terminal, data: 'b'.repeat(10) });
+  // Обрезка до 256 КиБ попадает ровно между половинами эмодзи: префикс + эмодзи + хвост.
+  receive({ t: 'terminalData', hostId: 'one', uri: terminal, data: `😀${'c'.repeat(262_143)}` });
+  const seen: string[] = [];
+  const unsubscribe = store.subscribeChannelData((_hostId, _uri, data) => seen.push(data));
+  const buffered = seen[0] ?? '';
+  assert.ok(buffered.length <= 256 * 1024 + 1, 'буфер остаётся ограниченным');
+  assert.equal(buffered.charCodeAt(0), 0xd83d, 'старшая половина эмодзи на месте');
+  assert.equal(buffered.charCodeAt(1), 0xde00, 'младшая половина эмодзи на месте');
+  unsubscribe();
+  store.forgetChannelData('one', terminal);
+  release();
+});
+
+test('снимок терминала начинает новую точку отсчёта, а action её не сдвигает', () => {
+  const terminal = 'ahp-terminal:/epoch';
+  const release = store.watch('one', terminal);
+  const base: TerminalState = {
+    title: 'Терминал',
+    content: [{ type: 'unclassified', value: '$ ' }],
+    lifecycle: { status: TerminalLifecycleStatus.Running },
+    claim: { kind: TerminalClaimKind.Client, clientId: 'backend' },
+  };
+  receive({ t: 'snapshot', hostId: 'one', uri: terminal, state: base });
+  const first = store.getState().channels.get(channelKey('one', terminal))!;
+  assert.equal(typeof first.epoch, 'number');
+
+  // `resized` и `exited` меняют состояние, но экран перерисовывать не нужно.
+  receive({ t: 'action', hostId: 'one', uri: terminal, action: { type: ActionType.TerminalResized, cols: 100, rows: 30 } });
+  const resized = store.getState().channels.get(channelKey('one', terminal))!;
+  assert.equal(resized.epoch, first.epoch, 'action не сдвигает точку отсчёта');
+  assert.equal((resized.state as { cols?: number }).cols, 100);
+
+  // Повторный снимок (F5, reconnect) — новая точка отсчёта.
+  receive({ t: 'snapshot', hostId: 'one', uri: terminal, state: base });
+  assert.notEqual(store.getState().channels.get(channelKey('one', terminal))!.epoch, first.epoch);
+
+  // Кадр, пришедший до снимка, уже есть в его содержимом: иначе вывод задвоился бы.
+  receive({ t: 'terminalData', hostId: 'one', uri: terminal, data: 'stale' });
+  receive({ t: 'snapshot', hostId: 'one', uri: terminal, state: base });
+  const seen: string[] = [];
+  const unsubscribe = store.subscribeChannelData((_hostId, _uri, data) => seen.push(data));
+  assert.deepEqual(seen, [], 'кадры до снимка не доигрываются поверх него');
+  unsubscribe();
+  release();
 });
 
 test('отмена отчёта шлёт cancelUsage и не рвёт поиск', async () => {

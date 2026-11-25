@@ -33,3 +33,15 @@ export function rememberDirectory(storage: Storage, hostId: string, directory: s
   const paths = [directory, ...previous.filter(path => key(path) !== key(directory))].slice(0, LIMIT);
   storage.setItem(KEY, JSON.stringify({ ...all, [hostId]: paths }));
 }
+
+/**
+ * История папок вместе с причиной, почему её не удалось прочитать: формы показывают
+ * это отдельной строкой и не блокируют работу (приватный режим запрещает localStorage).
+ */
+export function directoryHistory(storage: Storage, hostId: string): { paths: string[]; error?: string } {
+  try {
+    return { paths: recentDirectories(storage, hostId) };
+  } catch (error) {
+    return { paths: [], error: `Не удалось прочитать недавние папки: ${error instanceof Error ? error.message : String(error)}` };
+  }
+}
