@@ -17,11 +17,12 @@ function source(path: string, hostId = 'local'): LogSource {
 }
 
 test('журналы доступны только фиксированным локальным хостам проекта', () => {
-  const hosts = [{ id: 'local', label: 'Основной' }, { id: 'gemini', label: 'CheapVibeCode' }] as LocalHost[];
+  const hosts = [{ id: 'local', label: 'Основной' }, { id: 'wbllm', label: 'WBLLM' }, { id: 'glm', label: 'GLM' }] as LocalHost[];
   const sources = localLogSources(hosts);
   assert.deepEqual(sources.map(item => [item.hostId, item.fileName, item.startCommand]), [
     ['local', '.local/host.log', 'npm run host -- --log'],
-    ['gemini', '.local/gemini-host.log', 'npm run host:gemini -- --log'],
+    ['wbllm', '.local/wbllm-host.log', 'npm run host:wbllm -- --log'],
+    ['glm', '.local/glm-host.log', 'npm run host:glm -- --log'],
   ]);
   for (const item of sources) assert.ok(isAbsolute(item.path), item.path);
   assert.deepEqual(localLogSources([]), []);

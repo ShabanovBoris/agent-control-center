@@ -7,6 +7,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { promisify } from 'node:util';
 import { agentPackages, defaultServerData, managedCache, platform, projectRoot, stableVersion } from '../scripts/agent-sdks.mjs';
 import type { HostEntry } from './config.js';
+import { isResponsesProvider, type ResponsesProviderId } from '../scripts/responses-providers.js';
 import type { HostBuild } from './host-build.js';
 
 type Agent = keyof typeof agentPackages;
@@ -24,7 +25,7 @@ const registryDir = resolve(userData, 'agent-host/local-endpoint/entries');
 const readProcess = promisify(execFile);
 
 export interface LocalHost {
-  id: 'local' | 'gemini';
+  id: 'local' | ResponsesProviderId;
   label: string;
   port: number;
   tokenFile: string;
@@ -42,15 +43,15 @@ export interface HostInstance {
 export function localHosts(entries: HostEntry[]): LocalHost[] {
   if (process.platform !== 'darwin') return [];
   return entries.flatMap(entry => {
-    if (!entry.localFilesystem || (entry.id !== 'local' && entry.id !== 'gemini')) return [];
+    if (!entry.localFilesystem || (entry.id !== 'local' && !isResponsesProvider(entry.id))) return [];
     const main = entry.id === 'local';
     const url = new URL(entry.url);
-    const tokenFile = resolve(projectRoot, main ? '.local/host-token' : '.local/gemini-host-token');
+    const tokenFile = resolve(projectRoot, main ? '.local/host-token' : `.local/${entry.id}-host-token`);
     if (entry.tokenFile !== tokenFile || url.protocol !== 'ws:' || url.hostname !== '127.0.0.1' || !url.port) return [];
     return [{
       id: entry.id, label: entry.label, port: Number(url.port), tokenFile,
-      serverData: main ? resolve(projectRoot, process.env.AHP_SERVER_DATA_DIR ?? defaultServerData) : resolve(projectRoot, '.local/gemini-host-data'),
-      agents: main ? ['codex', 'claude'] : ['codex'],
+      serverData: main ? resolve(projectRoot, process.env.AHP_SERVER_DATA_DIR ?? defaultServerData) : resolve(projectRoot, `.local/${entry.id}-host-data`),
+      agents: ['codex'],
     }];
   });
 }
@@ -74,13 +75,20 @@ async function jsonFile(path: string) {
 }
 
 export async function localInstance(host: LocalHost): Promise<HostInstance | undefined> {
-  const token = (await readFile(host.tokenFile, 'utf8')).trim();
-  if (!token) return undefined;
-  for (const file of await readdir(registryDir)) {
+  const token = await readFile(host.tokenFile, 'utf8').catch((error: unknown) => {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return '';
+    throw error;
+  });
+  if (!token.trim()) return undefined;
+  const files = await readdir(registryDir).catch((error: unknown) => {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    throw error;
+  });
+  for (const file of files) {
     if (!/^[a-f\d]+\.json$/i.test(file)) continue;
     const entry = await jsonFile(resolve(registryDir, file));
     if (entry?.type !== 'standalone' || entry.quality !== 'stable' || !Number.isSafeInteger(entry.pid) || entry.pid <= 1 ||
-        typeof entry.instanceId !== 'string' || entry.connectionToken !== token || entry.endpoint?.type !== 'tcp' ||
+        typeof entry.instanceId !== 'string' || entry.connectionToken !== token.trim() || entry.endpoint?.type !== 'tcp' ||
         entry.endpoint.host !== '127.0.0.1' || entry.endpoint.port !== host.port) continue;
     // ps выводит окружение владельца. Из него читаются только пути и флаги запуска.
     let command: string;
@@ -174,11 +182,11 @@ export async function startLocalHost(host: LocalHost, instance: HostInstance = d
   const main = host.id === 'local';
   const child = spawn(main ? '/bin/bash' : process.execPath, main
     ? ['scripts/start-host.sh', '--log']
-    : ['--import', 'tsx', 'scripts/start-gemini-host.ts', '--log'], {
+    : ['--import', 'tsx', 'scripts/start-responses-host.ts', host.id, '--log'], {
     cwd: projectRoot, detached: true, stdio: 'ignore',
     env: {
       ...process.env, ...instance.env, VSCODE_CLI: nativeVSCodeCli,
-      [main ? 'AHP_PORT' : 'GEMINI_AHP_PORT']: String(host.port),
+      [main ? 'AHP_PORT' : 'RESPONSES_AHP_PORT']: String(host.port),
       VSCODE_AGENT_HOST_CODEX_SDK_ROOT: customRoot('codex', instance.roots.codex, host, instance),
       VSCODE_AGENT_HOST_CLAUDE_SDK_ROOT: customRoot('claude', instance.roots.claude, host, instance),
     },
@@ -192,11 +200,11 @@ async function startHost(host: LocalHost, instance: HostInstance, fallback?: { b
   const main = host.id === 'local';
   const child = spawn(main ? '/bin/bash' : process.execPath, main
     ? ['scripts/start-host.sh', '--log']
-    : ['--import', 'tsx', 'scripts/start-gemini-host.ts', '--log'], {
+    : ['--import', 'tsx', 'scripts/start-responses-host.ts', host.id, '--log'], {
     cwd: projectRoot, detached: true, stdio: 'ignore',
     env: {
       ...process.env, ...instance.env, VSCODE_CLI: nativeVSCodeCli,
-      [main ? 'AHP_PORT' : 'GEMINI_AHP_PORT']: String(host.port),
+      [main ? 'AHP_PORT' : 'RESPONSES_AHP_PORT']: String(host.port),
       VSCODE_AGENT_HOST_CODEX_SDK_ROOT: fallback ? fallback.roots.codex : customRoot('codex', instance.roots.codex, host, instance),
       VSCODE_AGENT_HOST_CLAUDE_SDK_ROOT: fallback ? fallback.roots.claude : customRoot('claude', instance.roots.claude, host, instance),
       VSCODE_CLI_INITIAL_AH_VERSION: fallback?.build.commit,
@@ -249,5 +257,5 @@ export async function waitForLocalHost(
   if (await localInstance(host)) {
     throw new Error(`Хост «${host.label}» запущен, но не подключился к backend. Проверьте его настройки.`);
   }
-  throw new Error(`Хост «${host.label}» не запустился. Проверьте .local/${host.id === 'local' ? 'host' : 'gemini-host'}.log.`);
+  throw new Error(`Хост «${host.label}» не запустился. Проверьте .local/${host.id === 'local' ? 'host' : `${host.id}-host`}.log.`);
 }

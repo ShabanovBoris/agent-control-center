@@ -158,7 +158,7 @@ export async function installVersion(component, version) {
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   /** @type {UpdateComponent[]} */
-  const components = ['codex', 'claude', 'ahp'];
+  const components = ['codex', 'ahp'];
   const results = await Promise.allSettled(components.map(async component => {
     try {
       await installVersion(component, await latestVersion(component));

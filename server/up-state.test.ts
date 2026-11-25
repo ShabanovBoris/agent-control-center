@@ -169,9 +169,9 @@ test('release(false) сохраняет состояние для следующ
   fake.identities.set(100, 'owner');
   fake.identities.set(500, 'leader');
   const ownership = await acquire(file, 100, fake.table);
-  await ownership.record('host:gemini', { leaderPid: 500 });
+  await ownership.record('host:wbllm', { leaderPid: 500 });
   await ownership.release(false);
-  assert.equal((await readUpState(file))?.children['host:gemini']?.leader.pid, 500);
+  assert.equal((await readUpState(file))?.children['host:wbllm']?.leader.pid, 500);
 });
 
 test('состояние с неизвестной версией игнорируется', async t => {

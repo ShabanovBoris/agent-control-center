@@ -78,18 +78,19 @@ export class ProjectUpdates {
     if (this.applying) throw new Error('Обновление уже выполняется.');
     const connected = this.hosts.filter(host => this.hub.hostGeneration(host.id) !== undefined);
     if (connected.length === 0) throw new Error('Для проверки подключите локальный Agent Host этого проекта.');
-    const [states, release, ahp, codex, claude] = await Promise.all([
+    const agents = [...new Set(connected.flatMap(host => host.agents))];
+    const [states, release, ahp, releases] = await Promise.all([
       Promise.all(connected.map(host => this.inspect(host))), latestHostBuild(), latestVersion('ahp'),
-      latestVersion('codex'), latestVersion('claude'),
+      Promise.all(agents.map(async agent => [agent, await latestVersion(agent)] as const)),
     ]);
-    const latest = { codex, claude };
+    const latest = new Map(releases);
     const changes: UpdateCheck['changes'] = [];
     const install: UpdateVersions = {};
     const targets: RestartTarget[] = [];
 
     for (const state of states) {
       const { host, instance, build, versions } = state;
-      const label = host.id === 'gemini' ? 'CheapVibeCode' : 'Основной хост';
+      const label = host.id === 'local' ? 'Основной хост' : host.label;
       const target: RestartTarget = { state, versions: {} };
       if (release.commit !== build.commit && compareVersions(release.version, build.version) >= 0) {
         target.build = release;
@@ -97,14 +98,15 @@ export class ProjectUpdates {
       }
       for (const agent of host.agents) {
         if (!canUpdateSdk(agent, host, instance)) continue;
+        const version = latest.get(agent)!;
         const cached = await resolveAgentSdk(agent, host.serverData);
         const cachedVersion = cached?.split('/').at(-2);
-        const available = cachedVersion && stableVersion.test(cachedVersion) && compareVersions(cachedVersion, latest[agent]) > 0
-          ? cachedVersion : latest[agent];
+        const available = cachedVersion && stableVersion.test(cachedVersion) && compareVersions(cachedVersion, version) > 0
+          ? cachedVersion : version;
         const current = versions[agent];
         if (current !== null && compareVersions(available, current) <= 0) continue;
         target.versions[agent] = available;
-        if (available === latest[agent]) install[agent] = available;
+        if (available === version) install[agent] = available;
         changes.push({ name: `${agentNames[agent]} · ${label}`, current, available });
       }
       if (target.build || Object.keys(target.versions).length > 0) targets.push(target);

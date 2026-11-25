@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "host": "bash scripts/start-host.sh",
-    "host:gemini": "node --import tsx scripts/start-gemini-host.ts",
+    "host:wbllm": "node --import tsx scripts/start-responses-host.ts wbllm",
+    "host:glm": "node --import tsx scripts/start-responses-host.ts glm",
     "update:agents": "node scripts/update-agents.mjs",
     "restart:services": "node --import tsx scripts/restart-services.ts",
     "up": "node --import tsx scripts/up.ts",
@@ -26,6 +27,8 @@
   },
   "dependencies": {
     "@microsoft/agent-host-protocol": "^1.1.0",
+    "@xterm/addon-fit": "0.11.0",
+    "@xterm/xterm": "6.0.0",
     "diff": "9.0.0",
     "hast-util-to-jsx-runtime": "2.3.7",
     "highlight.js": "11.11.2",
