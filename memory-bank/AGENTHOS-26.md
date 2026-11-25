@@ -1,5 +1,9 @@
 # AGENTHOS-26 — терминал на `#terminal`
 
+> Кнопка «Закрыть терминал» из шапки страницы, описанная ниже, позже переехала: `×` стоит
+> на каждой строке списка и закрывает именно её PTY (см. `progress.md`, запись от 25 ноября
+> 2026). Остальное описание задачи остаётся историческим.
+
 ## Чеклист реализации
 
 - [x] 1. `shared/reduce.ts`: `terminalReducer`, `ahp-terminal:` в `isSupportedChannel`/`reduceChannel` (+ `server/reduce.test.ts`)
