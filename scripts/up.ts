@@ -23,7 +23,8 @@ import { probeBackendOverview } from './backend-probe.js';
 
 const SERVICE_PREFIX: Record<UpService, string> = {
   'host:local': '[host:local]',
-  'host:gemini': '[host:gemini]',
+  'host:wbllm': '[host:wbllm]',
+  'host:glm': '[host:glm]',
   backend: '[backend]',
   web: '[web]',
 };
@@ -140,7 +141,7 @@ async function main(): Promise<number> {
 
   const backend = formatHostPort(config.listen.host, config.listen.port);
   const logSources = localLogSources(hosts);
-  const serviceOf = (host: LocalHost): UpService => host.id === 'local' ? 'host:local' : 'host:gemini';
+  const serviceOf = (host: LocalHost): UpService => `host:${host.id}`;
   // launchd пишет stdout в файл без времени; ISO-метка делает журнал пригодным для диагностики.
   const log = (line: string): void => {
     console.log(args.supervised ? `${new Date().toISOString()} ${line}` : line);
@@ -192,7 +193,7 @@ async function main(): Promise<number> {
     },
     spawnHost: (host, env) => serviceOf(host) === 'host:local'
       ? spawnService('host:local', '/bin/bash', ['scripts/start-host.sh', '--log'], env, log)
-      : spawnService('host:gemini', process.execPath, ['--import', 'tsx', 'scripts/start-gemini-host.ts', '--log'], env, log),
+      : spawnService(serviceOf(host), process.execPath, ['--import', 'tsx', 'scripts/start-responses-host.ts', host.id, '--log'], env, log),
     spawnBackend: env => spawnService('backend', process.execPath, ['--import', 'tsx', 'server/index.ts'], {
       ...env,
       ...(args.supervised ? { [UP_SUPERVISED_ENV]: '1' } : {}),

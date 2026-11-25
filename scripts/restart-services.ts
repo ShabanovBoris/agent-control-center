@@ -11,7 +11,7 @@ process.chdir(projectRoot);
 const config = await loadConfig(process.env.ACC_CONFIG ?? 'hosts.json');
 const hosts = localHosts(config.hosts);
 if (hosts.length !== config.hosts.length || hosts.length === 0) {
-  throw new Error('restart:services управляет только локальными хостами local и gemini из hosts.json.');
+  throw new Error('restart:services управляет только локальными хостами local, wbllm и glm из hosts.json.');
 }
 
 const base = process.env.ACC_BACKEND ?? `${config.listen.host}:${config.listen.port}`;
@@ -63,7 +63,7 @@ for (;;) {
   try {
     const state = await overview();
     if (hosts.every(host => state.hosts.some(item => item.id === host.id && item.status === 'connected'))) {
-      console.log('[services] Оба хоста и backend доступны.');
+      console.log('[services] Все хосты и backend доступны.');
       break;
     }
     console.log('[services] Backend отвечает; ожидание подключения хостов.');
@@ -71,7 +71,7 @@ for (;;) {
     error = cause;
   }
   if (Date.now() >= deadline) {
-    throw new Error('Не все хосты подключились за отведённое время. Проверьте .local/host.log и .local/gemini-host.log.', { cause: error });
+    throw new Error('Не все хосты подключились за отведённое время. Проверьте .local/host.log и .local/wbllm-host.log и .local/glm-host.log.', { cause: error });
   }
   await delay(500);
 }

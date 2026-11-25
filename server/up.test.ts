@@ -15,29 +15,33 @@ import { readUpState, upOwnershipSource, type ProcessTable, type UpOwnership, ty
 
 const localHost: LocalHost = {
   id: 'local', label: 'Local', port: 8089,
-  tokenFile: '/project/.local/host-token', serverData: '/project/.local/host-data', agents: ['codex', 'claude'],
+  tokenFile: '/project/.local/host-token', serverData: '/project/.local/host-data', agents: ['codex'],
 };
-const geminiHost: LocalHost = {
-  id: 'gemini', label: 'Gemini', port: 8091,
-  tokenFile: '/project/.local/gemini-host-token', serverData: '/project/.local/gemini-host-data', agents: ['codex'],
+const wbllmHost: LocalHost = {
+  id: 'wbllm', label: 'WBLLM', port: 8093,
+  tokenFile: '/project/.local/wbllm-host-token', serverData: '/project/.local/wbllm-host-data', agents: ['codex'],
 };
-const hosts = [localHost, geminiHost];
+const glmHost: LocalHost = {
+  id: 'glm', label: 'GLM', port: 8094,
+  tokenFile: '/project/.local/glm-host-token', serverData: '/project/.local/glm-host-data', agents: ['codex'],
+};
+const hosts = [localHost, wbllmHost];
 const config: AppConfig = { listen: { host: '127.0.0.1', port: 8090 }, hosts: [] };
 
 const overview: Overview = {
   hosts: [
     { id: 'local', label: 'Local', status: 'connected', agents: [] },
-    { id: 'gemini', label: 'Gemini', status: 'connected', agents: [] },
+    { id: 'wbllm', label: 'WBLLM', status: 'connected', agents: [] },
   ],
   sessions: [],
 };
 
 function serviceOf(host: LocalHost): UpService {
-  return host.id === 'local' ? 'host:local' : 'host:gemini';
+  return `host:${host.id}`;
 }
 
 function instance(host: LocalHost): HostInstance {
-  return { id: `fake-${host.id}`, pid: host.id === 'local' ? 8101 : 8102, roots: {}, env: {} };
+  return { id: `fake-${host.id}`, pid: host.id === 'local' ? 8101 : host.id === 'wbllm' ? 8102 : 8103, roots: {}, env: {} };
 }
 
 class FakeChild implements UpChild {
@@ -132,7 +136,7 @@ class Harness {
     this.owned = new Set(patch.owned ?? []);
     for (const service of patch.live ?? []) {
       if (service === 'host:local') this.alivePids.add(instance(localHost).pid);
-      if (service === 'host:gemini') this.alivePids.add(instance(geminiHost).pid);
+      if (service === 'host:wbllm') this.alivePids.add(instance(wbllmHost).pid);
     }
     const ownership: UpOwnership = {
       owner: { pid: 4242, startedAt: 'test' },
@@ -158,7 +162,7 @@ class Harness {
       hosts,
       env: patch.env ?? {},
       providerEnvFile: '.local/model-provider.env',
-      providerEnv: 'providerEnv' in patch ? patch.providerEnv : { API_KEY: 'key', BASE_URL: 'https://provider.test/v1' },
+      providerEnv: 'providerEnv' in patch ? patch.providerEnv : { WBLLM_API_KEY: 'wb-key' },
       signal: this.controller.signal,
       timeouts: {
         hostStartMs: 500, backendStartMs: 500, webStartMs: 500,
@@ -207,7 +211,7 @@ class Harness {
   reviveHost(service: UpService): void {
     this.dead.delete(service);
     if (service === 'host:local') this.alivePids.add(instance(localHost).pid);
-    if (service === 'host:gemini') this.alivePids.add(instance(geminiHost).pid);
+    if (service === 'host:wbllm') this.alivePids.add(instance(wbllmHost).pid);
   }
 
   text(): string {
@@ -240,7 +244,7 @@ class Harness {
         return true;
       },
       hostLog: async host => ({
-        fileName: host.id === 'local' ? '.local/host.log' : '.local/gemini-host.log',
+        fileName: host.id === 'local' ? '.local/host.log' : `.local/${host.id}-host.log`,
         lines: ['журнал хоста'],
       }),
       signalPid: (pid, signal) => {
@@ -302,11 +306,23 @@ test('нет provider env или ключей — ошибка до spawn', asyn
   assert.equal(await absent.run(), 1);
   assert.equal(absent.spawns.length, 0);
   assert.ok(absent.text().includes('model-provider.env.example'), absent.text());
-  for (const providerEnv of [{ API_KEY: 'key' }, { BASE_URL: 'https://provider.test/v1' }]) {
+  for (const providerEnv of [{}, { WBLLM_API_KEY: ' ' }]) {
     const harness = new Harness({ providerEnv });
     assert.equal(await harness.run(), 1);
     assert.equal(harness.spawns.length, 0);
     assert.ok(harness.text().includes('.local/model-provider.env'), harness.text());
+  }
+});
+
+test('up принимает ключ провайдера из окружения без файла', async () => {
+  const harness = new Harness({ ready: true, providerEnv: undefined, env: { WBLLM_API_KEY: 'wb-key' } });
+  const running = harness.run();
+  try {
+    await harness.waitReady();
+    assert.deepEqual(harness.spawns, ['host:local', 'host:wbllm', 'backend', 'web']);
+  } finally {
+    harness.controller.abort(new UpStop('SIGINT'));
+    assert.equal(await running, 0);
   }
 });
 
@@ -344,7 +360,7 @@ test('занятый чужой порт web — отказ до spawn с под
 });
 
 test('полностью живой стенд — no-op с кодом 0', async () => {
-  const harness = new Harness({ live: ['host:local', 'host:gemini', 'backend', 'web'] });
+  const harness = new Harness({ live: ['host:local', 'host:wbllm', 'backend', 'web'] });
   assert.equal(await harness.run(), 0);
   assert.equal(harness.spawns.length, 0);
   assert.ok(harness.text().includes('уже запущен'));
@@ -360,31 +376,31 @@ test('частично живой стенд — отказ без spawn и сп
   assert.ok(harness.text().includes('web'));
 });
 
-test('запуск: порядок local → gemini → backend → web, env и сигналы остановки', async () => {
+test('запуск: порядок local → wbllm → backend → web, env и сигналы остановки', async () => {
   const harness = new Harness({ ready: true });
   const running = harness.run();
   await harness.waitReady();
-  assert.deepEqual(harness.spawns, ['host:local', 'host:gemini', 'backend', 'web']);
+  assert.deepEqual(harness.spawns, ['host:local', 'host:wbllm', 'backend', 'web']);
 
   const localEnv = harness.envs.get('host:local')!;
   assert.equal(localEnv.AHP_PORT, '8089');
   assert.equal(localEnv.AHP_SERVER_DATA_DIR, localHost.serverData);
   assert.equal(localEnv.VSCODE_CLI, nativeVSCodeCli);
-  const geminiEnv = harness.envs.get('host:gemini')!;
-  assert.equal(geminiEnv.GEMINI_AHP_PORT, '8091');
-  assert.equal(geminiEnv.AHP_PORT, undefined);
+  const wbllmEnv = harness.envs.get('host:wbllm')!;
+  assert.equal(wbllmEnv.RESPONSES_AHP_PORT, '8093');
+  assert.equal(wbllmEnv.AHP_PORT, undefined);
   assert.equal(harness.envs.get('backend')!.ACC_BACKEND, undefined);
   assert.equal(harness.envs.get('web')!.ACC_BACKEND, '127.0.0.1:8090');
 
   const summary = harness.text();
-  for (const address of ['http://127.0.0.1:5173', 'ws://127.0.0.1:8090/ws', 'ws://127.0.0.1:8089', 'ws://127.0.0.1:8091']) {
+  for (const address of ['http://127.0.0.1:5173', 'ws://127.0.0.1:8090/ws', 'ws://127.0.0.1:8089', 'ws://127.0.0.1:8093']) {
     assert.ok(summary.includes(address), address);
   }
 
   harness.controller.abort(new UpStop('SIGINT'));
   assert.equal(await running, 0);
   assert.deepEqual(signalsOf(harness, 'host:local'), ['SIGINT']);
-  assert.deepEqual(signalsOf(harness, 'host:gemini'), ['SIGINT']);
+  assert.deepEqual(signalsOf(harness, 'host:wbllm'), ['SIGINT']);
   assert.deepEqual(signalsOf(harness, 'backend'), ['SIGTERM']);
   assert.deepEqual(signalsOf(harness, 'web'), ['SIGTERM']);
   assert.ok(harness.text().includes('порты свободны'));
@@ -457,9 +473,9 @@ test('ACC_PORT и ACC_MOCK_HOST_URL отклоняются до spawn', async ()
 });
 
 test('спавн с ошибкой сообщает сервис и код 1', async () => {
-  const harness = new Harness({ ready: true, spawnFails: 'host:gemini' });
+  const harness = new Harness({ ready: true, spawnFails: 'host:wbllm' });
   assert.equal(await harness.run(), 1);
-  assert.ok(harness.text().includes('Не удалось запустить host:gemini'));
+  assert.ok(harness.text().includes('Не удалось запустить host:wbllm'));
   assert.deepEqual(signalsOf(harness, 'host:local'), ['SIGINT']);
 });
 
@@ -483,7 +499,7 @@ test('supervised: падение web после готовности перез�
   assert.notEqual(second.pid, first.pid);
   assert.equal(harness.spawns.filter(service => service === 'web').length, 2);
   assert.deepEqual(signalsOf(harness, 'host:local'), []);
-  assert.deepEqual(signalsOf(harness, 'host:gemini'), []);
+  assert.deepEqual(signalsOf(harness, 'host:wbllm'), []);
   assert.deepEqual(signalsOf(harness, 'backend'), []);
   assert.ok(harness.text().includes('Перезапуск 1/3'), harness.text());
   assert.ok(harness.text().includes('web снова в строю'), harness.text());
@@ -567,7 +583,7 @@ test('C-01: запись владения backend и web создаётся до
 test('C-01: сбой записи владения гасит ребёнка и возвращает 1', async () => {
   const harness = new Harness({ ready: true, supervised: true, recordFails: 'backend' });
   assert.equal(await harness.run(), 1);
-  assert.deepEqual(harness.spawns, ['host:local', 'host:gemini', 'backend']);
+  assert.deepEqual(harness.spawns, ['host:local', 'host:wbllm', 'backend']);
   assert.deepEqual(signalsOf(harness, 'backend'), ['SIGTERM'], 'неучтённый backend должен быть погашен');
   assert.deepEqual(signalsOf(harness, 'host:local'), []);
   assert.ok(harness.text().includes('Не удалось сохранить владение backend'), harness.text());
@@ -579,9 +595,9 @@ test('C-01: подтверждённый backend с живым лидером п
   const running = harness.run();
   await harness.waitReady();
   assert.deepEqual(harness.groupSignals, [{ pid: 7100, signal: 'SIGTERM' }]);
-  assert.deepEqual(harness.spawns, ['host:local', 'host:gemini', 'backend', 'web']);
+  assert.deepEqual(harness.spawns, ['host:local', 'host:wbllm', 'backend', 'web']);
   assert.deepEqual(signalsOf(harness, 'host:local'), []);
-  assert.deepEqual(signalsOf(harness, 'host:gemini'), []);
+  assert.deepEqual(signalsOf(harness, 'host:wbllm'), []);
   assert.ok(harness.text().includes('Останавливаю прежний backend (pid 7100)'), harness.text());
   assert.ok(harness.text().includes('Стенд готов'), harness.text());
   harness.controller.abort(new UpStop('SIGTERM'));
@@ -639,7 +655,7 @@ test('C-01: запись backend переживает смерть up, новы�
   const backend = new FakeChild('backend', 7000);
   const first = new Harness({
     supervised: true,
-    live: ['host:local', 'host:gemini'],
+    live: ['host:local', 'host:wbllm'],
     deps: {
       spawnBackend: () => backend,
       probeBackend: async () => { throw new Error('backend ещё не готов'); },
@@ -658,7 +674,7 @@ test('C-01: запись backend переживает смерть up, новы�
   const second = new Harness({
     supervised: true,
     ready: true,
-    live: ['host:local', 'host:gemini', 'backend'],
+    live: ['host:local', 'host:wbllm', 'backend'],
     ownershipSource: upOwnershipSource({ file, ownerPid: 3000, table, log: () => undefined }),
   });
   const running = second.run();
@@ -666,13 +682,13 @@ test('C-01: запись backend переживает смерть up, новы�
   assert.deepEqual(second.groupSignals, [{ pid: 7000, signal: 'SIGTERM' }], second.text());
   assert.deepEqual(second.spawns, ['backend', 'web']);
   assert.deepEqual(signalsOf(second, 'host:local'), []);
-  assert.deepEqual(signalsOf(second, 'host:gemini'), []);
+  assert.deepEqual(signalsOf(second, 'host:wbllm'), []);
   second.controller.abort(new UpStop('SIGTERM'));
   assert.equal(await running, 0);
 });
 
 test('supervised: живой хост без записи принимается и не спавнится', async () => {
-  const harness = new Harness({ ready: true, supervised: true, live: ['host:local', 'host:gemini'] });
+  const harness = new Harness({ ready: true, supervised: true, live: ['host:local', 'host:wbllm'] });
   const running = harness.run();
   await harness.waitReady();
   assert.deepEqual(harness.spawns, ['backend', 'web']);
@@ -688,14 +704,14 @@ test('supervised: плановый restarting не спавнит второй �
   const harness = new Harness({ ready: true, supervised: true });
   const running = harness.run();
   await harness.waitReady();
-  harness.setRestarting('gemini', true);
-  harness.exit('host:gemini', 1);
+  harness.setRestarting('wbllm', true);
+  harness.exit('host:wbllm', 1);
   await delay(40);
-  harness.reviveHost('host:gemini');
+  harness.reviveHost('host:wbllm');
   await delay(40);
-  assert.equal(harness.spawns.filter(service => service === 'host:gemini').length, 1);
+  assert.equal(harness.spawns.filter(service => service === 'host:wbllm').length, 1);
   assert.ok(harness.text().includes('перезапускается планово'), harness.text());
-  assert.ok(harness.text().includes('Принимаю под наблюдение host:gemini'), harness.text());
+  assert.ok(harness.text().includes('Принимаю под наблюдение host:wbllm'), harness.text());
   harness.controller.abort(new UpStop('SIGTERM'));
   assert.equal(await running, 0);
 });
@@ -718,4 +734,42 @@ test('supervised: другой up — код 0 без проб и спавна',
   assert.equal(harness.spawns.length, 0);
   assert.ok(harness.text().includes('pid 777'), harness.text());
   assert.equal(harness.released, undefined);
+});
+
+test('up запускает WBLLM и GLM с раздельными портами и ждёт подключения обоих', async () => {
+  const harness = new Harness({ ready: true, env: { GLM_API_KEY: 'glm-key' } });
+  harness.options.hosts = [...hosts, glmHost];
+  const glmOverview: Overview['hosts'][number] = { id: 'glm', label: 'GLM', status: 'reconnecting', agents: [] };
+  harness.backendOverview.hosts.push(glmOverview);
+  const probeBackend = harness.options.deps.probeBackend;
+  let markProbed!: () => void;
+  const probed = new Promise<void>(resolve => { markProbed = resolve; });
+  harness.options.deps.probeBackend = async () => {
+    const result = await probeBackend();
+    markProbed();
+    return result;
+  };
+  const running = harness.run();
+  try {
+    await waitForChild(harness, 'backend');
+    await probed;
+    assert.equal(harness.spawns.includes('web'), false);
+    glmOverview.status = 'connected';
+    await harness.waitReady();
+    assert.deepEqual(harness.spawns, ['host:local', 'host:wbllm', 'host:glm', 'backend', 'web']);
+    assert.equal(harness.envs.get('host:glm')?.RESPONSES_AHP_PORT, '8094');
+    assert.equal(harness.envs.get('host:wbllm')?.RESPONSES_AHP_PORT, '8093');
+  } finally {
+    harness.controller.abort(new UpStop('SIGINT'));
+    assert.equal(await running, 0);
+  }
+  assert.deepEqual(signalsOf(harness, 'host:glm'), ['SIGINT']);
+});
+
+test('up отклоняет запуск настроенного GLM без ключа', async () => {
+  const harness = new Harness();
+  harness.options.hosts = [...hosts, glmHost];
+  assert.equal(await harness.run(), 1);
+  assert.deepEqual(harness.spawns, []);
+  assert.ok(harness.text().includes('GLM_API_KEY'));
 });

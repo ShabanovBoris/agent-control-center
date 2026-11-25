@@ -5,8 +5,9 @@ import { nativeVSCodeCli, stableVSCodeCli, type HostInstance, type LocalHost } f
 import { BACKEND_RESTART_EXIT_CODE } from './up-contract.js';
 import { RestartBudget } from './up-restart.js';
 import type { UpOwnership, UpOwnershipSource } from './up-state.js';
+import { isResponsesProvider, responsesProviders } from '../scripts/responses-providers.js';
 
-export type UpService = 'host:local' | 'host:gemini' | 'backend' | 'web';
+export type UpService = `host:${LocalHost['id']}` | 'backend' | 'web';
 
 /** Единый порт Vite: его проверяют `up`, `autostart` и `launchd`. */
 export const WEB_PORT = 5173;
@@ -111,7 +112,7 @@ export const DEFAULT_UP_TIMEOUTS: UpTimeouts = {
 
 export const UP_USAGE = `Использование: npm run up [--supervised] [--keep-awake] [--help]
 
-Поднимает локальные хосты local и gemini, backend и web (Vite) и гасит всё по Ctrl+C/SIGTERM.
+Поднимает локальные хосты из hosts.json, backend и web (Vite) и гасит всё по Ctrl+C/SIGTERM.
   --supervised    режим launchd: принимать живые хосты и перезапускать только упавший сервис
   --keep-awake    не давать macOS уснуть, пока жив up (caffeinate; только macOS)
   -h, --help      показать справку
@@ -120,7 +121,7 @@ export const UP_USAGE = `Использование: npm run up [--supervised] [
 Режим --prod не поддерживается; для production используйте npm run build и npm run server.
 
 Переменные: VSCODE_CLI — только VS Code Stable по стандартному пути (или его bin/code).
-AHP_PROVIDER_ENV_FILE — путь к .local/model-provider.env (нужны API_KEY и BASE_URL).`;
+AHP_PROVIDER_ENV_FILE — путь к .local/model-provider.env (ключи WBLLM_API_KEY и GLM_API_KEY для дополнительных хостов).`;
 
 export type UpArgs =
   | { kind: 'help' }
@@ -262,11 +263,11 @@ function exitText(exit: UpExit): string {
 }
 
 function serviceOf(host: LocalHost): UpService {
-  return host.id === 'local' ? 'host:local' : 'host:gemini';
+  return `host:${host.id}`;
 }
 
 function hostLogName(host: LocalHost): string {
-  return `.local/${host.id === 'local' ? 'host' : 'gemini-host'}.log`;
+  return `.local/${host.id === 'local' ? 'host' : `${host.id}-host`}.log`;
 }
 
 interface RunOutcome {
@@ -297,14 +298,11 @@ async function runUpCore(options: RunUpOptions, outcome: RunOutcome): Promise<nu
   const webPort = options.webPort ?? WEB_PORT;
 
   // 1. Локальные хосты: остальные записи hosts.json могут быть удалёнными.
-  const local = hosts.find(host => host.id === 'local');
-  const gemini = hosts.find(host => host.id === 'gemini');
-  if (!local || !gemini) {
-    deps.log('[up] up управляет только локальными хостами local и gemini из hosts.json на macOS. Проверьте localFilesystem и tokenFile.');
+  if (!hosts.some(host => host.id === 'local') ||
+      config.hosts.some(entry => (entry.id === 'local' || isResponsesProvider(entry.id)) && !hosts.some(host => host.id === entry.id))) {
+    deps.log('[up] Проверьте локальные хосты из hosts.json на macOS: localFilesystem и tokenFile.');
     return 1;
   }
-  const localHost: LocalHost = local;
-  const geminiHost: LocalHost = gemini;
 
   // 2. env-переопределения, которые ломают владение стендом.
   const accPort = env.ACC_PORT?.trim();
@@ -318,13 +316,14 @@ async function runUpCore(options: RunUpOptions, outcome: RunOutcome): Promise<nu
   }
 
   // 3. Провайдер: значения не печатаем.
-  if (!providerEnv) {
-    deps.log(`[up] Не найден файл провайдера ${providerEnvFile}. Создайте его по образцу model-provider.env.example: нужны API_KEY и BASE_URL.`);
-    return 1;
+  const missing: string[] = [];
+  for (const host of hosts) {
+    if (!isResponsesProvider(host.id)) continue;
+    const key = responsesProviders[host.id].envKey;
+    if (!(env[key] || providerEnv?.[key])?.trim()) missing.push(key);
   }
-  const missing = ['API_KEY', 'BASE_URL'].filter(name => !providerEnv[name]?.trim());
   if (missing.length > 0) {
-    deps.log(`[up] В ${providerEnvFile} не заданы ${missing.join(' и ')}. Оба локальных хоста без них не запустятся.`);
+    deps.log(`[up] Укажите ${missing.join(' и ')} в окружении или в ${providerEnvFile} (образец: model-provider.env.example).`);
     return 1;
   }
 
@@ -378,15 +377,13 @@ async function runUpCore(options: RunUpOptions, outcome: RunOutcome): Promise<nu
   }
 
   // 7. Текущее состояние. Проба backend недоступна, пока backend не запущен.
-  let localInstance: HostInstance | undefined;
-  let geminiInstance: HostInstance | undefined;
+  let instances: (HostInstance | undefined)[];
   let overview: Overview | undefined;
   let backendError: string | undefined;
   let webAlive = false;
   try {
-    [localInstance, geminiInstance, overview, webAlive] = await Promise.all([
-      deps.inspectHost(localHost),
-      deps.inspectHost(geminiHost),
+    [instances, overview, webAlive] = await Promise.all([
+      Promise.all(hosts.map(host => deps.inspectHost(host))),
       deps.probeBackend().catch((error: unknown) => { backendError = text(error); return undefined; }),
       deps.probeWeb().catch(() => false),
     ]);
@@ -396,15 +393,16 @@ async function runUpCore(options: RunUpOptions, outcome: RunOutcome): Promise<nu
   }
 
   const overviewStatus = (id: LocalHost['id']) => overview?.hosts.find(host => host.id === id)?.status;
-  const backendReady = overviewStatus('local') === 'connected' && overviewStatus('gemini') === 'connected';
+  const backendReady = hosts.every(host => overviewStatus(host.id) === 'connected');
   const states: ServiceState[] = [
-    { service: 'host:local', label: 'local', port: localHost.port, host: '127.0.0.1', live: localInstance !== undefined, portBusy: false,
-      ...(localInstance ? { note: `pid ${localInstance.pid}` } : {}) },
-    { service: 'host:gemini', label: 'gemini', port: geminiHost.port, host: '127.0.0.1', live: geminiInstance !== undefined, portBusy: false,
-      ...(geminiInstance ? { note: `pid ${geminiInstance.pid}` } : {}) },
+    ...hosts.map((host, index): ServiceState => ({
+      service: serviceOf(host), label: host.id, port: host.port, host: '127.0.0.1',
+      live: instances[index] !== undefined, portBusy: false,
+      ...(instances[index] ? { note: `pid ${instances[index].pid}` } : {}),
+    })),
     { service: 'backend', label: 'backend', port: config.listen.port, host: config.listen.host, live: backendReady, portBusy: false,
       ...(overview
-        ? { note: `отвечает, хосты: local ${overviewStatus('local') ?? 'нет'}, gemini ${overviewStatus('gemini') ?? 'нет'}` }
+        ? { note: `отвечает, хосты: ${hosts.map(host => `${host.id} ${overviewStatus(host.id) ?? 'нет'}`).join(', ')}` }
         : backendError ? { note: 'недоступен' } : {}) },
     { service: 'web', label: 'web', port: webPort, host: '127.0.0.1', live: webAlive, portBusy: false },
   ];
@@ -629,7 +627,7 @@ async function runUpCore(options: RunUpOptions, outcome: RunOutcome): Promise<nu
       VSCODE_CLI: cli.cli,
       ...(host.id === 'local'
         ? { AHP_PORT: String(host.port), AHP_SERVER_DATA_DIR: host.serverData }
-        : { GEMINI_AHP_PORT: String(host.port) }),
+        : { RESPONSES_AHP_PORT: String(host.port) }),
     };
     const spawned = await spawnStage(service, () => deps.spawnHost(host, childEnv), attempt, host);
     if ('error' in spawned) {
@@ -673,12 +671,11 @@ async function runUpCore(options: RunUpOptions, outcome: RunOutcome): Promise<nu
     const started = await waitFor(timeouts.backendStartMs, async () => {
       try {
         const state = await deps.probeBackend();
-        lastBackendNote = `Backend отвечает, хосты: local ${state.hosts.find(host => host.id === 'local')?.status ?? 'нет'}, gemini ${state.hosts.find(host => host.id === 'gemini')?.status ?? 'нет'}.`;
+        lastBackendNote = `Backend отвечает, хосты: ${hosts.map(host => `${host.id} ${state.hosts.find(item => item.id === host.id)?.status ?? 'нет'}`).join(', ')}.`;
         // При восстановлении достаточно ответа backend: иначе недоступный хост
         // заставлял бы бесконечно перезапускать живой backend.
         if (retry) return true;
-        return state.hosts.some(host => host.id === 'local' && host.status === 'connected') &&
-          state.hosts.some(host => host.id === 'gemini' && host.status === 'connected');
+        return hosts.every(host => state.hosts.some(item => item.id === host.id && item.status === 'connected'));
       } catch (error) {
         lastBackendNote = `Backend недоступен: ${text(error)}`;
         return false;
@@ -693,11 +690,10 @@ async function runUpCore(options: RunUpOptions, outcome: RunOutcome): Promise<nu
       ? `backend завершился (${exitText(attempt.exit)}). ${lastBackendNote}`
       : signal.aborted || stopping
         ? 'запуск backend остановлен.'
-        : `Backend не подключил local и gemini за ${Math.round(timeouts.backendStartMs / 1000)} с. ${lastBackendNote}`;
+        : `Backend не подключил ${hosts.map(host => host.id).join(', ')} за ${Math.round(timeouts.backendStartMs / 1000)} с. ${lastBackendNote}`;
     if (!retry && !signal.aborted && !stopping) {
       fail(reason);
-      await logHostTail(localHost);
-      await logHostTail(geminiHost);
+      for (const host of hosts) await logHostTail(host);
     } else deps.log(`[up] Попытка запуска backend не удалась: ${reason}`);
     return { ok: false, reason };
   };
@@ -855,12 +851,13 @@ async function runUpCore(options: RunUpOptions, outcome: RunOutcome): Promise<nu
 
   try {
     if (supervised) {
-      if (localInstance) adoptHost(localHost, localInstance);
-      if (geminiInstance) adoptHost(geminiHost, geminiInstance);
+      hosts.forEach((host, index) => {
+        const instance = instances[index];
+        if (instance) adoptHost(host, instance);
+      });
     }
     const stages: (() => Promise<StartResult>)[] = [
-      ...(supervised && localInstance ? [] : [() => startHost(localHost)]),
-      ...(supervised && geminiInstance ? [] : [() => startHost(geminiHost)]),
+      ...hosts.filter((_, index) => !supervised || !instances[index]).map(host => () => startHost(host)),
       () => startBackend(false),
       () => startWeb(false),
     ];
@@ -896,9 +893,8 @@ async function runUpCore(options: RunUpOptions, outcome: RunOutcome): Promise<nu
       '[up] Стенд готов:',
       `  web      http://127.0.0.1:${webPort}`,
       `  backend  ws://${formatHostPort(config.listen.host, config.listen.port)}/ws${options.phonePort !== undefined ? ` (+ телефон 127.0.0.1:${options.phonePort})` : ''}`,
-      `  local    ws://127.0.0.1:${localHost.port} (pid ${readyHosts.get('local')?.pid ?? '?'})`,
-      `  gemini   ws://127.0.0.1:${geminiHost.port} (pid ${readyHosts.get('gemini')?.pid ?? '?'})`,
-      '  журналы  .local/host.log, .local/gemini-host.log',
+      ...hosts.map(host => `  ${host.id.padEnd(8)} ws://127.0.0.1:${host.port} (pid ${readyHosts.get(host.id)?.pid ?? '?'})`),
+      `  журналы  ${hosts.map(hostLogName).join(', ')}`,
       '  Ctrl+C — остановить всё.',
     ].join('\n');
   }
@@ -906,8 +902,7 @@ async function runUpCore(options: RunUpOptions, outcome: RunOutcome): Promise<nu
   function liveSummary(): string {
     return [
       '[up] Стенд уже запущен, ничего не запускаю:',
-      `  local    ws://127.0.0.1:${localHost.port} (pid ${localInstance?.pid ?? '?'})`,
-      `  gemini   ws://127.0.0.1:${geminiHost.port} (pid ${geminiInstance?.pid ?? '?'})`,
+      ...hosts.map((host, index) => `  ${host.id.padEnd(8)} ws://127.0.0.1:${host.port} (pid ${instances[index]?.pid ?? '?'})`),
       `  backend  ws://${formatHostPort(config.listen.host, config.listen.port)}/ws`,
       `  web      http://127.0.0.1:${webPort}`,
       '  up управляет только своими процессами; остановите стенд прежним способом.',
@@ -928,10 +923,9 @@ async function runUpCore(options: RunUpOptions, outcome: RunOutcome): Promise<nu
 
   function portOf(service: UpService): { port: number; host: string } {
     switch (service) {
-      case 'host:local': return { port: localHost.port, host: '127.0.0.1' };
-      case 'host:gemini': return { port: geminiHost.port, host: '127.0.0.1' };
       case 'backend': return { port: config.listen.port, host: config.listen.host };
       case 'web': return { port: webPort, host: '127.0.0.1' };
+      default: return { port: hosts.find(host => serviceOf(host) === service)!.port, host: '127.0.0.1' };
     }
   }
 

@@ -126,7 +126,9 @@ a { color: var(--accent); }
 
 .brand { display: flex; flex-direction: column; gap: 6px; }
 .brand-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
-.brand-actions { display: flex; gap: 6px; }
+/* Кнопки шапки переносятся: на узком экране четыре подписи не влезают в строку,
+   а `min-width: auto` у flex-элемента не даёт им сжаться — страница уезжала вбок. */
+.brand-actions { display: flex; flex-wrap: wrap; gap: 6px; }
 .brand-actions > button { flex: 1; min-height: 30px; padding: 4px 8px; font-size: 12px; }
 .notifications-dialog { max-height: 85dvh; overflow-y: auto; }
 .update-changes { padding-inline-start: 20px; margin-block: 0 12px; }
@@ -334,6 +336,59 @@ a { color: var(--accent); }
 }
 
 .detail { min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+
+/* Терминал: экран занимает остаток высоты detail, прокрутка — только внутри xterm. */
+.terminal-page {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+}
+.terminal-header { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.terminal-header > h2 { flex: 1 1 auto; margin: 0; }
+.terminal-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-left: auto; }
+.terminal-actions button { font-size: 12px; padding: 4px 8px; }
+.terminal-status {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 10px;
+  align-items: baseline;
+  font-size: 12px;
+  min-width: 0;
+}
+.terminal-cwd {
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+}
+.terminal-screen {
+  flex: 1;
+  min-height: 0;
+  /* xterm сам рисует скроллбар: внешний overflow дал бы двойную прокрутку. */
+  overflow: hidden;
+  padding: 6px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #11151c;
+}
+.terminal-screen .xterm { height: 100%; }
+.terminal-placeholder { margin: 0; padding: 10px; color: var(--muted); }
+.terminal-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: min(480px, 100%);
+  overflow-y: auto;
+}
+.terminal-form label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--muted); }
+.terminal-form label > * { color: var(--text); }
+.terminal-note { margin: 0; font-size: 12px; }
+
 .empty {
   flex: 1;
   display: flex;
@@ -918,6 +973,12 @@ a { color: var(--accent); }
   .health-fields dt { margin-top: 6px; }
   .log-tail { max-height: 50dvh; font-size: 11px; }
   .new-session { padding: 16px 12px; }
+  /* Телефон: терминал занимает экран без горизонтального скролла; клавиатура сжимает только его. */
+  .terminal-page { padding: 8px 8px 12px; gap: 6px; }
+  .terminal-header .mobile-back { flex: 1 1 100%; text-align: left; }
+  .terminal-form { width: 100%; padding-bottom: 12px; }
+  .terminal-screen { padding: 4px; }
+  .terminal-actions button { min-height: 34px; }
   .icon-button, .composer-action { min-height: 40px; }
   .icon-button { min-width: 40px; }
   .composer-send { width: 40px; padding: 0; font-size: 20px; }

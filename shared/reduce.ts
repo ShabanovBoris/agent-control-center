@@ -5,6 +5,7 @@ import {
   chatReducer,
   rootReducer,
   sessionReducer,
+  terminalReducer,
   type ChangesetAction,
   type ChangesetState,
   type ChatAction,
@@ -14,8 +15,10 @@ import {
   type SessionAction,
   type SessionState,
   type StateAction,
+  type TerminalAction,
+  type TerminalState,
 } from '@microsoft/agent-host-protocol';
-import { ROOT_URI, type ChannelState } from './protocol.js';
+import { ROOT_URI, TERMINAL_PREFIX, type ChannelState } from './protocol.js';
 
 export function isChangesetChannel(uri: string): boolean {
   // VS Code объявляет набор правок хода как дочерний URI чата.
@@ -23,7 +26,8 @@ export function isChangesetChannel(uri: string): boolean {
 }
 
 export function isSupportedChannel(uri: string): boolean {
-  return uri === ROOT_URI || uri.startsWith('ahp-session:') || uri.startsWith('ahp-chat:') || isChangesetChannel(uri);
+  return uri === ROOT_URI || uri.startsWith('ahp-session:') || uri.startsWith('ahp-chat:')
+    || uri.startsWith(TERMINAL_PREFIX) || isChangesetChannel(uri);
 }
 
 export function reduceChannel(uri: string, state: ChannelState, action: StateAction): ChannelState {
@@ -31,6 +35,7 @@ export function reduceChannel(uri: string, state: ChannelState, action: StateAct
   if (isChangesetChannel(uri)) return changesetReducer(state as ChangesetState, action as ChangesetAction);
   if (uri.startsWith('ahp-session:')) return sessionReducer(state as SessionState, action as SessionAction);
   if (uri.startsWith('ahp-chat:')) return chatReducer(state as ChatState, action as ChatAction);
+  if (uri.startsWith(TERMINAL_PREFIX)) return terminalReducer(state as TerminalState, action as TerminalAction);
   throw new Error(`Unsupported channel: ${uri}`);
 }
 

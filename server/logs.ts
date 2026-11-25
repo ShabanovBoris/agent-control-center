@@ -21,11 +21,12 @@ export interface LogSource {
 
 /**
  * Единственное место, где известны пути журналов. Панель может запустить хост только
- * с `--log` (`startLocalHost`/`startHost`), поэтому эти два файла покрывают её сценарии.
+ * с `--log` (`startLocalHost`/`startHost`), поэтому эти файлы покрывают её сценарии.
  */
 const LOG_FILES: Record<LocalHost['id'], { fileName: string; startCommand: string }> = {
   local: { fileName: '.local/host.log', startCommand: 'npm run host -- --log' },
-  gemini: { fileName: '.local/gemini-host.log', startCommand: 'npm run host:gemini -- --log' },
+  wbllm: { fileName: '.local/wbllm-host.log', startCommand: 'npm run host:wbllm -- --log' },
+  glm: { fileName: '.local/glm-host.log', startCommand: 'npm run host:glm -- --log' },
 };
 
 /** Таблица «hostId → фиксированный файл»: произвольный путь или хост добавить нельзя. */

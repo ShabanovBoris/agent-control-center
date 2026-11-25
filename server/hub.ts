@@ -12,6 +12,7 @@ import {
   ContentEncoding,
   JsonRpcErrorCodes,
   MessageKind,
+  TerminalClaimKind,
   ToolCallCancellationReason,
   ToolCallConfirmationReason,
   ToolCallStatus,
@@ -27,12 +28,15 @@ import {
   type SessionState,
   type Snapshot,
   type StateAction,
+  type TerminalInfo,
+  type TerminalState,
 } from '@microsoft/agent-host-protocol';
 import { RpcError } from '@microsoft/agent-host-protocol/client';
 import type { HostConfig, HostHandle, MultiHostClient } from '@microsoft/agent-host-protocol/hosts';
 import {
   ROOT_URI,
   SIDE_CHAT_FIRST_EDIT_UNAVAILABLE,
+  TERMINAL_PREFIX,
   type AgentOverview,
   type AgentSdkDownload,
   type Call,
@@ -51,6 +55,9 @@ import { channelKey, isSupportedChannel } from '../shared/reduce.js';
 import { normalizeDirectoryPath, parseDirectoryEntries } from '../shared/directory.js';
 import { resolveTimeZone } from '../shared/usage.js';
 import { ChannelMirror } from './mirror.js';
+import { TerminalStream } from './terminal-stream.js';
+import { trimTerminalContent, contentBytes, TERMINAL_MIRROR_BYTES } from './terminal-content.js';
+import { DEFAULT_TERMINAL_IDLE_MS, evictionCandidate, terminalCleanupPlan } from './terminal-cleanup.js';
 import type { DirectoryPicker } from './directory-picker.js';
 import type { LocalDirectoryLister } from './directory-listing.js';
 import { abortable } from './async.js';
@@ -71,6 +78,11 @@ const SDK_REQUEST_KEYS = {
 const SDK_DOWNLOAD_VALUES: readonly string[] = ['notDownloaded', 'downloadOnUse', 'downloading', 'ready'];
 const ACTION_CONFIRMATION_MS = 15_000;
 const CHAT_MOVES_SETTING = 'chatMoves.enabled';
+/** Сколько своих PTY панель держит одновременно: каждый — отдельный shell на хосте. */
+export const MAX_CLIENT_TERMINALS = 8;
+/** Пределы resize: значения вне диапазона — ошибка клиента, а не повод звать хост. */
+const TERMINAL_MAX_COLS = 1000;
+const TERMINAL_MAX_ROWS = 500;
 const SEQUENCE_ACTION_LABEL: Partial<Record<StateAction['type'], string>> = {
   [ActionType.ChatConfigChanged]: 'изменение режима',
   [ActionType.SessionConfigChanged]: 'изменение режима',
@@ -93,6 +105,11 @@ export interface HubSink {
   broadcast(message: ServerMessage): void;
   /** Сообщение браузерам, которые смотрят канал. */
   toWatchers(hostId: string, uri: string, message: ServerMessage): void;
+  /**
+   * Очередь хотя бы одного наблюдателя канала переполнена: кадр вывода терминала
+   * остаётся в буфере до следующего тика, а не копится в сокете без предела.
+   */
+  channelBackpressured?(hostId: string, uri: string): boolean;
 }
 
 /** Диагностика хоста сверх `HostOverview`: история ошибок и время последнего события. */
@@ -122,6 +139,18 @@ export class Hub implements SearchEnvironment {
   private readonly historySearch: HistorySearch;
   private readonly hostIssues = new Map<string, HostIssue[]>();
   private readonly lastEventAt = new Map<string, number>();
+  /** Когда терминал последний раз остался без наблюдателей: отсчёт автоочистки. */
+  private readonly terminalSeenAt = new Map<string, number>();
+  /**
+   * Терминалы, которые мы попросили хост закрыть, но их ещё показывает список root.
+   * Их слот не считаем занятым и повторно не вытесняем; запись живёт до обновления root.
+   */
+  private readonly terminalDisposals = new Map<string, Set<string>>();
+  /** Наши терминалы в процессе закрытия: слот освободится только после ответа хоста. */
+  private readonly terminalClosings = new Map<string, Set<string>>();
+  /** Наши созданные терминалы, ещё не появившиеся в списке root: их слот уже занят. */
+  private readonly pendingTerminals = new Map<string, Set<string>>();
+  private readonly terminalStream: TerminalStream;
   private overviewTimer: NodeJS.Timeout | undefined;
 
   constructor(
@@ -138,6 +167,11 @@ export class Hub implements SearchEnvironment {
     searchLimits?: SearchLimits,
   ) {
     this.historySearch = new HistorySearch(this, searchLimits);
+    this.terminalStream = new TerminalStream({
+      send: (hostId, uri, data) => this.sink.toWatchers(hostId, uri, { t: 'terminalData', hostId, uri, data }),
+      ...(sink.channelBackpressured ? { backpressured: (hostId: string, uri: string) => sink.channelBackpressured?.(hostId, uri) ?? false } : {}),
+      onOverflow: (hostId, uri, bytes) => console.warn(`[hub] Буфер вывода ${uri} переполнен: потеряно ${bytes} байт (${hostId})`),
+    });
   }
 
   async start(hosts: readonly HostConfig[]): Promise<void> {
@@ -151,6 +185,11 @@ export class Hub implements SearchEnvironment {
 
   async stop(): Promise<void> {
     clearTimeout(this.overviewTimer);
+    this.terminalStream.stop();
+    this.terminalSeenAt.clear();
+    this.terminalDisposals.clear();
+    this.terminalClosings.clear();
+    this.pendingTerminals.clear();
     for (const action of this.pendingActions.values()) action.finish(new CallFailure('Backend завершает работу'));
     this.historySearch.clear();
     this.pageLocks.clear();
@@ -211,11 +250,16 @@ export class Hub implements SearchEnvironment {
     const failure = this.channelErrors.get(key);
     if (count > 0 && failure) throw new CallFailure(failure.message, failure.code);
     this.watchCounts.set(key, count + 1);
+    // Терминал снова под наблюдением: автоочистка не должна его закрыть.
+    this.terminalSeenAt.delete(key);
     if (count === 0) {
       this.mirror.track(hostId, uri);
       void this.load(hostId, uri);
       return undefined;
     }
+    // Накопленный, но ещё не отправленный вывод уже есть в состоянии зеркала: отдаём его
+    // кадром раньше снимка, иначе второй наблюдатель получит эти же байты дважды.
+    this.terminalStream.flush(hostId, uri);
     return this.mirror.state(hostId, uri);
   }
 
@@ -230,8 +274,36 @@ export class Hub implements SearchEnvironment {
     this.watchCounts.delete(key);
     this.channelErrors.delete(key);
     this.mirror.drop(hostId, uri);
+    this.terminalStream.drop(hostId, uri);
+    if (uri.startsWith(TERMINAL_PREFIX)) this.terminalSeenAt.set(key, Date.now());
     this.notifyChannel(hostId, uri);
     this.multi.unsubscribe(hostId, uri).catch(error => console.warn(`[hub] unsubscribe ${uri} failed:`, errorMessage(error)));
+  }
+
+  /**
+   * Закрывает свои брошенные терминалы и возвращает их URI. Вызывается таймером
+   * в `server/index.ts`; терминалы агентов и наблюдаемые каналы не трогаются.
+   */
+  sweepTerminals(now = Date.now(), thresholdMs = DEFAULT_TERMINAL_IDLE_MS): string[] {
+    const disposed: string[] = [];
+    for (const host of this.multi.hostsSnapshot()) {
+      if (host.state.status !== 'connected') continue;
+      const terminals = this.hostTerminals(host.id);
+      this.observeTerminals(host.id, terminals, now);
+      // Уже закрываемые терминалы не попадают в план: dispose не должен дублироваться.
+      const disposals = this.terminalDisposals.get(host.id);
+      const plan = terminalCleanupPlan({
+        now, thresholdMs, clientId: host.clientId,
+        terminals: disposals ? terminals.filter(terminal => !disposals.has(terminal.resource)) : terminals,
+        watched: uri => (this.watchCounts.get(channelKey(host.id, uri)) ?? 0) > 0,
+        seenAt: uri => this.terminalSeenAt.get(channelKey(host.id, uri)),
+      });
+      for (const uri of plan) {
+        disposed.push(uri);
+        this.closeTerminal(host.id, uri).catch(error => console.warn(`[hub] Автоочистка ${uri} не удалась:`, errorMessage(error)));
+      }
+    }
+    return disposed;
   }
 
   async call(call: Call, signal?: AbortSignal): Promise<unknown> {
@@ -433,6 +505,29 @@ export class Hub implements SearchEnvironment {
         });
         return { sessionUri };
       }
+      case 'createTerminal':
+        return this.createTerminal(call, signal);
+      case 'disposeTerminal': {
+        const uri = this.requireTerminalUri(call.terminalUri);
+        await this.closeTerminal(call.hostId, uri);
+        return undefined;
+      }
+      case 'terminalInput': {
+        const state = this.runningTerminal(call.hostId, call.terminalUri);
+        if (typeof call.data !== 'string' || call.data.length === 0) throw new CallFailure('Пустой ввод терминала');
+        if (!state) throw new CallFailure('Терминал завершён: ввод недоступен');
+        this.dispatch(call.hostId, call.terminalUri, { type: ActionType.TerminalInput, data: call.data });
+        return undefined;
+      }
+      case 'terminalResize': {
+        this.runningTerminal(call.hostId, call.terminalUri);
+        const { cols, rows } = call;
+        if (!Number.isInteger(cols) || cols < 1 || cols > TERMINAL_MAX_COLS || !Number.isInteger(rows) || rows < 1 || rows > TERMINAL_MAX_ROWS) {
+          throw new CallFailure('Некорректный размер терминала');
+        }
+        this.dispatch(call.hostId, call.terminalUri, { type: ActionType.TerminalResized, cols, rows });
+        return undefined;
+      }
       case 'resolveSessionConfig':
         return this.sessionConfigRequest(call, 'resolveSessionConfig', {
           channel: ROOT_URI,
@@ -610,6 +705,118 @@ export class Hub implements SearchEnvironment {
     }
   }
 
+  private async createTerminal(call: Extract<Call, { op: 'createTerminal' }>, signal?: AbortSignal): Promise<{ terminalUri: string }> {
+    const host = this.multi.host(call.hostId);
+    if (!host) throw new CallFailure('Хост не подключён');
+    const path = normalizeDirectoryPath(call.directory);
+    if (!path) throw new CallFailure('Укажите абсолютный путь к папке на хосте, например /Users/me/project');
+    await this.assertTerminalDirectory(call.hostId, path, signal);
+
+    const uri = `${TERMINAL_PREFIX}/${randomUUID()}`;
+    // Слот резервируется до запроса: вытесняемый PTY успевает закрыться, пока хост
+    // ещё не создал новый, — иначе на хосте на время dispose живут лишние shell'ы.
+    await this.reserveTerminalSlot(call.hostId, uri, signal);
+    try {
+      signal?.throwIfAborted();
+      await this.client(call.hostId).request('createTerminal', {
+        channel: uri,
+        // Claim остаётся за backend-клиентом: после F5 и рестарта backend shell принадлежит нам же.
+        claim: { kind: TerminalClaimKind.Client, clientId: host.clientId },
+        ...(call.title ? { name: call.title } : {}),
+        cwd: toFileUri(path),
+        ...(call.cols && call.rows ? { cols: call.cols, rows: call.rows } : {}),
+      });
+    } catch (error) {
+      // PTY не появился — зарезервированный слот возвращается лимиту.
+      this.untrackUri(this.pendingTerminals, call.hostId, uri);
+      throw error;
+    }
+    return { terminalUri: uri };
+  }
+
+  /**
+   * Папка проверяется до создания PTY: несуществующий cwd хост молча подменяет домашней,
+   * а пользователь должен видеть ошибку в поле, а не чужой каталог в терминале.
+   * Хост без `resourceList` — штатная деградация: путь принимается как есть.
+   */
+  private async assertTerminalDirectory(hostId: string, path: string, signal?: AbortSignal): Promise<void> {
+    try {
+      await abortable(this.client(hostId).request('resourceList', { channel: ROOT_URI, uri: toFileUri(path) }), signal, 'Отменено');
+    } catch (error) {
+      // Хост без листинга папок не должен блокировать терминал: путь проверен в UI.
+      if (error instanceof RpcError && error.code === JsonRpcErrorCodes.MethodNotFound) return;
+      throw directoryFailure(error);
+    }
+  }
+
+  /**
+   * Резервирует слот под новый PTY, вытесняя при необходимости старейший терминал
+   * без наблюдателей. Занятость считается по списку хоста с поправкой на то, что
+   * происходит «в полёте»: закрываемые терминалы ещё держат слот до ответа хоста,
+   * а только что созданные занимают его сразу, не дожидаясь обновления root.
+   * Если все слоты заняты наблюдаемыми терминалами — честная ошибка: молча убивать
+   * открытый на другом устройстве shell нельзя.
+   */
+  private async reserveTerminalSlot(hostId: string, uri: string, signal?: AbortSignal): Promise<void> {
+    const host = this.multi.host(hostId);
+    if (!host) throw new CallFailure('Хост не подключён');
+    const disposals = this.terminalDisposals.get(hostId);
+    // Терминалы, которые уже закрываются или закрыты, слот не занимают: root обновится позже.
+    const terminals = this.hostTerminals(hostId).filter(terminal => !disposals?.has(terminal.resource));
+    const visible = new Set(terminals.map(terminal => terminal.resource));
+    const pending = [...(this.pendingTerminals.get(hostId) ?? [])].filter(item => !visible.has(item)).length;
+    const closings = this.terminalClosings.get(hostId)?.size ?? 0;
+    const own = terminals.filter(terminal => this.isOwnTerminal(hostId, terminal.claim)).length;
+    if (own + closings + pending < MAX_CLIENT_TERMINALS) {
+      this.trackUri(this.pendingTerminals, hostId, uri);
+      return;
+    }
+    const candidate = evictionCandidate(terminals, {
+      clientId: host.clientId,
+      watched: item => (this.watchCounts.get(channelKey(hostId, item)) ?? 0) > 0,
+      seenAt: item => this.terminalSeenAt.get(channelKey(hostId, item)),
+    });
+    if (!candidate) throw new CallFailure(`Открыто ${MAX_CLIENT_TERMINALS} терминалов. Закройте один из них.`);
+    try {
+      await this.closeTerminal(hostId, candidate);
+    } catch (error) {
+      // Хост не закрыл терминал: слот остался занят, новый PTY не создаём.
+      throw new CallFailure(`Не удалось освободить место: ${errorMessage(error)}`, error instanceof RpcError ? error.code : undefined);
+    }
+    signal?.throwIfAborted();
+    this.trackUri(this.pendingTerminals, hostId, uri);
+  }
+
+  /** «Свой» терминал: claim client с clientId этого backend. Терминалы агентов не наши. */
+  private isOwnTerminal(hostId: string, claim: TerminalInfo['claim']): boolean {
+    const host = this.multi.host(hostId);
+    return host !== undefined && claim.kind === TerminalClaimKind.Client && claim.clientId === host.clientId;
+  }
+
+  private trackUri(map: Map<string, Set<string>>, hostId: string, uri: string): void {
+    const set = map.get(hostId) ?? new Set<string>();
+    set.add(uri);
+    map.set(hostId, set);
+  }
+
+  private untrackUri(map: Map<string, Set<string>>, hostId: string, uri: string): void {
+    const set = map.get(hostId);
+    if (!set?.delete(uri)) return;
+    if (set.size === 0) map.delete(hostId);
+  }
+
+  private requireTerminalUri(uri: string): string {
+    if (typeof uri !== 'string' || !uri.startsWith(TERMINAL_PREFIX)) throw new CallFailure('Ожидался терминал');
+    return uri;
+  }
+
+  /** Терминал открыт и жив: в завершённый PTY писать и ресайзить его бессмысленно. */
+  private runningTerminal(hostId: string, uri: string): TerminalState | undefined {
+    const state = this.terminalState(hostId, this.requireTerminalUri(uri));
+    if (state.lifecycle.status !== 'running') return undefined;
+    return state;
+  }
+
   private async forkSession(call: Extract<Call, { op: 'forkSession' }>, signal?: AbortSignal): Promise<{ sessionUri: string }> {
     const { hostId, sessionUri, chatUri, turnId } = call;
     const { session, chat } = this.historyChat(call);
@@ -771,6 +978,53 @@ export class Hub implements SearchEnvironment {
     return client;
   }
 
+  /** Список терминалов хоста: зеркало root — источник истины, а не отдельная карта в панели. */
+  private hostTerminals(hostId: string): readonly TerminalInfo[] {
+    const root = this.mirror.state(hostId, ROOT_URI) as RootState | undefined;
+    const handleTerminals = this.multi.host(hostId)?.terminals;
+    return root?.terminals ?? handleTerminals ?? [];
+  }
+
+  /** Канал терминала открыт и его состояние уже пришло: иначе отправлять ввод некуда. */
+  private terminalState(hostId: string, uri: string): TerminalState {
+    if (!uri.startsWith(TERMINAL_PREFIX)) throw new CallFailure('Ожидался терминал');
+    const state = this.mirror.state(hostId, uri) as TerminalState | undefined;
+    if (!state) throw new CallFailure('Терминал не открыт или его состояние ещё не получено');
+    return state;
+  }
+
+  /**
+   * Закрывает PTY на хосте и убирает канал из зеркала. Повторное закрытие
+   * (терминал уже исчез, backend перезапущен) не ошибка для вызывающего.
+   */
+  private async closeTerminal(hostId: string, uri: string): Promise<void> {
+    const key = channelKey(hostId, uri);
+    // Отметки ставятся синхронно, до первого await: параллельный create уже не выберет
+    // этот URI и увидит, что слот ещё держится, пока хост не ответил на dispose.
+    this.trackUri(this.terminalDisposals, hostId, uri);
+    const closing = this.hostTerminals(hostId).find(terminal => terminal.resource === uri);
+    const countsTowardsLimit = closing !== undefined && this.isOwnTerminal(hostId, closing.claim);
+    if (countsTowardsLimit) this.trackUri(this.terminalClosings, hostId, uri);
+    let disposed = false;
+    try {
+      await this.client(hostId).request('disposeTerminal', { channel: uri });
+      disposed = true;
+    } catch (error) {
+      if (!(error instanceof RpcError) || error.code !== AhpErrorCodes.NotFound) throw error;
+      // NotFound — терминала уже нет: для вызывающего это успешное закрытие.
+      disposed = true;
+    } finally {
+      // Неудачный dispose оставляет PTY живым: слот и запись в списке хоста сохраняются.
+      if (!disposed) this.untrackUri(this.terminalDisposals, hostId, uri);
+      if (countsTowardsLimit) this.untrackUri(this.terminalClosings, hostId, uri);
+      this.untrackUri(this.pendingTerminals, hostId, uri);
+      this.terminalStream.drop(hostId, uri);
+      this.terminalSeenAt.delete(key);
+      this.mirror.drop(hostId, uri);
+      this.multi.unsubscribe(hostId, uri).catch(error => console.warn(`[hub] unsubscribe ${uri} failed:`, errorMessage(error)));
+    }
+  }
+
   private dispatch(hostId: string, uri: string, action: StateAction): void {
     this.client(hostId).dispatch(uri, action);
   }
@@ -831,9 +1085,12 @@ export class Hub implements SearchEnvironment {
     }
     const loaded = this.mirror.loadFinished(token, snapshot);
     if (loaded) {
+      if (uri.startsWith(TERMINAL_PREFIX)) this.trimTerminalMirror(hostId, uri);
+      // Снимок — это reset+replay в эмуляторе: вывод, накопленный до него, должен уйти первым.
+      this.terminalStream.flush(hostId, uri);
       // Снимок канала — тоже событие от хоста: страница здоровья показывает его время.
       this.lastEventAt.set(hostId, Date.now());
-      this.sink.toWatchers(hostId, uri, { t: 'snapshot', hostId, uri, state: loaded.state });
+      this.sink.toWatchers(hostId, uri, { t: 'snapshot', hostId, uri, state: this.mirror.state(hostId, uri) ?? loaded.state });
       for (const type of loaded.invalidActions) this.reportInvalidAction(hostId, uri, type);
       if (uri === ROOT_URI) this.scheduleOverview();
     }
@@ -905,11 +1162,77 @@ export class Hub implements SearchEnvironment {
         pending?.finish(new CallFailure('Не удалось обработать подтверждение хоста. Проверьте чат перед повтором.'));
         continue;
       }
-      if (applied === 'applied') this.sink.toWatchers(hostId, channel, { t: 'action', hostId, uri: channel, action });
+      if (applied === 'applied' && channel === ROOT_URI && action.type === ActionType.RootTerminalsChanged) {
+        this.observeTerminals(hostId, (action as { terminals?: readonly TerminalInfo[] }).terminals ?? []);
+      }
+      if (channel.startsWith(TERMINAL_PREFIX)) this.afterTerminalAction(hostId, channel, action);
+      const streamed = applied === 'applied' && this.streamTerminalData(hostId, channel, action);
+      if (applied === 'applied' && !streamed) this.sink.toWatchers(hostId, channel, { t: 'action', hostId, uri: channel, action });
       pending?.finish();
       this.notifyChannel(hostId, channel);
       if (channel === ROOT_URI) this.scheduleOverview();
     }
+  }
+
+  /**
+   * Вывод PTY не идёт через обычный `action`: он копится и уходит кадрами `terminalData`.
+   * Любое другое действие канала сначала выдавливает накопленное, чтобы порядок
+   * «вывод → статус» сохранялся в браузере.
+   */
+  private streamTerminalData(hostId: string, channel: string, action: StateAction): boolean {
+    if (action.type !== ActionType.TerminalData) return false;
+    const data = (action as { data?: unknown }).data;
+    if (typeof data !== 'string') return false;
+    // За каналом никто не следит — копить кадры некому; состояние канала обновится в зеркале.
+    if ((this.watchCounts.get(channelKey(hostId, channel)) ?? 0) > 0) this.terminalStream.push(hostId, channel, data);
+    this.trimTerminalMirror(hostId, channel);
+    return true;
+  }
+
+  private afterTerminalAction(hostId: string, channel: string, action: StateAction): void {
+    // Вывод обязан дойти до браузера раньше статуса — иначе последние строки пропадут.
+    if (action.type !== ActionType.TerminalData) this.terminalStream.flush(hostId, channel);
+  }
+
+  /**
+   * Отслеживает срок жизни своих терминалов по списку из root. Запись `terminalSeenAt`
+   * заводится при появлении терминала и после того, как за ним перестали следить,
+   * поэтому рестарт backend не сбрасывает отсчёт автоочистки в бесконечность.
+   */
+  private observeTerminals(hostId: string, terminals: readonly TerminalInfo[], now = Date.now()): void {
+    const host = this.multi.host(hostId);
+    if (!host) return;
+    const seen = new Set<string>();
+    const resources = new Set<string>();
+    for (const terminal of terminals) {
+      const key = channelKey(hostId, terminal.resource);
+      seen.add(key);
+      resources.add(terminal.resource);
+      // Созданный нами терминал попал в список хоста: резерв слота больше не нужен.
+      this.untrackUri(this.pendingTerminals, hostId, terminal.resource);
+      if (!this.isOwnTerminal(hostId, terminal.claim)) continue;
+      if (this.terminalSeenAt.has(key)) continue;
+      if ((this.watchCounts.get(key) ?? 0) > 0) continue;
+      this.terminalSeenAt.set(key, now);
+    }
+    // Закрытый нами терминал исчез из списка хоста — запись о закрытии можно снять.
+    for (const uri of [...(this.terminalDisposals.get(hostId) ?? [])]) {
+      if (!resources.has(uri)) this.untrackUri(this.terminalDisposals, hostId, uri);
+    }
+    // Терминал исчез (закрыт нами или хостом) — его запись больше не нужна.
+    for (const key of [...this.terminalSeenAt.keys()]) {
+      if (!key.startsWith(`${hostId}\u0000${TERMINAL_PREFIX}`)) continue;
+      if (!seen.has(key)) this.terminalSeenAt.delete(key);
+    }
+  }
+
+  /** Ограничивает историю вывода в зеркале: полная история PTY backend не нужна. */
+  private trimTerminalMirror(hostId: string, channel: string): void {
+    this.mirror.rewrite(hostId, channel, state => {
+      const terminal = state as TerminalState;
+      if (contentBytes(terminal.content) <= TERMINAL_MIRROR_BYTES) return state;
+      return { ...terminal, content: trimTerminalContent(terminal.content, TERMINAL_MIRROR_BYTES) };
+    });
   }
 
   private reportInvalidAction(hostId: string, uri: string, type: unknown): void {

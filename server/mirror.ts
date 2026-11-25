@@ -50,6 +50,15 @@ export class ChannelMirror {
     return this.entries.get(channelKey(hostId, uri))?.state;
   }
 
+  /**
+   * Переписывает уже принятое состояние канала, не трогая `seq`: нужно, чтобы
+   * ограничить историю вывода терминала в памяти backend.
+   */
+  rewrite(hostId: string, uri: string, transform: (state: ChannelState) => ChannelState): void {
+    const entry = this.entries.get(channelKey(hostId, uri));
+    if (entry?.state !== undefined) entry.state = transform(entry.state);
+  }
+
   urisOf(hostId: string): string[] {
     return [...this.entries.values()].filter(entry => entry.hostId === hostId).map(entry => entry.uri);
   }

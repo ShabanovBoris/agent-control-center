@@ -140,5 +140,5 @@ export async function waitForConnections(
     if (disconnected.length > 0) console.log(`[services] Ожидание: ${disconnected.join(', ')}.`);
     await delay(500);
   }
-  throw new Error('Не все хосты подключились за отведённое время. Проверьте журналы .local/host.log и .local/gemini-host.log.');
+  throw new Error('Не все хосты подключились за отведённое время. Проверьте журналы .local/host.log и .local/wbllm-host.log и .local/glm-host.log.');
 }

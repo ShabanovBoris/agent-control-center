@@ -102,7 +102,7 @@ export async function readUpState(file: string, log: (line: string) => void = ()
   }
   const children: UpState['children'] = {};
   for (const [service, value] of Object.entries(parsed.children)) {
-    if (service !== 'host:local' && service !== 'host:gemini' && service !== 'backend' && service !== 'web') continue;
+    if (service !== 'host:local' && service !== 'host:wbllm' && service !== 'host:glm' && service !== 'backend' && service !== 'web') continue;
     const record = parseServiceRecord(value);
     if (record) children[service] = record;
   }

@@ -1,5 +1,5 @@
 import { useEffect, useSyncExternalStore } from 'react';
-import { AhpErrorCodes } from '@microsoft/agent-host-protocol';
+import { ActionType, AhpErrorCodes } from '@microsoft/agent-host-protocol';
 import {
   parseServerMessage,
   type Call,
@@ -23,6 +23,12 @@ export interface ChannelView {
   state?: ChannelState;
   error?: string;
   missing?: boolean;
+  /**
+   * Номер снимка канала: растёт, когда хост присылает новую точку отсчёта (первое открытие,
+   * F5, reconnect, `terminal/cleared`). Actions его не меняют, поэтому `resized` или `exited`
+   * не заставляют терминал стирать экран и рисовать содержимое заново.
+   */
+  epoch?: number;
 }
 
 export interface Notice {
@@ -47,6 +53,19 @@ interface Watch {
 
 const RETRY_MS = 1500;
 const NOTICE_MS = 8000;
+/**
+ * Сколько вывода PTY браузер придерживает до подписки эмулятора. Достаточно, чтобы
+ * не потерять первый кадр после F5, и мало, чтобы это вообще было заметно.
+ */
+const DATA_BUFFER_CHARS = 256 * 1024;
+
+function isHighSurrogate(code: number): boolean {
+  return code >= 0xd800 && code <= 0xdbff;
+}
+
+function isLowSurrogate(code: number): boolean {
+  return code >= 0xdc00 && code <= 0xdfff;
+}
 
 class Store {
   private state: AppState = {
@@ -61,6 +80,18 @@ class Store {
   private readonly pending = new Map<number, { resolve(data: unknown): void; reject(error: Error): void; cleanup(): void }>();
   private socket: WebSocket | undefined;
   private nextId = 1;
+  /** Растёт на каждом снимке канала: эмулятор по нему отличает новую точку отсчёта от action. */
+  private epoch = 0;
+  /**
+   * Слушатели вывода PTY. Кадры `terminalData` не проходят через состояние React:
+   * их получают эмуляторы напрямую, иначе 30 обновлений в секунду перерисовывали бы страницу.
+   */
+  private readonly channelDataListeners = new Set<(hostId: string, uri: string, data: string) => void>();
+  /**
+   * Кадры, пришедшие до подписки эмулятора (например, между приходом снимка и монтированием
+   * xterm). Без буфера начало вывода терялось бы при каждом F5.
+   */
+  private readonly channelDataBuffer = new Map<string, string>();
   // Backend подавляет push на том устройстве, где сессия уже на экране.
   private presenceVisible = false;
   private presenceSelection: { hostId: string; sessionUri: string } | undefined;
@@ -94,7 +125,28 @@ class Store {
       this.watches.delete(key);
       this.send({ t: 'unwatch', hostId, uri });
       this.setChannel(key, undefined);
+      this.channelDataBuffer.delete(key);
     };
+  }
+
+  /**
+   * Поток вывода терминала: кадры идут мимо React-состояния и отдаются всем
+   * подписчикам (эмулятору) в том порядке, в каком их прислал backend.
+   * Кадры, пришедшие до подписки, не теряются: они ждут в буфере канала.
+   */
+  subscribeChannelData(listener: (hostId: string, uri: string, data: string) => void): () => void {
+    this.channelDataListeners.add(listener);
+    for (const [key, data] of this.channelDataBuffer) {
+      const split = key.indexOf('\u0000');
+      listener(key.slice(0, split), key.slice(split + 1), data);
+    }
+    this.channelDataBuffer.clear();
+    return () => this.channelDataListeners.delete(listener);
+  }
+
+  /** Забывает буфер канала, чтобы выброшенный поток не всплыл при следующей подписке. */
+  forgetChannelData(hostId: string, uri: string): void {
+    this.channelDataBuffer.delete(channelKey(hostId, uri));
   }
 
   call<T = void>(call: Call): Promise<T> {
@@ -230,14 +282,39 @@ class Store {
       case 'snapshot': {
         const key = channelKey(message.hostId, message.uri);
         if (!this.watches.has(key) || this.state.channels.get(key)?.missing) return;
-        this.setChannel(key, { state: message.state });
+        // Снимок терминала — новая точка отсчёта для эмулятора: он стирает экран и пишет
+        // содержимое заново (первое открытие, F5, reconnect, возврат на страницу).
+        this.setChannel(key, { state: message.state, epoch: ++this.epoch });
+        // Всё, что накопилось до снимка, уже есть в его содержимом: иначе эмулятор
+        // дописал бы эти кадры поверх снимка и вывод бы задвоился.
+        this.channelDataBuffer.delete(key);
         return;
       }
       case 'action': {
         const key = channelKey(message.hostId, message.uri);
-        const current = this.state.channels.get(key)?.state;
-        if (current === undefined) return;
-        this.setChannel(key, { state: reduceChannel(message.uri, current, message.action) });
+        const view = this.state.channels.get(key);
+        if (view?.state === undefined) return;
+        // Обычный action меняет состояние, но не начинает вывод заново: `resized` или
+        // `exited` не должны стирать экран. Исключение — `cleared`: он стирает содержимое
+        // и в эмуляторе, поэтому считается новой точкой отсчёта.
+        const cleared = message.action.type === ActionType.TerminalCleared;
+        this.setChannel(key, {
+          state: reduceChannel(message.uri, view.state, message.action),
+          // Снимок уже был (иначе action некуда применять), поэтому `epoch` всегда известен.
+          epoch: cleared ? ++this.epoch : view.epoch,
+        });
+        // Кадры до очистки уже не нужны: снимок содержимого теперь пустой.
+        if (cleared) this.channelDataBuffer.delete(key);
+        return;
+      }
+      case 'terminalData': {
+        const key = channelKey(message.hostId, message.uri);
+        if (!this.watches.has(key)) return;
+        if (this.channelDataListeners.size === 0) {
+          this.bufferChannelData(key, message.data);
+          return;
+        }
+        for (const listener of this.channelDataListeners) listener(message.hostId, message.uri, message.data);
         return;
       }
       case 'channelError': {
@@ -289,6 +366,24 @@ class Store {
     this.update({ channels });
   }
 
+  /**
+   * Буфер кадров до подписки эмулятора ограничен: держать мегабайты в памяти вкладки
+   * незачем. Кадры до снимка уже есть в его содержимом, поэтому при переполнении
+   * теряется только хвост начала; кадры, пришедшие после снимка, снимком не повторятся.
+   */
+  private bufferChannelData(key: string, data: string): void {
+    const previous = this.channelDataBuffer.get(key) ?? '';
+    const next = previous + data;
+    if (next.length <= DATA_BUFFER_CHARS) {
+      this.channelDataBuffer.set(key, next);
+      return;
+    }
+    let start = next.length - DATA_BUFFER_CHARS;
+    // Не начинаем с младшего суррогата: половина эмодзи в xterm — битый символ.
+    if (start > 0 && isLowSurrogate(next.charCodeAt(start)) && isHighSurrogate(next.charCodeAt(start - 1))) start -= 1;
+    this.channelDataBuffer.set(key, next.slice(start));
+  }
+
   private update(patch: Partial<AppState>): void {
     this.state = { ...this.state, ...patch };
     for (const listener of this.listeners) listener();
@@ -319,9 +414,9 @@ export function usePresence(selection: Selection | null): void {
 }
 
 /** Состояние канала хоста; `uri === undefined` означает «пока не знаем, что смотреть». */
-export function useChannel<T extends ChannelState>(hostId: string, uri: string | undefined): { state?: T; error?: string; missing?: boolean } {
+export function useChannel<T extends ChannelState>(hostId: string, uri: string | undefined): { state?: T; error?: string; missing?: boolean; epoch?: number } {
   useEffect(() => (uri ? store.watch(hostId, uri) : undefined), [hostId, uri]);
   const { channels } = useAppState();
   const view = uri ? channels.get(channelKey(hostId, uri)) ?? EMPTY_VIEW : EMPTY_VIEW;
-  return view as { state?: T; error?: string; missing?: boolean };
+  return view as { state?: T; error?: string; missing?: boolean; epoch?: number };
 }

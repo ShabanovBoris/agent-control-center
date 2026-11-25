@@ -22,6 +22,7 @@ import { createPushService } from './push.js';
 import { createSessionUserState } from './session-user-state.js';
 import { ProjectUpdates, type UpdatePlan } from './updates.js';
 import { restartServices, withRestarting } from './restart-services.js';
+import { terminalIdleMs } from './terminal-cleanup.js';
 import { BACKEND_RESTART_EXIT_CODE, UP_SUPERVISED_ENV } from './up-contract.js';
 
 const previousBackend = Number(process.env.ACC_PREVIOUS_BACKEND_PID);
@@ -112,6 +113,16 @@ function send(browser: Browser, message: ServerMessage, onSent?: () => void): vo
   else onSent?.();
 }
 
+/**
+ * Предел очереди одного сокета. Вывод PTY бывает 187 КБ/с: если браузер не успевает
+ * читать (фоновая вкладка, мобильная сеть), кадры ждут в буфере backend, а не копятся
+ * в сокете без предела. Очередь всё равно дренируется, потому что поток хоста медленнее
+ * суммы кадров, которую транспорт забирает за тик.
+ */
+const SOCKET_BACKPRESSURE_BYTES = 4 * 1024 * 1024;
+
+const TERMINAL_SWEEP_MS = 60_000;
+
 function broadcastSessionUserState(): void {
   if (!userState) return;
   // viewFor — единственный источник сообщения: он уже отфильтровал нулевые счётчики.
@@ -148,6 +159,15 @@ const hub = new Hub(new MultiHostClient({ clientIdStore: new FileClientIdStore(j
     for (const browser of browsers) {
       if (browser.watching.has(key)) send(browser, message);
     }
+  },
+  channelBackpressured(hostId, uri) {
+    const key = channelKey(hostId, uri);
+    for (const browser of browsers) {
+      if (!browser.watching.has(key)) continue;
+      if (browser.socket.bufferedAmount > SOCKET_BACKPRESSURE_BYTES) return true;
+    }
+    // Без наблюдателей кадр просто некому отдать: буфер канала разбирается, а не копится.
+    return false;
   },
 }, config.agents, {
   picker: new DirectoryPicker(config.hosts.filter(host => host.localFilesystem).map(host => host.id)),
@@ -427,7 +447,19 @@ async function handlePinCall(call: PinCall): Promise<boolean> {
   return userState.setPinned(hostId, sessionUri, pinned);
 }
 
+// Порог проверяется на старте: опечатка в env не должна тихо отключать уборку PTY.
+const terminalIdle = terminalIdleMs(process.env.ACC_TERMINAL_IDLE_MS);
 await hub.start(config.hosts.map(toHostConfig));
+// Брошенные свои терминалы закрываются по таймеру: PTY на маке не должен жить вечно.
+const terminalSweep = setInterval(() => {
+  try {
+    hub.sweepTerminals(Date.now(), terminalIdle);
+  } catch (error) {
+    console.warn('[acc] Автоочистка терминалов не удалась.', error instanceof Error ? error.message : String(error));
+  }
+}, TERMINAL_SWEEP_MS);
+terminalSweep.unref();
+
 const onListenError = (error: Error): void => {
   console.error(`[acc] Backend не запустился на ${config.listen.host}:${config.listen.port}: ${error.message}`);
   void shutdown(1);
@@ -448,6 +480,7 @@ let shuttingDown = false;
 async function shutdown(exitCode = 0): Promise<void> {
   if (shuttingDown) return;
   shuttingDown = true;
+  clearInterval(terminalSweep);
   if (server.listening) server.close();
   if (phone?.server.listening) phone.server.close();
   for (const browser of browsers) browser.socket.close();

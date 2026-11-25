@@ -1,8 +1,9 @@
 {
   "listen": { "host": "127.0.0.1", "port": 8090 },
-  "agents": ["claude", "codex"],
+  "agents": ["codex"],
   "hosts": [
-    { "id": "local", "label": "Claude · cheapvibecode + Codex · ChatGPT", "url": "ws://127.0.0.1:8089", "tokenFile": ".local/host-token", "localFilesystem": true, "defaultModels": { "claude": "@provider=anthropic:opus" } },
-    { "id": "gemini", "label": "CheapVibeCode · Codex", "url": "ws://127.0.0.1:8091", "tokenFile": ".local/gemini-host-token", "localFilesystem": true }
+    { "id": "local", "label": "ChatGPT · Codex", "url": "ws://127.0.0.1:8089", "tokenFile": ".local/host-token", "localFilesystem": true },
+    { "id": "wbllm", "label": "WBLLM · Codex", "url": "ws://127.0.0.1:8093", "tokenFile": ".local/wbllm-host-token", "localFilesystem": true },
+    { "id": "glm", "label": "GLM · Codex", "url": "ws://127.0.0.1:8094", "tokenFile": ".local/glm-host-token", "localFilesystem": true }
   ]
 }
