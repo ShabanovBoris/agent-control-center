@@ -4,6 +4,15 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# PTY терминалов панели наследует env этого процесса (в AHP `createTerminal` нет поля env).
+# Панель — xterm.js с 256 цветами и truecolor, а CI/agent-раннеры выставляют NO_COLOR,
+# CLICOLOR, CLICOLOR_FORCE, FORCE_COLOR, CI и TERM=dumb — с ними lipgloss/termenv
+# и Node-TUI выбирают Ascii/NoColor и перестают подсвечивать выбранный пункт.
+# Список и значения синхронизированы с server/terminal-env.ts (wbllm/glm-лаунчер).
+unset NO_COLOR CLICOLOR CLICOLOR_FORCE FORCE_COLOR CI
+export TERM=xterm-256color
+export COLORTERM=truecolor
+
 CODE="${VSCODE_CLI:-/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code}"
 PORT="${AHP_PORT:-8089}"
 TOKEN_FILE=".local/host-token"
