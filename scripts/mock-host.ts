@@ -471,7 +471,9 @@ function createTerminal(params: any): null {
     ? { kind: TerminalClaimKind.Session, session: String(params.claim.session), chat: String(params.claim.chat) }
     : { kind: TerminalClaimKind.Client, clientId: String(params.claim?.clientId ?? '') };
   terminals.set(uri, {
-    title: typeof params.name === 'string' && params.name ? params.name : 'Терминал',
+    // Как настоящий хост: `name` в createTerminal принимается, но title остаётся «bash» —
+    // terminal/titleChanged заголовок не меняет. Различимость строк даёт панель.
+    title: 'bash',
     cwd,
     cols: Number.isInteger(params.cols) ? params.cols : 80,
     rows: Number.isInteger(params.rows) ? params.rows : 24,

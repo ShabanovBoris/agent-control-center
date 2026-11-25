@@ -56,6 +56,7 @@ function setup(options: { request?: (method: string, params: unknown) => unknown
     }),
     subscribe: async (_hostId: string, uri: string) => ({ snapshot: { resource: uri, state: states.get(uri), fromSeq: serverSeq } }),
     async unsubscribe() {},
+    async addHost() {},
     hostsSnapshot: () => [host],
     aggregatedSessions: () => [],
     async *hostEvents() { for await (const [event] of on(hostEvents, 'hostEvent', { close: ['shutdown'] })) yield event; },
@@ -71,7 +72,22 @@ function setup(options: { request?: (method: string, params: unknown) => unknown
   };
   const streaming = (uri: string) => messages.filter(item => item.uri === uri && item.message.t === 'terminalData')
     .map(item => (item.message as { data: string }).data).join('');
-  return { hub, host, states, requests, dispatched, messages, echo, streaming, events };
+  /**
+   * Подключает хост и загружает root так же, как это делает `Hub.start` + событие `connected`.
+   * `addHost` в фикстуре — no-op: хост уже есть в `hostsSnapshot`.
+   */
+  const connectRoot = async (rootState: unknown): Promise<void> => {
+    states.set(ROOT, rootState);
+    // Дать consumeHostEvents начать итерацию до события: иначе оно потеряется.
+    await setImmediate();
+    hostEvents.emit('hostEvent', { type: 'connected', hostId: 'h' });
+    for (let attempt = 0; attempt < 200; attempt += 1) {
+      if (hub.overview().hosts[0]?.terminals !== undefined) return;
+      await delay(5);
+    }
+    throw new Error('overview не получил список терминалов из root');
+  };
+  return { hub, host, states, requests, dispatched, messages, echo, streaming, events, connectRoot };
 }
 
 const terminalUri = 'ahp-terminal:/one';
@@ -325,5 +341,67 @@ test('автоочистка закрывает только свой броше
   assert.deepEqual(disposed, ['ahp-terminal:/mine']);
   await setImmediate();
   assert.deepEqual(fixture.requests.filter(item => item.method === 'disposeTerminal').map(item => (item.params as { channel: string }).channel), ['ahp-terminal:/mine']);
+  await fixture.hub.stop();
+});
+
+test('overview отдаёт только свои терминалы с сохранёнными title и lifecycle', async () => {
+  const terminals: TerminalInfo[] = [
+    { resource: 'ahp-terminal:/mine', title: 'Проект', claim: { kind: TerminalClaimKind.Client, clientId: 'browser-backend' }, lifecycle: { status: TerminalLifecycleStatus.Running } },
+    { resource: 'ahp-terminal:/exited', title: 'Сборка', claim: { kind: TerminalClaimKind.Client, clientId: 'browser-backend' }, lifecycle: { status: TerminalLifecycleStatus.Exited, exitCode: 7 } },
+    { resource: 'ahp-terminal:/agent', title: 'Агент', claim: { kind: TerminalClaimKind.Session, session: 'ahp-session:/s', chat: 'ahp-chat:/c' }, lifecycle: { status: TerminalLifecycleStatus.Running } },
+    { resource: 'ahp-terminal:/other', title: 'Чужой', claim: { kind: TerminalClaimKind.Client, clientId: 'another' }, lifecycle: { status: TerminalLifecycleStatus.Running } },
+  ];
+  const fixture = setup({ terminals });
+  assert.deepEqual(fixture.hub.overview().hosts[0]?.terminals, [
+    { resource: 'ahp-terminal:/mine', title: 'Проект', lifecycle: { status: TerminalLifecycleStatus.Running } },
+    { resource: 'ahp-terminal:/exited', title: 'Сборка', lifecycle: { status: TerminalLifecycleStatus.Exited, exitCode: 7 } },
+  ]);
+  await fixture.hub.stop();
+});
+
+test('createTerminal без title передаёт имя папки, явный title побеждает', async () => {
+  const fromFolder = setup();
+  await fromFolder.hub.call({ op: 'createTerminal', hostId: 'h', directory: '/work/src' });
+  assert.equal((fromFolder.requests[1]?.params as { name?: string }).name, 'src');
+
+  const fromRoot = setup();
+  await fromRoot.hub.call({ op: 'createTerminal', hostId: 'h', directory: '/' });
+  assert.equal((fromRoot.requests[1]?.params as { name?: string }).name, '/');
+
+  const explicit = setup();
+  await explicit.hub.call({ op: 'createTerminal', hostId: 'h', directory: '/work/src', title: '  kent  ' });
+  assert.equal((explicit.requests[1]?.params as { name?: string }).name, 'kent');
+  await fromFolder.hub.stop();
+  await fromRoot.hub.stop();
+  await explicit.hub.stop();
+});
+
+test('RootTerminalsChanged обновляет список терминалов overview через зеркало root', async () => {
+  const fixture = setup();
+  await fixture.hub.start([{ id: 'h', label: 'Host', transportFactory: async () => { throw new Error('unused'); } }]);
+  assert.equal(fixture.hub.overview().hosts[0]?.terminals, undefined, 'до загрузки root списка нет');
+
+  const terminals: TerminalInfo[] = [
+    { resource: 'ahp-terminal:/mine', title: 'Проект', claim: { kind: TerminalClaimKind.Client, clientId: 'browser-backend' }, lifecycle: { status: TerminalLifecycleStatus.Running } },
+    { resource: 'ahp-terminal:/agent', title: 'Агент', claim: { kind: TerminalClaimKind.Session, session: 'ahp-session:/s', chat: 'ahp-chat:/c' }, lifecycle: { status: TerminalLifecycleStatus.Running } },
+    { resource: 'ahp-terminal:/other', title: 'Чужой', claim: { kind: TerminalClaimKind.Client, clientId: 'another' }, lifecycle: { status: TerminalLifecycleStatus.Running } },
+  ];
+  await fixture.connectRoot({ agents: [], terminals });
+  assert.deepEqual(fixture.hub.overview().hosts[0]?.terminals, [
+    { resource: 'ahp-terminal:/mine', title: 'Проект', lifecycle: { status: TerminalLifecycleStatus.Running } },
+  ]);
+
+  fixture.echo(ROOT, {
+    type: ActionType.RootTerminalsChanged,
+    terminals: [
+      terminals[0]!,
+      { resource: 'ahp-terminal:/new', title: 'Второй', claim: { kind: TerminalClaimKind.Client, clientId: 'browser-backend' }, lifecycle: { status: TerminalLifecycleStatus.Exited, exitCode: 0 } },
+    ],
+  });
+  await setImmediate();
+  assert.deepEqual(fixture.hub.overview().hosts[0]?.terminals, [
+    { resource: 'ahp-terminal:/mine', title: 'Проект', lifecycle: { status: TerminalLifecycleStatus.Running } },
+    { resource: 'ahp-terminal:/new', title: 'Второй', lifecycle: { status: TerminalLifecycleStatus.Exited, exitCode: 0 } },
+  ]);
   await fixture.hub.stop();
 });

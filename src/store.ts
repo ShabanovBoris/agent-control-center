@@ -1,4 +1,4 @@
-import { useEffect, useSyncExternalStore } from 'react';
+import { useEffect, useRef, useSyncExternalStore } from 'react';
 import { ActionType, AhpErrorCodes } from '@microsoft/agent-host-protocol';
 import {
   parseServerMessage,
@@ -39,6 +39,11 @@ export interface Notice {
 export interface AppState {
   connection: Connection;
   overview: Overview;
+  /**
+   * Первая сводка от backend получена. До неё страницы не знают набор терминалов
+   * и не должны сбрасывать сохранённый выбор при первой отрисовке.
+   */
+  overviewLoaded: boolean;
   /** Закрепления и непрочитанные этого устройства; приходят отдельным сообщением backend. */
   sessionUserState: SessionUserState;
   channels: ReadonlyMap<string, ChannelView>;
@@ -71,6 +76,7 @@ class Store {
   private state: AppState = {
     connection: 'connecting',
     overview: { hosts: [], sessions: [] },
+    overviewLoaded: false,
     sessionUserState: { pinned: [], unread: [] },
     channels: new Map(),
     notices: [],
@@ -83,10 +89,10 @@ class Store {
   /** Растёт на каждом снимке канала: эмулятор по нему отличает новую точку отсчёта от action. */
   private epoch = 0;
   /**
-   * Слушатели вывода PTY. Кадры `terminalData` не проходят через состояние React:
+   * Слушатели вывода PTY по каналам. Кадры `terminalData` не проходят через состояние React:
    * их получают эмуляторы напрямую, иначе 30 обновлений в секунду перерисовывали бы страницу.
    */
-  private readonly channelDataListeners = new Set<(hostId: string, uri: string, data: string) => void>();
+  private readonly channelDataListeners = new Map<string, Set<(data: string) => void>>();
   /**
    * Кадры, пришедшие до подписки эмулятора (например, между приходом снимка и монтированием
    * xterm). Без буфера начало вывода терялось бы при каждом F5.
@@ -130,18 +136,25 @@ class Store {
   }
 
   /**
-   * Поток вывода терминала: кадры идут мимо React-состояния и отдаются всем
-   * подписчикам (эмулятору) в том порядке, в каком их прислал backend.
-   * Кадры, пришедшие до подписки, не теряются: они ждут в буфере канала.
+   * Поток вывода терминала: кадры идут мимо React-состояния и отдаются подписчику
+   * конкретного канала. Кадры этого канала, пришедшие до подписки, не теряются:
+   * они ждут в его собственном буфере и отдаются при подписке.
    */
-  subscribeChannelData(listener: (hostId: string, uri: string, data: string) => void): () => void {
-    this.channelDataListeners.add(listener);
-    for (const [key, data] of this.channelDataBuffer) {
-      const split = key.indexOf('\u0000');
-      listener(key.slice(0, split), key.slice(split + 1), data);
+  subscribeChannelData(hostId: string, uri: string, listener: (data: string) => void): () => void {
+    const key = channelKey(hostId, uri);
+    const listeners = this.channelDataListeners.get(key) ?? new Set<(data: string) => void>();
+    listeners.add(listener);
+    this.channelDataListeners.set(key, listeners);
+    const buffered = this.channelDataBuffer.get(key);
+    if (buffered !== undefined) {
+      this.channelDataBuffer.delete(key);
+      listener(buffered);
     }
-    this.channelDataBuffer.clear();
-    return () => this.channelDataListeners.delete(listener);
+    return () => {
+      const current = this.channelDataListeners.get(key);
+      if (!current?.delete(listener)) return;
+      if (current.size === 0) this.channelDataListeners.delete(key);
+    };
   }
 
   /** Забывает буфер канала, чтобы выброшенный поток не всплыл при следующей подписке. */
@@ -277,7 +290,8 @@ class Store {
   private onMessage(message: ServerMessage): void {
     switch (message.t) {
       case 'overview':
-        this.update({ overview: message.overview });
+        // Первая сводка — точка, после которой страница терминала знает набор PTY.
+        this.update({ overview: message.overview, overviewLoaded: true });
         return;
       case 'snapshot': {
         const key = channelKey(message.hostId, message.uri);
@@ -310,11 +324,14 @@ class Store {
       case 'terminalData': {
         const key = channelKey(message.hostId, message.uri);
         if (!this.watches.has(key)) return;
-        if (this.channelDataListeners.size === 0) {
+        const listeners = this.channelDataListeners.get(key);
+        if (!listeners?.size) {
+          // У этого канала нет слушателя: буферизуем именно его, не теряя кадр
+          // из-за того, что слушатель есть у другого терминала.
           this.bufferChannelData(key, message.data);
           return;
         }
-        for (const listener of this.channelDataListeners) listener(message.hostId, message.uri, message.data);
+        for (const listener of listeners) listener(message.data);
         return;
       }
       case 'channelError': {
@@ -419,4 +436,46 @@ export function useChannel<T extends ChannelState>(hostId: string, uri: string |
   const { channels } = useAppState();
   const view = uri ? channels.get(channelKey(hostId, uri)) ?? EMPTY_VIEW : EMPTY_VIEW;
   return view as { state?: T; error?: string; missing?: boolean; epoch?: number };
+}
+
+export interface ChannelRef {
+  hostId: string;
+  uri: string;
+}
+
+/**
+ * Подписки на набор каналов. Diff по ключам: открытие или закрытие одного терминала
+ * не пересоздаёт подписку удержанных, иначе их поток вывода и снимок потерялись бы.
+ */
+export function useChannels(refs: readonly ChannelRef[]): ReadonlyMap<string, ChannelView> {
+  const releases = useRef(new Map<string, () => void>());
+  const latest = useRef(refs);
+  latest.current = refs;
+  const keys = new Set(refs.map(ref => channelKey(ref.hostId, ref.uri)));
+  const signature = [...keys].sort().join('\n');
+
+  useEffect(() => {
+    const current = releases.current;
+    const wanted = new Map<string, ChannelRef>();
+    for (const ref of latest.current) wanted.set(channelKey(ref.hostId, ref.uri), ref);
+    for (const [key, release] of current) {
+      if (wanted.has(key)) continue;
+      release();
+      current.delete(key);
+    }
+    for (const [key, ref] of wanted) {
+      if (current.has(key)) continue;
+      current.set(key, store.watch(ref.hostId, ref.uri));
+    }
+  }, [signature]);
+
+  useEffect(() => () => {
+    for (const release of releases.current.values()) release();
+    releases.current.clear();
+  }, []);
+
+  const { channels } = useAppState();
+  const views = new Map<string, ChannelView>();
+  for (const key of keys) views.set(key, channels.get(key) ?? EMPTY_VIEW);
+  return views;
 }

@@ -29,6 +29,7 @@ const snapshot = (hostId: string, uri: string) => receive({ t: 'snapshot', hostI
 
 test('после повреждённых сообщений браузер принимает следующую сводку', () => {
   const previous = store.getState();
+  assert.equal(previous.overviewLoaded, false, 'до первой сводки страница не знает набор терминалов');
   for (const data of ['{', 'null', '{"t":"overview"}']) socket.onmessage!({ data });
   assert.equal(store.getState(), previous);
 
@@ -36,6 +37,7 @@ test('после повреждённых сообщений браузер пр
   receive({ t: 'overview', overview });
   assert.notEqual(store.getState(), previous);
   assert.deepEqual(store.getState().overview, overview);
+  assert.equal(store.getState().overviewLoaded, true);
   assert.equal(store.getState().connection, 'open');
 });
 
@@ -144,16 +146,51 @@ test('поток терминала идёт мимо состояния React �
   assert.equal(store.getState(), before);
 
   const seen: string[] = [];
-  const unsubscribe = store.subscribeChannelData((hostId, uri, data) => seen.push(`${hostId}:${uri}:${data}`));
-  assert.deepEqual(seen, [`one:${terminal}:early`], 'кадр, пришедший до подписки, не теряется');
+  const unsubscribe = store.subscribeChannelData('one', terminal, data => seen.push(data));
+  assert.deepEqual(seen, ['early'], 'кадр, пришедший до подписки, не теряется');
   receive({ t: 'terminalData', hostId: 'one', uri: terminal, data: 'late' });
-  assert.deepEqual(seen.at(-1), `one:${terminal}:late`);
+  assert.deepEqual(seen.at(-1), 'late');
   assert.equal(store.getState(), before, 'кадры не меняют channels');
 
   // Кадр чужого канала не должен попасть в этот эмулятор.
   store.forgetChannelData('one', terminal);
   unsubscribe();
   release();
+});
+
+test('поток адресный: подписка на один терминал не съедает буфер другого', () => {
+  const first = 'ahp-terminal:/first';
+  const second = 'ahp-terminal:/second';
+  const releaseFirst = store.watch('one', first);
+  const releaseSecond = store.watch('one', second);
+  snapshot('one', first);
+  snapshot('one', second);
+  receive({ t: 'terminalData', hostId: 'one', uri: first, data: 'first-early' });
+  receive({ t: 'terminalData', hostId: 'one', uri: second, data: 'second-early' });
+
+  const seenFirst: string[] = [];
+  const offFirst = store.subscribeChannelData('one', first, data => seenFirst.push(data));
+  assert.deepEqual(seenFirst, ['first-early'], 'подписка получает только свой буфер');
+
+  receive({ t: 'terminalData', hostId: 'one', uri: first, data: '-late' });
+  assert.deepEqual(seenFirst, ['first-early', '-late']);
+
+  const seenSecond: string[] = [];
+  const offSecond = store.subscribeChannelData('one', second, data => seenSecond.push(data));
+  assert.deepEqual(seenSecond, ['second-early'], 'буфер второго канала пережил подписку на первый');
+
+  // Кадр канала без слушателя буферизуется, даже когда слушатель есть у соседнего.
+  offFirst();
+  receive({ t: 'terminalData', hostId: 'one', uri: first, data: 'first-buffered' });
+  assert.deepEqual(seenFirst, ['first-early', '-late']);
+  const seenAgain: string[] = [];
+  const offAgain = store.subscribeChannelData('one', first, data => seenAgain.push(data));
+  assert.deepEqual(seenAgain, ['first-buffered']);
+
+  offAgain();
+  offSecond();
+  releaseFirst();
+  releaseSecond();
 });
 
 test('буфер вывода до подписки не рвёт суррогатную пару', () => {
@@ -164,7 +201,7 @@ test('буфер вывода до подписки не рвёт суррога
   // Обрезка до 256 КиБ попадает ровно между половинами эмодзи: префикс + эмодзи + хвост.
   receive({ t: 'terminalData', hostId: 'one', uri: terminal, data: `😀${'c'.repeat(262_143)}` });
   const seen: string[] = [];
-  const unsubscribe = store.subscribeChannelData((_hostId, _uri, data) => seen.push(data));
+  const unsubscribe = store.subscribeChannelData('one', terminal, data => seen.push(data));
   const buffered = seen[0] ?? '';
   assert.ok(buffered.length <= 256 * 1024 + 1, 'буфер остаётся ограниченным');
   assert.equal(buffered.charCodeAt(0), 0xd83d, 'старшая половина эмодзи на месте');
@@ -201,7 +238,7 @@ test('снимок терминала начинает новую точку о�
   receive({ t: 'terminalData', hostId: 'one', uri: terminal, data: 'stale' });
   receive({ t: 'snapshot', hostId: 'one', uri: terminal, state: base });
   const seen: string[] = [];
-  const unsubscribe = store.subscribeChannelData((_hostId, _uri, data) => seen.push(data));
+  const unsubscribe = store.subscribeChannelData('one', terminal, data => seen.push(data));
   assert.deepEqual(seen, [], 'кадры до снимка не доигрываются поверх него');
   unsubscribe();
   release();
