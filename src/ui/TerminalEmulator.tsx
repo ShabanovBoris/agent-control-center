@@ -22,12 +22,14 @@ interface TerminalEmulatorProps {
   state: TerminalState | undefined;
   /** Номер снимка: меняется только когда канал прислал новую точку отсчёта. */
   epoch: number | undefined;
+  /** Панель выбрана в списке: только она получает фокус клавиатуры. */
+  active: boolean;
   /** Нет связи или PTY завершён: ввод не отправляется. */
   interactive: boolean;
   onNotice(message: string): void;
 }
 
-export default function TerminalEmulator({ hostId, uri, state, epoch, interactive, onNotice }: TerminalEmulatorProps) {
+export default function TerminalEmulator({ hostId, uri, state, epoch, active, interactive, onNotice }: TerminalEmulatorProps) {
   const container = useRef<HTMLDivElement>(null);
   const terminal = useRef<Terminal | undefined>(undefined);
   const interactiveRef = useRef(interactive);
@@ -86,7 +88,6 @@ export default function TerminalEmulator({ hostId, uri, state, epoch, interactiv
     // Первый fit — синхронно: иначе xterm стартует с 80×24 и первая строка обрезается.
     fit.fit();
     sendResize();
-    term.focus();
 
     return () => {
       clearTimeout(resizeTimer);
@@ -110,14 +111,17 @@ export default function TerminalEmulator({ hostId, uri, state, epoch, interactiv
     term.write(contentOf(state));
   }, [state, epoch]);
 
-  // Поток вывода: подписка живёт вместе с компонентом и не зависит от рендеров.
+  // Фокус — только у выбранной панели. Скрытые панели остаются смонтированными
+  // и продолжают писать поток, но клавиатура не должна уходить в невидимый xterm.
+  useEffect(() => {
+    if (active) terminal.current?.focus();
+  }, [active]);
+
+  // Поток вывода: подписка адресная и живёт вместе с компонентом, не завися от рендеров.
   useEffect(() => {
     const term = terminal.current;
     if (!term) return;
-    return store.subscribeChannelData((dataHostId, dataUri, data) => {
-      if (dataHostId !== hostId || dataUri !== uri) return;
-      term.write(data);
-    });
+    return store.subscribeChannelData(hostId, uri, data => term.write(data));
   }, [hostId, uri]);
 
   return <div className="terminal-screen" ref={container} />;

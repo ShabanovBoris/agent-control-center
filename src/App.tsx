@@ -40,7 +40,7 @@ type Filter = 'all' | 'active' | 'input' | 'archived';
 
 
 export function App() {
-  const { connection, overview, channels, notices, sessionUserState } = useAppState();
+  const { connection, overview, overviewLoaded, channels, notices, sessionUserState } = useAppState();
   const backendConnected = connection === 'open';
   const [selection, setSelection] = useState(() => selectionFromHash(location.hash));
   const [creating, setCreating] = useState(false);
@@ -217,6 +217,7 @@ export function App() {
           <TerminalView
             hosts={overview.hosts}
             connected={backendConnected}
+            overviewLoaded={overviewLoaded}
             onClose={() => { setShowTerminal(false); setShowSessionList(true); }}
           />
         ) : showHealth ? (

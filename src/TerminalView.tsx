@@ -1,11 +1,16 @@
-import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react';
+import { lazy, Suspense, useCallback, useEffect, useMemo, useState } from 'react';
 import type { HostOverview, TerminalState } from '../shared/protocol';
+import { directoryName, normalizeDirectoryPath } from '../shared/directory';
+import { channelKey } from '../shared/reduce';
 import { pathOf } from './format';
-import { describeError, store, useChannel } from './store';
+import { describeError, store, useChannels } from './store';
 import {
-  forgetTerminal, lastTerminal, rememberLastTerminal, rememberTerminal, savedTerminal, terminalChoice, terminalCwd,
+  forgetSelectedTerminal, forgetTerminalLabel, lastTerminalForm, nextTerminalLabel,
+  rememberLastTerminalForm, rememberSelectedTerminal, rememberTerminalLabel, selectedTerminal,
+  terminalCwd, terminalLabels, terminalRowLabels, terminalStatusText,
 } from './terminal-session';
 import { DirectoryTree } from './ui/DirectoryTree';
+import { TerminalList, type TerminalListEntry } from './ui/TerminalList';
 import { directoryHistory, rememberDirectory } from './recent-directories';
 import { isAbsoluteHostPath } from './session-config';
 
@@ -15,163 +20,326 @@ import { isAbsoluteHostPath } from './session-config';
  */
 const TerminalEmulator = lazy(() => import('./ui/TerminalEmulator'));
 
-interface TerminalOrigin {
+/** Терминал, созданный этим устройством и ещё не появившийся в overview. */
+interface PendingTerminal {
   hostId: string;
+  uri: string;
+  title: string;
   directory: string;
-  attached?: string;
+}
+
+/** Строка общего списка: всё, что нужно для выбора и статуса. */
+interface TerminalEntry {
+  hostId: string;
+  hostLabel: string;
+  uri: string;
+  title: string;
+  /** lifecycle из overview/pending: строка показывает статус до прихода снимка канала. */
+  lifecycle?: TerminalState['lifecycle'];
+  /** Запрошенная папка pending-терминала: cwd из состояния появится после снимка. */
+  directory?: string;
+}
+
+const rowKey = (hostId: string, uri: string): string => channelKey(hostId, uri);
+
+/** Приватный режим может запретить localStorage: страница открывается без выбора. */
+function readSelection(): { hostId: string; uri: string } | undefined {
+  try { return selectedTerminal(window.localStorage); } catch { return undefined; }
+}
+
+function readForm(): { hostId: string; directory: string } | undefined {
+  try { return lastTerminalForm(window.localStorage); } catch { return undefined; }
+}
+
+/** Подписи строк из localStorage: в приватном режиме остаются хост-заголовки. */
+function readLabels(): ReadonlyMap<string, string> {
+  try { return terminalLabels(window.localStorage); } catch { return new Map(); }
 }
 
 /**
- * Что показать при открытии страницы: последнюю пару хост+папка и её сохранённый PTY.
- * Папка по умолчанию — запасной вариант, когда сохранённой пары нет. Приватный режим
- * может запретить localStorage целиком: тогда страница просто открывается формой.
+ * Страница `#terminal`: общий список всех своих PTY backend и один активный экран.
+ * Набор приходит из overview (backend читает root хоста), поэтому PTY живут до
+ * «Закрыть терминал», а F5 и возврат на страницу восстанавливают те же сессии.
  */
-function restoreTerminal(storage: Storage, hosts: readonly HostOverview[]): TerminalOrigin {
-  const host = hosts.find(candidate => candidate.status === 'connected') ?? hosts[0];
-  const directory = pathOf(host?.defaultDirectory);
-  try {
-    const last = lastTerminal(storage);
-    const hostId = last && hosts.some(candidate => candidate.id === last.hostId) ? last.hostId : host?.id ?? '';
-    const path = last && last.hostId === hostId ? last.directory : directory;
-    const attached = savedTerminal(storage, hostId, path);
-    return { hostId, directory: path, ...(attached ? { attached } : {}) };
-  } catch {
-    // Приватный режим или запрет на localStorage: страница открывается формой, без подхвата.
-    return { hostId: host?.id ?? '', directory };
-  }
-}
-
-/**
- * Страница `#terminal`: один shell на страницу, хост и папка выбираются здесь же.
- * PTY живёт до «Закрыть терминал»: уход со страницы его не убивает, а F5 и возврат
- * подхватывают тот же URI из localStorage по паре хост+папка.
- */
-export function TerminalView({ hosts, connected, onClose }: {
+export function TerminalView({ hosts, connected, overviewLoaded, onClose }: {
   hosts: readonly HostOverview[];
   connected: boolean;
+  overviewLoaded: boolean;
   onClose(): void;
 }) {
-  // Первое открытие и F5 восстанавливают ту же пару хост+папка: без этого страница после
-  // перезагрузки показывала бы форму (или терминал другой папки) и создавала второй PTY.
-  const [initial] = useState(() => restoreTerminal(window.localStorage, hosts));
-  const [hostId, setHostId] = useState(initial.hostId);
-  const host = hosts.find(candidate => candidate.id === hostId);
-  const [directory, setDirectory] = useState(initial.directory);
-  /** URI подхваченного терминала: `undefined` — показываем форму открытия. */
-  const [attached, setAttached] = useState(initial.attached);
+  // Выбор читается синхронно при монтировании: после F5 он уже в состоянии к первой сводке.
+  const [selected, setSelected] = useState(readSelection);
+  const [pending, setPending] = useState<ReadonlyMap<string, PendingTerminal>>(() => new Map());
+  const [labels, setLabels] = useState(readLabels);
+  const [closing, setClosing] = useState<ReadonlySet<string>>(() => new Set());
+  const [formOpen, setFormOpen] = useState(false);
+  const [formHostId, setFormHostId] = useState(() => readForm()?.hostId ?? '');
+  const [formDirectory, setFormDirectory] = useState(() => readForm()?.directory ?? '');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>();
-  const [recent, setRecent] = useState(() => directoryHistory(window.localStorage, initial.hostId));
+  const [recent, setRecent] = useState(() => directoryHistory(window.localStorage, readForm()?.hostId ?? ''));
 
-  const available = connected && host?.status === 'connected';
-  // Сводка хостов приходит уже после первого рендера: до неё hostId пуст, и сохранённый URI
-  // пары «хост+папка» ещё не с чем связать. Догоняем, как только хосты появились.
+  /** Overview + только что созданные PTY; закрываемые строки скрыты до обновления root. */
+  const entries = useMemo(() => {
+    const map = new Map<string, TerminalEntry>();
+    for (const host of hosts) {
+      for (const terminal of host.terminals ?? []) {
+        map.set(rowKey(host.id, terminal.resource), {
+          hostId: host.id,
+          hostLabel: host.label,
+          uri: terminal.resource,
+          title: terminal.title,
+          lifecycle: terminal.lifecycle,
+        });
+      }
+    }
+    for (const [key, item] of pending) {
+      if (map.has(key)) continue;
+      map.set(key, {
+        hostId: item.hostId,
+        hostLabel: hosts.find(host => host.id === item.hostId)?.label ?? item.hostId,
+        uri: item.uri,
+        title: item.title,
+        directory: item.directory,
+      });
+    }
+    return [...map.values()].filter(entry => !closing.has(rowKey(entry.hostId, entry.uri)));
+  }, [hosts, pending, closing]);
+
+  // Все видимые терминалы под наблюдением backend-а: их вывод не теряется при переключении,
+  // а вытеснение «старейшего без наблюдателей» не срабатывает, пока страница открыта.
+  const channels = useChannels(entries.map(entry => ({ hostId: entry.hostId, uri: entry.uri })));
+
+  // PTY, закрытый на другом устройстве или хостом, исчезает из списка, а не висит мёртвым.
+  const rows = entries.filter(entry => channels.get(rowKey(entry.hostId, entry.uri))?.missing !== true);
+  const overviewSignature = rows.map(entry => rowKey(entry.hostId, entry.uri)).join('\n');
+
+  const selectedKey = selected ? rowKey(selected.hostId, selected.uri) : undefined;
+  const activeIndex = rows.findIndex(entry => rowKey(entry.hostId, entry.uri) === selectedKey);
+  const active = activeIndex >= 0 ? rows[activeIndex] : rows[0];
+  const activeKey = active ? rowKey(active.hostId, active.uri) : undefined;
+  const activeView = activeKey ? channels.get(activeKey) : undefined;
+  const activeState = activeView?.state as TerminalState | undefined;
+
+  const rememberSelection = useCallback((hostId: string, uri: string) => {
+    try { rememberSelectedTerminal(window.localStorage, hostId, uri); }
+    catch (failure) { store.notify(`Выбор терминала не удалось запомнить: ${describeError(failure)}`); }
+  }, []);
+
+  const select = useCallback((hostId: string, uri: string) => {
+    setSelected({ hostId, uri });
+    rememberSelection(hostId, uri);
+    setFormOpen(false);
+    setError(undefined);
+  }, [rememberSelection]);
+
+  // Первая сводка — точка, после которой можно сверять сохранённый выбор со списком.
+  // До неё эффект молчит: иначе F5 терял бы выбранный URI ещё до прихода overview.
   useEffect(() => {
-    if (hostId || hosts.length === 0) return;
-    const restored = restoreTerminal(window.localStorage, hosts);
-    setHostId(restored.hostId);
-    setDirectory(restored.directory);
-    setAttached(restored.attached);
-    setRecent(directoryHistory(window.localStorage, restored.hostId));
-  }, [hostId, hosts]);
-  const channel = useChannel<TerminalState>(hostId, attached);
-  const state = channel.state;
+    if (!overviewLoaded) return;
+    if (rows.length === 0) {
+      setSelected(undefined);
+      setFormOpen(true);
+      if (!selected) return;
+      try { forgetSelectedTerminal(window.localStorage); } catch { /* приватный режим */ }
+      return;
+    }
+    if (selected && rows.some(entry => rowKey(entry.hostId, entry.uri) === rowKey(selected.hostId, selected.uri))) return;
+    const first = rows[0]!;
+    setSelected({ hostId: first.hostId, uri: first.uri });
+    rememberSelection(first.hostId, first.uri);
+    // rows/selected читаются на момент смены набора: эффект не должен срабатывать на клик.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [overviewLoaded, overviewSignature, rememberSelection]);
 
-  const create = useCallback(async (forPath: string) => {
+  // Форма подставляет хост из последней пары, иначе первый подключённый хост.
+  useEffect(() => {
+    if (!overviewLoaded) return;
+    if (formHostId && hosts.some(candidate => candidate.id === formHostId)) return;
+    const saved = readForm();
+    const host = hosts.find(candidate => candidate.id === saved?.hostId)
+      ?? hosts.find(candidate => candidate.status === 'connected')
+      ?? hosts[0];
+    setFormHostId(host?.id ?? '');
+    setFormDirectory(saved && saved.hostId === host?.id ? saved.directory : pathOf(host?.defaultDirectory));
+    setRecent(directoryHistory(window.localStorage, host?.id ?? ''));
+  }, [overviewLoaded, formHostId, hosts]);
+
+  const overviewKeys = useMemo(() => {
+    const keys = new Set<string>();
+    for (const host of hosts) {
+      for (const terminal of host.terminals ?? []) keys.add(rowKey(host.id, terminal.resource));
+    }
+    return keys;
+  }, [hosts]);
+
+  // Pending живёт до появления URI в overview или до NotFound канала.
+  useEffect(() => {
+    setPending(previous => {
+      let changed = false;
+      const next = new Map(previous);
+      for (const key of previous.keys()) {
+        if (overviewKeys.has(key) || channels.get(key)?.missing) {
+          next.delete(key);
+          changed = true;
+        }
+      }
+      return changed ? next : previous;
+    });
+  }, [overviewKeys, channels]);
+
+  // Строка закрытия исчезает, когда root перестал отдавать URI: overview — источник истины.
+  useEffect(() => {
+    setClosing(previous => {
+      let changed = false;
+      const next = new Set(previous);
+      for (const key of previous) {
+        if (!overviewKeys.has(key)) {
+          next.delete(key);
+          changed = true;
+        }
+      }
+      return changed ? next : previous;
+    });
+  }, [overviewKeys]);
+
+  const openForm = useCallback(() => {
+    setError(undefined);
+    setFormOpen(true);
+    if (!active) return;
+    const cwd = terminalCwd(channels.get(rowKey(active.hostId, active.uri))?.state as TerminalState | undefined, active.directory ?? '');
+    setFormHostId(active.hostId);
+    setFormDirectory(cwd || active.directory || '');
+    setRecent(directoryHistory(window.localStorage, active.hostId));
+  }, [active, channels]);
+
+  /** Форма всегда создаёт новый PTY: старый по паре «хост+папка» не подхватывается. */
+  const open = useCallback(async () => {
+    if (busy) return;
+    const host = hosts.find(candidate => candidate.id === formHostId);
+    if (!connected || host?.status !== 'connected') {
+      setError('Хост не подключён');
+      return;
+    }
+    if (!isAbsoluteHostPath(formDirectory)) {
+      setError('Укажите абсолютный путь к папке на хосте, например /Users/me/project');
+      return;
+    }
+    const directory = formDirectory.trim();
+    // Имя строки закрепляется за URI: реальный хост отдаёт title «bash» и не переименовывает PTY.
+    const folder = normalizeDirectoryPath(directory);
+    const used = rows.flatMap(entry => {
+      if (entry.hostId !== formHostId) return [];
+      const state = channels.get(rowKey(entry.hostId, entry.uri))?.state as TerminalState | undefined;
+      if (normalizeDirectoryPath(terminalCwd(state, entry.directory ?? '')) !== folder) return [];
+      return [labels.get(entry.uri) || entry.title];
+    });
+    const title = nextTerminalLabel(directoryName(directory) ?? 'Терминал', used);
     setBusy(true);
     setError(undefined);
     try {
-      const { terminalUri } = await store.call<{ terminalUri: string }>({ op: 'createTerminal', hostId, directory: forPath });
-      try { rememberTerminal(window.localStorage, hostId, forPath, terminalUri); }
-      catch (failure) { store.notify(`Терминал не удалось запомнить: ${describeError(failure)}`); }
-      setAttached(terminalUri);
+      rememberDirectory(window.localStorage, formHostId, directory);
+      rememberLastTerminalForm(window.localStorage, formHostId, directory);
+      setRecent(directoryHistory(window.localStorage, formHostId));
+    } catch (failure) {
+      store.notify(`Папку не удалось запомнить: ${describeError(failure)}`);
+    }
+    try {
+      const { terminalUri } = await store.call<{ terminalUri: string }>({
+        op: 'createTerminal',
+        hostId: formHostId,
+        directory,
+        title,
+      });
+      try { rememberTerminalLabel(window.localStorage, terminalUri, title); }
+      catch (failure) { store.notify(`Имя терминала не удалось запомнить: ${describeError(failure)}`); }
+      setLabels(previous => new Map(previous).set(terminalUri, title));
+      setPending(previous => new Map(previous).set(rowKey(formHostId, terminalUri), {
+        hostId: formHostId, uri: terminalUri, title, directory,
+      }));
+      select(formHostId, terminalUri);
     } catch (failure) {
       setError(describeError(failure));
     } finally {
       setBusy(false);
     }
-  }, [hostId]);
-
-  /** Сохранённый URI сначала подхватывается; NotFound приводит к созданию нового (см. эффект ниже). */
-  const open = useCallback(() => {
-    if (!available || busy) return;
-    if (!isAbsoluteHostPath(directory)) {
-      setError('Укажите абсолютный путь к папке на хосте, например /Users/me/project');
-      return;
-    }
-    setError(undefined);
-    try {
-      rememberDirectory(window.localStorage, hostId, directory);
-      // Пара запоминается до выбора «подхватить или создать»: после F5 страница вернётся
-      // и к подхваченному, и к новому терминалу именно этой папки.
-      rememberLastTerminal(window.localStorage, hostId, directory);
-    } catch (failure) { store.notify(`Папку не удалось запомнить: ${describeError(failure)}`); }
-    setRecent(directoryHistory(window.localStorage, hostId));
-    // Сохранённый URI подхватывается как есть; если его уже нет, эффект `terminalChoice`
-    // пересоздаст PTY. Без сохранённого сразу создаём новый. Запрет на localStorage
-    // (приватный режим) не мешает открыть терминал — просто его не получится подхватить.
-    let saved: string | undefined;
-    try { saved = savedTerminal(window.localStorage, hostId, directory); }
-    catch (failure) { store.notify(`Сохранённый терминал недоступен: ${describeError(failure)}`); }
-    setAttached(saved);
-    if (!saved) void create(directory);
-  }, [available, busy, directory, hostId, create]);
-
-  // Закрытый или вычищенный PTY: `terminalChoice` превращает NotFound в решение «создать новый»,
-  // а незавершённый снимок оставляет сохранённый URI в игре (иначе открывался бы второй PTY).
-  // Попытка на URI запоминается: если хост откажет в создании, страница не будет долбить его вечно.
-  const choice = attached ? terminalChoice(attached, channel) : undefined;
-  const replace = choice?.kind === 'create';
-  const replaced = useRef<string | undefined>(undefined);
-
-  /** Забывает сохранённый URI: приватный режим может запретить запись, но это не повод падать. */
-  const forgetSaved = useCallback((uri: string) => {
-    try { forgetTerminal(window.localStorage, hostId, directory); }
-    catch (failure) { store.notify(`Запись терминала не удалось обновить: ${describeError(failure)}`); }
-    store.forgetChannelData(hostId, uri);
-  }, [directory, hostId]);
-
-  useEffect(() => {
-    // Пока хост отключён, новый PTY не создать: дождёмся связи, чтобы не терять попытку.
-    if (!attached || !replace || !available || replaced.current === attached) return;
-    replaced.current = attached;
-    forgetSaved(attached);
-    void create(directory);
-  }, [attached, replace, available, forgetSaved, directory, create]);
-
-  const openNew = () => {
-    if (attached) forgetSaved(attached);
-    setAttached(undefined);
-    if (directory) void create(directory);
-  };
+  }, [busy, channels, connected, formDirectory, formHostId, hosts, labels, rows, select]);
 
   const close = useCallback(async () => {
-    if (!attached) return;
+    if (!active || busy) return;
+    const key = rowKey(active.hostId, active.uri);
     setBusy(true);
     try {
-      await store.call({ op: 'disposeTerminal', hostId, terminalUri: attached });
+      await store.call({ op: 'disposeTerminal', hostId: active.hostId, terminalUri: active.uri });
+      // `closing` ставится после успешного ответа: иначе неудачное закрытие
+      // размонтировало бы живой xterm и потеряло бы контекст.
+      setClosing(previous => new Set(previous).add(key));
+      setPending(previous => {
+        if (!previous.has(key)) return previous;
+        const next = new Map(previous);
+        next.delete(key);
+        return next;
+      });
+      store.forgetChannelData(active.hostId, active.uri);
+      // Имя закрытого PTY больше не нужно: URI не вернётся под тем же shell.
+      try { forgetTerminalLabel(window.localStorage, active.uri); } catch { /* приватный режим */ }
+      setLabels(previous => {
+        if (!previous.has(active.uri)) return previous;
+        const next = new Map(previous);
+        next.delete(active.uri);
+        return next;
+      });
+      const remaining = rows.filter(entry => rowKey(entry.hostId, entry.uri) !== key);
+      const next = remaining.find(entry => entry.hostId === active.hostId) ?? remaining[0];
+      if (next) {
+        select(next.hostId, next.uri);
+      } else {
+        setSelected(undefined);
+        setFormOpen(true);
+        try { forgetSelectedTerminal(window.localStorage); } catch { /* приватный режим */ }
+      }
     } catch (failure) {
       store.notify(`Терминал не закрыт: ${describeError(failure)}`);
     } finally {
-      // Даже если хост не подтвердил закрытие, запись в localStorage не должна вести на мёртвый URI.
-      forgetSaved(attached);
-      setAttached(undefined);
       setBusy(false);
     }
-  }, [attached, forgetSaved, hostId]);
+  }, [active, busy, rows, select]);
 
   const changeHost = (nextId: string) => {
-    setHostId(nextId);
-    setDirectory(pathOf(hosts.find(candidate => candidate.id === nextId)?.defaultDirectory));
-    setAttached(undefined);
+    setFormHostId(nextId);
+    setFormDirectory(pathOf(hosts.find(candidate => candidate.id === nextId)?.defaultDirectory));
     setError(undefined);
     setRecent(directoryHistory(window.localStorage, nextId));
   };
 
-  const lifecycle = state?.lifecycle;
+  const lifecycle = activeState?.lifecycle ?? active?.lifecycle;
   const running = lifecycle?.status === 'running';
-  const cwd = terminalCwd(state, directory);
-  const loaded = channel.state !== undefined || channel.missing === true || channel.error !== undefined;
+  const cwd = terminalCwd(activeState, active?.directory ?? '');
+  const waitingOverview = !overviewLoaded && connected;
+  const showForm = formOpen || rows.length === 0;
+  const rowDrafts = rows.map(entry => {
+    const key = rowKey(entry.hostId, entry.uri);
+    const view = channels.get(key);
+    const state = view?.state as TerminalState | undefined;
+    const folder = terminalCwd(state, entry.directory ?? '');
+    return {
+      key,
+      hostId: entry.hostId,
+      uri: entry.uri,
+      hostLabel: entry.hostLabel,
+      title: entry.title,
+      folder: normalizeDirectoryPath(folder) ?? '',
+      cwd: folder || undefined,
+      status: terminalStatusText(state?.lifecycle ?? entry.lifecycle),
+    };
+  });
+  // Сохранённое имя при создании важнее title хоста: у реальных хостов это «bash».
+  const rowLabels = terminalRowLabels(rowDrafts, labels);
+  const listItems: TerminalListEntry[] = rowDrafts.map(({ key, hostId, uri, hostLabel, cwd, status }, index) => ({
+    key, hostId, uri, hostLabel, cwd, status, title: rowLabels[index]!,
+  }));
+
+  const formAvailable = connected && hosts.find(candidate => candidate.id === formHostId)?.status === 'connected';
 
   return (
     <div className="terminal-page">
@@ -179,7 +347,10 @@ export function TerminalView({ hosts, connected, onClose }: {
         <button className="mobile-back" aria-controls="sidebar" onClick={onClose}>‹ Сессии</button>
         <h2>Терминал</h2>
         <div className="terminal-actions">
-          {attached && (
+          {!waitingOverview && !showForm && (
+            <button type="button" className="terminal-new" disabled={busy} onClick={openForm}>Новый терминал</button>
+          )}
+          {active && !showForm && (
             <button type="button" className="terminal-close" disabled={busy} onClick={() => void close()}>
               Закрыть терминал
             </button>
@@ -188,96 +359,110 @@ export function TerminalView({ hosts, connected, onClose }: {
         </div>
       </header>
 
-      {attached ? (
+      {waitingOverview ? (
+        <p className="terminal-placeholder" role="status">Загружаем список терминалов…</p>
+      ) : (
         <>
-          <div className="terminal-status" aria-live="polite">
-            <span className={running ? 'dot dot-connected' : 'dot dot-disconnected'} aria-hidden />
-            <strong>{host?.label ?? hostId}</strong>
-            <code className="terminal-cwd" title={cwd}>{cwd}</code>
-            <span className="muted">
-              {lifecycle
-                ? lifecycle.status === 'exited'
-                  ? `завершён${lifecycle.exitCode !== undefined ? ` · код ${lifecycle.exitCode}` : ''}`
-                  : 'выполняется'
-                : 'подключаемся…'}
-            </span>
-            {state?.rows && state.cols ? <span className="muted">{state.cols}×{state.rows}</span> : null}
-            {lifecycle?.status === 'exited' && (
-              <button type="button" className="terminal-new" disabled={busy} onClick={openNew}>Открыть новый</button>
+          {active && (
+            <div className="terminal-status" aria-live="polite">
+              <span className={running ? 'dot dot-connected' : 'dot dot-disconnected'} aria-hidden />
+              <strong>{active.hostLabel}</strong>
+              <code className="terminal-cwd" title={cwd}>{cwd}</code>
+              <span className="muted">{terminalStatusText(lifecycle)}</span>
+              {activeState?.rows && activeState.cols ? <span className="muted">{activeState.cols}×{activeState.rows}</span> : null}
+            </div>
+          )}
+          {activeView?.error && <p className="error-text" role="alert">{activeView.error}</p>}
+          {listItems.length > 0 && <TerminalList items={listItems} activeKey={activeKey} onSelect={select} />}
+          <div className="terminal-stage">
+            <div className="terminal-stack">
+              {rows.map(entry => {
+                const key = rowKey(entry.hostId, entry.uri);
+                const view = channels.get(key);
+                const state = view?.state as TerminalState | undefined;
+                const paneActive = key === activeKey;
+                return (
+                  <div className="terminal-pane" data-active={paneActive ? 'true' : 'false'} key={key}>
+                    {state ? (
+                      <Suspense fallback={<p className="terminal-placeholder" role="status">Загружаем эмулятор терминала…</p>}>
+                        <TerminalEmulator
+                          hostId={entry.hostId}
+                          uri={entry.uri}
+                          state={state}
+                          epoch={view?.epoch}
+                          active={paneActive}
+                          // Resize нужен и скрытым панелям, поэтому interactive — только про ввод.
+                          interactive={state.lifecycle.status === 'running' && connected}
+                          onNotice={message => store.notify(message)}
+                        />
+                      </Suspense>
+                    ) : (
+                      <p className="terminal-placeholder" role="status">Открываем терминал…</p>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+            {showForm && (
+              <form className="terminal-form terminal-form-overlay" onSubmit={event => { event.preventDefault(); void open(); }}>
+                <label>
+                  Хост
+                  <select value={formHostId} onChange={event => changeHost(event.target.value)} disabled={busy}>
+                    {hosts.map(candidate => (
+                      <option key={candidate.id} value={candidate.id} disabled={candidate.status !== 'connected'}>
+                        {candidate.label}{candidate.status === 'connected' ? '' : ' (нет связи)'}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <div className="directory-picker">
+                  <label htmlFor="terminal-directory">Папка терминала на хосте</label>
+                  <input
+                    id="terminal-directory"
+                    value={formDirectory}
+                    onChange={event => setFormDirectory(event.target.value)}
+                    placeholder="/Users/me/project"
+                    spellCheck={false}
+                    required
+                    disabled={busy}
+                  />
+                  <div className="directory-actions">
+                    <DirectoryTree hostId={formHostId} initialPath={formDirectory} disabled={!formAvailable || busy} onChoose={setFormDirectory} />
+                  </div>
+                </div>
+                {recent.paths.length > 0 && (
+                  <label>
+                    Недавние папки
+                    <select value={recent.paths.includes(formDirectory) ? formDirectory : ''} onChange={event => { if (event.target.value) setFormDirectory(event.target.value); }} disabled={busy}>
+                      <option value="">Выберите недавнюю папку</option>
+                      {recent.paths.map(path => <option key={path} value={path}>{path}</option>)}
+                    </select>
+                  </label>
+                )}
+                <p className="muted terminal-note">
+                  Shell запускается на выбранном хосте без подтверждений команд и живёт до кнопки «Закрыть терминал».
+                  Каждое открытие создаёт новый PTY: в одной папке можно держать несколько агентов.
+                </p>
+                {recent.error && <p className="error-text" role="alert">{recent.error}</p>}
+                {error && <p className="error-text" role="alert">{error}</p>}
+                <div className="row">
+                  <button type="submit" className="primary" disabled={!formAvailable || busy}>
+                    {busy ? 'Открываем…' : 'Открыть терминал'}
+                  </button>
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={() => {
+                      // Отмена не трогает живые панели: они остаются смонтированными под формой.
+                      if (rows.length > 0) { setFormOpen(false); setError(undefined); }
+                      else onClose();
+                    }}
+                  >Отмена</button>
+                </div>
+              </form>
             )}
           </div>
-          {channel.error && <p className="error-text" role="alert">{channel.error}</p>}
-          {error && (
-            <p className="error-text" role="alert">
-              {error}
-              <button type="button" className="terminal-new" disabled={busy} onClick={openNew}>Повторить</button>
-            </p>
-          )}
-          {loaded ? (
-            <Suspense fallback={<p className="terminal-placeholder" role="status">Загружаем эмулятор терминала…</p>}>
-              <TerminalEmulator
-                key={attached}
-                hostId={hostId}
-                uri={attached}
-                state={channel.state}
-                epoch={channel.epoch}
-                interactive={running && connected}
-                onNotice={message => store.notify(message)}
-              />
-            </Suspense>
-          ) : (
-            <p className="terminal-placeholder" role="status">Открываем терминал…</p>
-          )}
         </>
-      ) : (
-        <form className="terminal-form" onSubmit={event => { event.preventDefault(); open(); }}>
-          <label>
-            Хост
-            <select value={hostId} onChange={event => changeHost(event.target.value)} disabled={busy}>
-              {hosts.map(candidate => (
-                <option key={candidate.id} value={candidate.id} disabled={candidate.status !== 'connected'}>
-                  {candidate.label}{candidate.status === 'connected' ? '' : ' (нет связи)'}
-                </option>
-              ))}
-            </select>
-          </label>
-          <div className="directory-picker">
-            <label htmlFor="terminal-directory">Папка терминала на хосте</label>
-            <input
-              id="terminal-directory"
-              value={directory}
-              onChange={event => setDirectory(event.target.value)}
-              placeholder="/Users/me/project"
-              spellCheck={false}
-              required
-              disabled={busy}
-            />
-            <div className="directory-actions">
-              <DirectoryTree hostId={hostId} initialPath={directory} disabled={!available || busy} onChoose={setDirectory} />
-            </div>
-          </div>
-          {recent.paths.length > 0 && (
-            <label>
-              Недавние папки
-              <select value={recent.paths.includes(directory) ? directory : ''} onChange={event => { if (event.target.value) setDirectory(event.target.value); }} disabled={busy}>
-                <option value="">Выберите недавнюю папку</option>
-                {recent.paths.map(path => <option key={path} value={path}>{path}</option>)}
-              </select>
-            </label>
-          )}
-          <p className="muted terminal-note">
-            Shell запускается на выбранном хосте без подтверждений команд и живёт до кнопки «Закрыть терминал».
-            Свои брошенные терминалы панель закрывает сама.
-          </p>
-          {recent.error && <p className="error-text" role="alert">{recent.error}</p>}
-          {error && <p className="error-text" role="alert">{error}</p>}
-          <div className="row">
-            <button type="submit" className="primary" disabled={!available || busy}>
-              {busy ? 'Открываем…' : 'Открыть терминал'}
-            </button>
-            <button type="button" disabled={busy} onClick={onClose}>Отмена</button>
-          </div>
-        </form>
       )}
     </div>
   );

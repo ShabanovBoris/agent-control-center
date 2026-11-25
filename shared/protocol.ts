@@ -54,6 +54,16 @@ export interface AgentOverview {
   setupDocsUrl?: string;
 }
 
+/**
+ * Терминал в сводке хоста. Источник — root/SDK-список хоста (`TerminalInfo`),
+ * но сюда попадают только терминалы этого backend: агентские и чужие отфильтрованы.
+ */
+export interface TerminalOverview {
+  resource: string;
+  title: string;
+  lifecycle: TerminalState['lifecycle'];
+}
+
 export interface HostOverview {
   id: string;
   label: string;
@@ -65,6 +75,11 @@ export interface HostOverview {
   canPickDirectory?: boolean;
   /** Backend сейчас планово перезапускает хост (restart:services или обновление). */
   restarting?: boolean;
+  /**
+   * Свои живые терминалы backend. Поле отсутствует, если хост не публикует список
+   * (`root.terminals`) или своих PTY нет; пустой массив в сводку не попадает.
+   */
+  terminals?: TerminalOverview[];
   agents: AgentOverview[];
 }
 

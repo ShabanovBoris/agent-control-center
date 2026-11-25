@@ -366,6 +366,85 @@ a { color: var(--accent); }
   white-space: nowrap;
   font-size: 12px;
 }
+/* Общий список терминалов: строки не растягивают страницу, длинный cwd обрезается. */
+.terminal-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: min(30dvh, 240px);
+  overflow-y: auto;
+  overflow-x: hidden;
+  min-width: 0;
+}
+.terminal-list > li { min-width: 0; }
+.terminal-row {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  width: 100%;
+  min-width: 0;
+  padding: 6px 8px;
+  text-align: left;
+  /* Прозрачная рамка той же толщины: список не дёргается при смене выбора. */
+  border: 2px solid transparent;
+  border-radius: 8px;
+  background: var(--soft);
+  color: var(--text);
+}
+.terminal-row[aria-current="true"] { border-color: #000; }
+@media (prefers-color-scheme: dark) {
+  /* На тёмном фоне чисто чёрная обводка сливается: добавляем светлый внутренний контур. */
+  .terminal-row[aria-current="true"] { box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.45); }
+}
+.terminal-row-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+  font-size: 13px;
+}
+.terminal-row-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 8px;
+  align-items: baseline;
+  min-width: 0;
+  font-size: 11px;
+  color: var(--muted);
+}
+.terminal-row-host, .terminal-row-status { flex: 0 0 auto; }
+.terminal-row-cwd {
+  flex: 1 1 120px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+}
+/* Сцена: все эмуляторы смонтированы, видима только выбранная панель. */
+.terminal-stage { position: relative; flex: 1; min-height: 0; }
+.terminal-stack { position: absolute; inset: 0; }
+.terminal-pane {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  visibility: hidden;
+}
+.terminal-pane[data-active="true"] { visibility: visible; }
+.terminal-form-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  width: 100%;
+  padding: 8px 2px 12px;
+  background: var(--bg);
+  overflow-y: auto;
+}
 .terminal-screen {
   flex: 1;
   min-height: 0;

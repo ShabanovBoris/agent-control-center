@@ -31,6 +31,14 @@ export function normalizeDirectoryPath(value: string): string | undefined {
   return `/${segments.join('/')}`;
 }
 
+/** Имя последнего сегмента канонического пути: `/work/src` → `src`, `/` → `/`. */
+export function directoryName(value: string): string | undefined {
+  const normalized = normalizeDirectoryPath(value);
+  if (!normalized) return undefined;
+  if (normalized === '/') return '/';
+  return normalized.slice(normalized.lastIndexOf('/') + 1);
+}
+
 export function parentDirectoryPath(path: string): string | undefined {
   const normalized = normalizeDirectoryPath(path);
   if (!normalized || normalized === '/') return undefined;

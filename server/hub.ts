@@ -52,7 +52,7 @@ import {
   type SlashCompletions,
 } from '../shared/protocol.js';
 import { channelKey, isSupportedChannel } from '../shared/reduce.js';
-import { normalizeDirectoryPath, parseDirectoryEntries } from '../shared/directory.js';
+import { directoryName, normalizeDirectoryPath, parseDirectoryEntries } from '../shared/directory.js';
 import { resolveTimeZone } from '../shared/usage.js';
 import { ChannelMirror } from './mirror.js';
 import { TerminalStream } from './terminal-stream.js';
@@ -722,7 +722,8 @@ export class Hub implements SearchEnvironment {
         channel: uri,
         // Claim остаётся за backend-клиентом: после F5 и рестарта backend shell принадлежит нам же.
         claim: { kind: TerminalClaimKind.Client, clientId: host.clientId },
-        ...(call.title ? { name: call.title } : {}),
+        // Имя видно в общем списке терминалов: явный title побеждает, иначе имя папки.
+        name: call.title?.trim() || directoryName(path) || 'Терминал',
         cwd: toFileUri(path),
         ...(call.cols && call.rows ? { cols: call.cols, rows: call.rows } : {}),
       });
@@ -1276,6 +1277,10 @@ export class Hub implements SearchEnvironment {
   private hostOverview(host: HostHandle): HostOverview {
     const root = this.mirror.state(host.id, ROOT_URI) as RootState | undefined;
     const configValues = root?.config?.values ?? {};
+    // Список терминалов уже есть в зеркале root: отдельная карта в панели не нужна.
+    const terminals = this.hostTerminals(host.id)
+      .filter(terminal => this.isOwnTerminal(host.id, terminal.claim))
+      .map(terminal => ({ resource: terminal.resource, title: terminal.title, lifecycle: terminal.lifecycle }));
     return {
       id: host.id,
       label: host.label,
@@ -1284,6 +1289,7 @@ export class Hub implements SearchEnvironment {
       ...(host.lastError ? { error: redactSecrets(host.lastError.message) } : {}),
       ...(host.protocolVersion ? { protocolVersion: host.protocolVersion } : {}),
       ...(host.defaultDirectory ? { defaultDirectory: host.defaultDirectory } : {}),
+      ...(terminals.length > 0 ? { terminals } : {}),
       canPickDirectory: this.directories?.picker?.availableFor(host.id) ?? false,
       agents: host.agents.filter(agent => !this.visibleAgents || this.visibleAgents.includes(agent.provider)).map((agent): AgentOverview => {
         const setup = readSdkSetup(configValues[`${SDK_STATUS_KEY_PREFIX}${agent.provider}`]);
