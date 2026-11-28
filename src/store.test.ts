@@ -244,6 +244,52 @@ test('снимок терминала начинает новую точку о�
   release();
 });
 
+test('подписка на первую команду видит только живое принятое действие PTY', () => {
+  const terminal = 'ahp-terminal:/command';
+  const neighbour = 'ahp-terminal:/command-neighbour';
+  const base: TerminalState = {
+    title: 'Терминал',
+    content: [],
+    lifecycle: { status: TerminalLifecycleStatus.Running },
+    claim: { kind: TerminalClaimKind.Client, clientId: 'backend' },
+    supportsCommandDetection: true,
+  };
+  const release = store.watch('one', terminal);
+  const releaseNeighbour = store.watch('one', neighbour);
+  receive({ t: 'snapshot', hostId: 'one', uri: terminal, state: base });
+  receive({ t: 'snapshot', hostId: 'one', uri: neighbour, state: base });
+
+  const seen: string[] = [];
+  const unsubscribe = store.subscribeTerminalCommands('one', terminal, commandLine => seen.push(commandLine));
+  // Снимок уже с командой не уведомляет: история не доказывает, что команда первая.
+  receive({
+    t: 'snapshot',
+    hostId: 'one',
+    uri: terminal,
+    state: { ...base, content: [{ type: 'command', commandId: 'old', commandLine: 'echo from-history', output: '', timestamp: 1, isComplete: true }] },
+  });
+  assert.deepEqual(seen, []);
+
+  receive({ t: 'action', hostId: 'one', uri: terminal, action: { type: ActionType.TerminalCommandExecuted, commandId: 'c1', commandLine: 'echo first', timestamp: 2 } });
+  assert.deepEqual(seen, ['echo first']);
+  const applied = store.getState().channels.get(channelKey('one', terminal))?.state as TerminalState;
+  assert.deepEqual(applied.content.at(-1), {
+    type: 'command', commandId: 'c1', commandLine: 'echo first', output: '', timestamp: 2, isComplete: false,
+  }, 'уведомление идёт после reducer');
+
+  // Соседний PTY и ненаблюдаемый канал не уведомляют эту подписку.
+  receive({ t: 'action', hostId: 'one', uri: neighbour, action: { type: ActionType.TerminalCommandExecuted, commandId: 'n1', commandLine: 'echo neighbour', timestamp: 3 } });
+  receive({ t: 'action', hostId: 'two', uri: terminal, action: { type: ActionType.TerminalCommandExecuted, commandId: 'x1', commandLine: 'echo other-host', timestamp: 4 } });
+  assert.deepEqual(seen, ['echo first']);
+
+  unsubscribe();
+  receive({ t: 'action', hostId: 'one', uri: terminal, action: { type: ActionType.TerminalCommandExecuted, commandId: 'c2', commandLine: 'echo second', timestamp: 5 } });
+  assert.deepEqual(seen, ['echo first'], 'после отписки слушатель не получает команд');
+
+  release();
+  releaseNeighbour();
+});
+
 test('отмена отчёта шлёт cancelUsage и не рвёт поиск', async () => {
   const controller = new AbortController();
   const running = store.usageReport('UTC', controller.signal);

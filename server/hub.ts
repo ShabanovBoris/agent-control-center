@@ -51,7 +51,7 @@ import {
   type ServerMessage,
   type SlashCompletions,
 } from '../shared/protocol.js';
-import { channelKey, isSupportedChannel } from '../shared/reduce.js';
+import { channelKey, isChangesetChannel, isSupportedChannel } from '../shared/reduce.js';
 import { directoryName, normalizeDirectoryPath, parseDirectoryEntries } from '../shared/directory.js';
 import { resolveTimeZone } from '../shared/usage.js';
 import { ChannelMirror } from './mirror.js';
@@ -64,7 +64,8 @@ import { abortable } from './async.js';
 import { CallFailure, errorMessage, rpcCallFailure, toCallError } from './errors.js';
 import { readHostBuild, type HostBuild } from './host-build.js';
 import { appendHostIssue } from './host-issues.js';
-import { redactSecrets } from './redact.js';
+import { redactSecrets } from '../shared/redact.js';
+import { checkSessionTitle } from '../shared/session-title.js';
 import { HistorySearch, Semaphore, type SearchEnvironment, type SearchLimits } from './search.js';
 
 // Служебные ключи VS Code в root config. Это не часть AHP: через них референсный клиент
@@ -88,6 +89,7 @@ const SEQUENCE_ACTION_LABEL: Partial<Record<StateAction['type'], string>> = {
   [ActionType.SessionConfigChanged]: 'изменение режима',
   [ActionType.RootConfigChanged]: 'изменение настроек хоста',
   [ActionType.ChatTruncated]: 'обрезку истории',
+  [ActionType.SessionTitleChanged]: 'переименование сессии',
 };
 
 type HistoryTarget = Pick<Extract<Call, { op: 'editMessage' }>, 'hostId' | 'sessionUri' | 'chatUri'>;
@@ -469,6 +471,38 @@ export class Hub implements SearchEnvironment {
     }
   }
 
+  /**
+   * Ручное имя агентной сессии живёт на хосте: action меняет состояние канала и метаданные,
+   * хост публикует `root/sessionSummaryChanged`, и список обновляется штатным путём.
+   * Временная подписка нужна, чтобы дождаться снимка неоткрытой строки и подтверждения
+   * именно своего action; освобождается только собственный ref.
+   */
+  private async renameSession(call: Extract<Call, { op: 'renameSession' }>, signal?: AbortSignal): Promise<void> {
+    const checked = checkSessionTitle(call.title);
+    if (!checked.ok) throw new CallFailure(checked.error);
+    const { hostId, sessionUri } = call;
+    if (!sessionUri.startsWith('ahp-session:') || isChangesetChannel(sessionUri)) {
+      throw new CallFailure('Переименовать можно только сессию');
+    }
+    if (!this.multi.host(hostId)) throw new CallFailure(`Хост ${hostId} не подключён`);
+    signal?.throwIfAborted();
+    const state = this.watch(hostId, sessionUri);
+    try {
+      if (state === undefined) {
+        await this.waitForChannel(hostId, sessionUri, value => value !== undefined, signal, ACTION_CONFIRMATION_MS);
+      }
+      await this.dispatchActionAndWait(
+        hostId,
+        sessionUri,
+        { type: ActionType.SessionTitleChanged, title: checked.title },
+        signal,
+        'Хост не подтвердил переименование сессии. Проверьте название в списке перед повтором.',
+      );
+    } finally {
+      this.unwatch(hostId, sessionUri);
+    }
+  }
+
   private async execute(call: Call, signal?: AbortSignal): Promise<unknown> {
     switch (call.op) {
       case 'pickDirectory':
@@ -552,6 +586,8 @@ export class Hub implements SearchEnvironment {
         this.dispatch(call.hostId, call.sessionUri, { type: ActionType.SessionIsArchivedChanged, isArchived: call.archived });
         return undefined;
       }
+      case 'renameSession':
+        return this.renameSession(call, signal);
       case 'refreshSession': {
         if (!call.sessionUri.startsWith('ahp-session:')) throw new CallFailure('Ожидалась сессия');
         if (!this.watchCounts.has(channelKey(call.hostId, call.sessionUri))) throw new CallFailure('Сессия не открыта');
@@ -1036,13 +1072,14 @@ export class Hub implements SearchEnvironment {
     return this.waitForAction(action.turnId, hostId, chatUri, 'Хост не подтвердил отправку. Проверьте чат перед повтором.', signal);
   }
 
-  private dispatchActionAndWait(hostId: string, channel: string, action: StateAction, signal?: AbortSignal): Promise<void> {
+  private dispatchActionAndWait(hostId: string, channel: string, action: StateAction, signal?: AbortSignal, timeoutMessage?: string): Promise<void> {
     signal?.throwIfAborted();
     const host = this.multi.host(hostId);
     if (!host) throw new CallFailure(`Хост ${hostId} не подключён`);
     const { clientSeq } = this.client(hostId).dispatch(channel, action);
     const key = sequenceActionKey(hostId, action.type, { clientId: host.clientId, clientSeq }, host.generation);
-    return this.waitForAction(key, hostId, channel, `Хост не подтвердил ${SEQUENCE_ACTION_LABEL[action.type]}. Проверьте чат перед повтором.`, signal);
+    return this.waitForAction(key, hostId, channel, timeoutMessage
+      ?? `Хост не подтвердил ${SEQUENCE_ACTION_LABEL[action.type]}. Проверьте чат перед повтором.`, signal);
   }
 
   private waitForAction(key: string, hostId: string, channel: string, timeoutMessage: string, signal?: AbortSignal): Promise<void> {

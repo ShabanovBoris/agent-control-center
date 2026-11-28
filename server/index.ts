@@ -374,6 +374,7 @@ async function onMessage(browser: Browser, message: ClientMessage): Promise<void
         if ('hostId' in call && updates.isRestarting(call.hostId) && (
           call.op === 'sendMessage' || call.op === 'createSession' || call.op === 'createChat'
           || call.op === 'forkSession' || call.op === 'editMessage' || call.op === 'retryEditedMessage'
+          || call.op === 'renameSession'
         )) {
           throw new Error('Хост перезапускается после обновления.');
         }

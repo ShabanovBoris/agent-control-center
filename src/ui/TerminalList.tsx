@@ -19,12 +19,13 @@ export interface TerminalListEntry {
   status: string;
 }
 
-export function TerminalList({ items, activeKey, onSelect, onClose, closeInFlight }: {
+export function TerminalList({ items, activeKey, onSelect, onClose, onRename, closeInFlight }: {
   items: readonly TerminalListEntry[];
   activeKey: string | undefined;
   onSelect(hostId: string, uri: string): void;
   onClose(hostId: string, uri: string): void;
-  /** Строки с запросом `disposeTerminal` в полёте: их `×` недоступна до ответа. */
+  onRename(hostId: string, uri: string): void;
+  /** Строки с запросом `disposeTerminal` в полёте: их действия недоступны до ответа. */
   closeInFlight: ReadonlySet<string>;
 }) {
   return (
@@ -44,6 +45,14 @@ export function TerminalList({ items, activeKey, onSelect, onClose, closeInFligh
               <span className="terminal-row-status">{item.status}</span>
             </span>
           </button>
+          <button
+            type="button"
+            className="terminal-row-rename"
+            aria-label={`Переименовать терминал «${item.title}»`}
+            title="Переименовать"
+            disabled={closeInFlight.has(item.key)}
+            onClick={() => onRename(item.hostId, item.uri)}
+          >✎</button>
           <button
             type="button"
             className="terminal-row-close"

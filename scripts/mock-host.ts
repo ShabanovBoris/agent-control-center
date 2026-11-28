@@ -103,6 +103,8 @@ const scripts = new Map<string, AbortController>();
 const terminals = new Map<string, TerminalState>();
 /** Недописанные до перевода строки команды: фейковый shell обрабатывает ввод построчно. */
 const terminalBuffers = new Map<string, string>();
+/** Номера команд для пар `terminal/commandExecuted` → `terminal/commandFinished`. */
+let terminalCommandSeq = 0;
 
 const PROMPT = '\u001b[32m$\u001b[0m ';
 
@@ -184,17 +186,25 @@ function publishTerminals(): void {
 function runTerminalLine(uri: string, line: string): void {
   const state = terminals.get(uri);
   if (!state || state.lifecycle.status !== TerminalLifecycleStatus.Running) return;
+  const command = line.trim();
+  // Пустой Enter не считается командой: command detection сообщает только о непустой строке.
+  const commandId = command ? `mock-command-${++terminalCommandSeq}` : undefined;
+  if (commandId) {
+    emit(uri, { type: ActionType.TerminalCommandExecuted, commandId, commandLine: line, timestamp: Date.now() });
+  }
   // Эхо строки целиком: так вывод не зависит от того, пришёл ввод одним действием или по символу.
   emit(uri, { type: ActionType.TerminalData, data: `${line}\r\n` });
-  const command = line.trim();
   const exit = /^exit(?:\s+(-?\d+))?$/.exec(command);
   if (exit) {
-    emit(uri, { type: ActionType.TerminalExited, exitCode: exit[1] === undefined ? 0 : Number(exit[1]) });
+    const exitCode = exit[1] === undefined ? 0 : Number(exit[1]);
+    if (commandId) emit(uri, { type: ActionType.TerminalCommandFinished, commandId, exitCode, durationMs: 0 });
+    emit(uri, { type: ActionType.TerminalExited, exitCode });
     publishTerminals();
     return;
   }
   const echo = /^echo\s+(.*)$/.exec(command);
   if (command) emit(uri, { type: ActionType.TerminalData, data: `${echo ? echo[1] : command}\r\n` });
+  if (commandId) emit(uri, { type: ActionType.TerminalCommandFinished, commandId, exitCode: 0, durationMs: 0 });
   emit(uri, { type: ActionType.TerminalData, data: PROMPT });
 }
 
@@ -377,6 +387,12 @@ function acceptDispatch(connection: Connection, channel: string, action: StateAc
       setSummary(chatSession.get(channel)!, { status: SessionStatus.Idle, activity: '' });
       return undefined;
     }
+    case ActionType.SessionTitleChanged: {
+      if (!sessions.has(channel)) return 'unknown session';
+      emit(channel, action, origin);
+      setSummary(channel, { title: action.title });
+      return undefined;
+    }
     case ActionType.TerminalInput: {
       if (!terminals.has(channel)) return 'unknown terminal';
       writeTerminal(channel, action.data);
@@ -481,7 +497,7 @@ function createTerminal(params: any): null {
     lifecycle: { status: TerminalLifecycleStatus.Running },
     claim,
     isPty: true,
-    supportsCommandDetection: false,
+    supportsCommandDetection: true,
   });
   terminalBuffers.set(uri, '');
   publishTerminals();

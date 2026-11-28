@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { REDACTED, redactSecrets } from './redact.js';
+import { REDACTED, redactSecrets } from '../shared/redact.js';
 
 const token = '0123456789abcdef'.repeat(4);
 
