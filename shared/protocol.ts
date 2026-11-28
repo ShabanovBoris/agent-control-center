@@ -296,6 +296,7 @@ export type HostCall =
   | { op: 'pickDirectory'; hostId: string; initialDirectory?: string }
   | { op: 'listDirectory'; hostId: string; path: string }
   | { op: 'archiveSession'; hostId: string; sessionUri: string; archived: boolean }
+  | { op: 'renameSession'; hostId: string; sessionUri: string; title: string }
   | { op: 'refreshSession'; hostId: string; sessionUri: string }
   | { op: 'fetchTurns'; hostId: string; chatUri: string; cursor: string }
   | { op: 'slashCompletions'; hostId: string; sessionUri: string; chatUri: string; text: string; offset: number }

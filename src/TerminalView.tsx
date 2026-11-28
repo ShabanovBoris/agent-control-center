@@ -6,10 +6,13 @@ import { pathOf } from './format';
 import { describeError, store, useChannels } from './store';
 import {
   forgetSelectedTerminal, forgetTerminalLabel, lastTerminalForm, nextTerminalLabel,
-  rememberLastTerminalForm, rememberSelectedTerminal, rememberTerminalLabel, selectedTerminal,
-  terminalCwd, terminalLabels, terminalRowLabels, terminalStatusText,
+  rememberAutoTerminalLabel, rememberCreatedTerminalLabel, rememberLastTerminalForm,
+  rememberManualTerminalLabel, rememberSelectedTerminal, selectedTerminal, skipTerminalAutoLabel,
+  terminalCommandLabel, terminalCwd, terminalLabel, terminalLabelBase, terminalRowLabels,
+  terminalStateHasCommands, terminalStatusText,
 } from './terminal-session';
 import { DirectoryTree } from './ui/DirectoryTree';
+import { RenameDialog } from './ui/RenameDialog';
 import { TerminalList, type TerminalListEntry } from './ui/TerminalList';
 import { directoryHistory, rememberDirectory } from './recent-directories';
 import { isAbsoluteHostPath } from './session-config';
@@ -51,9 +54,9 @@ function readForm(): { hostId: string; directory: string } | undefined {
   try { return lastTerminalForm(window.localStorage); } catch { return undefined; }
 }
 
-/** Подписи строк из localStorage: в приватном режиме остаются хост-заголовки. */
-function readLabels(): ReadonlyMap<string, string> {
-  try { return terminalLabels(window.localStorage); } catch { return new Map(); }
+/** Подпись строки из localStorage: в приватном режиме остаются хост-заголовки. */
+function labelOf(hostId: string, uri: string): string | undefined {
+  try { return terminalLabel(window.localStorage, hostId, uri); } catch { return undefined; }
 }
 
 /**
@@ -70,7 +73,9 @@ export function TerminalView({ hosts, connected, overviewLoaded, onClose }: {
   // Выбор читается синхронно при монтировании: после F5 он уже в состоянии к первой сводке.
   const [selected, setSelected] = useState(readSelection);
   const [pending, setPending] = useState<ReadonlyMap<string, PendingTerminal>>(() => new Map());
-  const [labels, setLabels] = useState(readLabels);
+  /** Растёт после записи подписи: localStorage читается заново без общей карты в state. */
+  const [, bumpLabelVersion] = useState(0);
+  const refreshLabels = useCallback(() => bumpLabelVersion(version => version + 1), []);
   const [closing, setClosing] = useState<ReadonlySet<string>>(() => new Set());
   /** Строки с `disposeTerminal` в полёте: их `×` заблокирована до ответа хоста. */
   const [closingBusy, setClosingBusy] = useState<ReadonlySet<string>>(() => new Set());
@@ -79,6 +84,7 @@ export function TerminalView({ hosts, connected, overviewLoaded, onClose }: {
   const [formDirectory, setFormDirectory] = useState(() => readForm()?.directory ?? '');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>();
+  const [renameTarget, setRenameTarget] = useState<{ hostId: string; uri: string; title: string }>();
   const [recent, setRecent] = useState(() => directoryHistory(window.localStorage, readForm()?.hostId ?? ''));
 
   /** Overview + только что созданные PTY; закрываемые строки скрыты до обновления root. */
@@ -108,6 +114,41 @@ export function TerminalView({ hosts, connected, overviewLoaded, onClose }: {
     return [...map.values()].filter(entry => !closing.has(rowKey(entry.hostId, entry.uri)));
   }, [hosts, pending, closing]);
 
+  const entrySignature = entries.map(entry => rowKey(entry.hostId, entry.uri)).join('\n');
+
+  // Живая команда наблюдаемого PTY. Подписка регистрируется до `useChannels`: действие,
+  // пришедшее сразу после снимка, не должно потеряться между watch и монтированием xterm.
+  useEffect(() => {
+    const unsubscribe = entries.map(entry => store.subscribeTerminalCommands(entry.hostId, entry.uri, commandLine => {
+      const parsed = terminalCommandLabel(commandLine);
+      if (parsed.kind === 'empty') return;
+      try {
+        const storage = window.localStorage;
+        if (parsed.kind === 'hidden') {
+          if (skipTerminalAutoLabel(storage, entry.hostId, entry.uri)) refreshLabels();
+          return;
+        }
+        if (rememberAutoTerminalLabel(storage, entry.hostId, entry.uri, parsed.title)) refreshLabels();
+      } catch {
+        // Приватный режим или переполненное хранилище: shell продолжает работать с дефолтом.
+      }
+    }));
+    return () => { for (const off of unsubscribe) off(); };
+    // Набор адресов, а не свежие объекты entries: иначе подписки пересоздавались бы каждый рендер.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [entrySignature, refreshLabels]);
+
+  // Другая вкладка того же origin обновила подпись — перечитываем из localStorage.
+  useEffect(() => {
+    const onStorage = (event: StorageEvent) => {
+      if (event.key === null || event.key.startsWith('acc.terminals.v3.') || event.key === 'acc.terminals.v2.labels') {
+        refreshLabels();
+      }
+    };
+    window.addEventListener('storage', onStorage);
+    return () => window.removeEventListener('storage', onStorage);
+  }, [refreshLabels]);
+
   // Все видимые терминалы под наблюдением backend-а: их вывод не теряется при переключении,
   // а вытеснение «старейшего без наблюдателей» не срабатывает, пока страница открыта.
   const channels = useChannels(entries.map(entry => ({ hostId: entry.hostId, uri: entry.uri })));
@@ -115,6 +156,43 @@ export function TerminalView({ hosts, connected, overviewLoaded, onClose }: {
   // PTY, закрытый на другом устройстве или хостом, исчезает из списка, а не висит мёртвым.
   const rows = entries.filter(entry => channels.get(rowKey(entry.hostId, entry.uri))?.missing !== true);
   const overviewSignature = rows.map(entry => rowKey(entry.hostId, entry.uri)).join('\n');
+
+  /**
+   * Снимок — граница наблюдения. Если в нём уже есть непустые команды, а запись ещё
+   * ждёт первую, история могла быть обрезана: автоимя не берём, остаётся дефолт.
+   */
+  useEffect(() => {
+    let changed = false;
+    for (const entry of rows) {
+      const state = channels.get(rowKey(entry.hostId, entry.uri))?.state as TerminalState | undefined;
+      if (!terminalStateHasCommands(state)) continue;
+      try {
+        const storage = window.localStorage;
+        if (terminalLabelBase(storage, entry.hostId, entry.uri)?.kind !== 'created') continue;
+        if (skipTerminalAutoLabel(storage, entry.hostId, entry.uri)) changed = true;
+      } catch { /* приватный режим */ }
+    }
+    if (changed) refreshLabels();
+  }, [channels, overviewSignature, refreshLabels]);
+
+  // Подтверждённый NotFound значит, что URI не вернётся: его локальная подпись не нужна.
+  useEffect(() => {
+    let changed = false;
+    for (const entry of entries) {
+      if (channels.get(rowKey(entry.hostId, entry.uri))?.missing !== true) continue;
+      try { if (forgetTerminalLabel(window.localStorage, entry.hostId, entry.uri)) changed = true; }
+      catch { /* приватный режим */ }
+    }
+    if (changed) refreshLabels();
+  }, [channels, entrySignature, refreshLabels]);
+
+  // Строка исчезла из набора (например, закрыта в другой вкладке): диалог не сохраняет ей имя.
+  useEffect(() => {
+    if (!renameTarget) return;
+    const key = rowKey(renameTarget.hostId, renameTarget.uri);
+    if (rows.some(entry => rowKey(entry.hostId, entry.uri) === key)) return;
+    setRenameTarget(undefined);
+  }, [rows, renameTarget]);
 
   const selectedKey = selected ? rowKey(selected.hostId, selected.uri) : undefined;
   const activeIndex = rows.findIndex(entry => rowKey(entry.hostId, entry.uri) === selectedKey);
@@ -239,13 +317,13 @@ export function TerminalView({ hosts, connected, overviewLoaded, onClose }: {
       return;
     }
     const directory = formDirectory.trim();
-    // Имя строки закрепляется за URI: реальный хост отдаёт title «bash» и не переименовывает PTY.
+    // Имя строки закрепляется за адресом: реальный хост отдаёт title «bash» и не переименовывает PTY.
     const folder = normalizeDirectoryPath(directory);
     const used = rows.flatMap(entry => {
       if (entry.hostId !== formHostId) return [];
       const state = channels.get(rowKey(entry.hostId, entry.uri))?.state as TerminalState | undefined;
       if (normalizeDirectoryPath(terminalCwd(state, entry.directory ?? '')) !== folder) return [];
-      return [labels.get(entry.uri) || entry.title];
+      return [labelOf(entry.hostId, entry.uri) || entry.title];
     });
     const title = nextTerminalLabel(directoryName(directory) ?? 'Терминал', used);
     setBusy(true);
@@ -264,9 +342,10 @@ export function TerminalView({ hosts, connected, overviewLoaded, onClose }: {
         directory,
         title,
       });
-      try { rememberTerminalLabel(window.localStorage, terminalUri, title); }
-      catch (failure) { store.notify(`Имя терминала не удалось запомнить: ${describeError(failure)}`); }
-      setLabels(previous => new Map(previous).set(terminalUri, title));
+      try {
+        rememberCreatedTerminalLabel(window.localStorage, formHostId, terminalUri, title);
+        refreshLabels();
+      } catch (failure) { store.notify(`Имя терминала не удалось запомнить: ${describeError(failure)}`); }
       setPending(previous => new Map(previous).set(rowKey(formHostId, terminalUri), {
         hostId: formHostId, uri: terminalUri, title, directory,
       }));
@@ -276,7 +355,7 @@ export function TerminalView({ hosts, connected, overviewLoaded, onClose }: {
     } finally {
       setBusy(false);
     }
-  }, [busy, channels, connected, formDirectory, formHostId, hosts, labels, rows, select]);
+  }, [busy, channels, connected, formDirectory, formHostId, hosts, refreshLabels, rows, select]);
 
   /**
    * Закрывает строку, на которой нажали `×`, а не только выбранную. Выбор меняется
@@ -301,13 +380,8 @@ export function TerminalView({ hosts, connected, overviewLoaded, onClose }: {
       });
       store.forgetChannelData(hostId, uri);
       // Имя закрытого PTY больше не нужно: URI не вернётся под тем же shell.
-      try { forgetTerminalLabel(window.localStorage, uri); } catch { /* приватный режим */ }
-      setLabels(previous => {
-        if (!previous.has(uri)) return previous;
-        const next = new Map(previous);
-        next.delete(uri);
-        return next;
-      });
+      try { if (forgetTerminalLabel(window.localStorage, hostId, uri)) refreshLabels(); }
+      catch { /* приватный режим */ }
       if (!wasActive) return;
       const remaining = rows.filter(entry => rowKey(entry.hostId, entry.uri) !== key);
       // Закрываемые прямо сейчас строки не годятся в преемники: иначе выбор перескочил бы
@@ -337,7 +411,7 @@ export function TerminalView({ hosts, connected, overviewLoaded, onClose }: {
         return next;
       });
     }
-  }, [activeKey, closing, closingBusy, rows, select]);
+  }, [activeKey, closing, closingBusy, refreshLabels, rows, select]);
 
   const changeHost = (nextId: string) => {
     setFormHostId(nextId);
@@ -367,11 +441,32 @@ export function TerminalView({ hosts, connected, overviewLoaded, onClose }: {
       status: terminalStatusText(state?.lifecycle ?? entry.lifecycle),
     };
   });
-  // Сохранённое имя при создании важнее title хоста: у реальных хостов это «bash».
-  const rowLabels = terminalRowLabels(rowDrafts, labels);
+  // Сохранённое имя при создании и ручное имя важнее title хоста: у реальных хостов это «bash».
+  const rowLabels = terminalRowLabels(rowDrafts, labelOf);
   const listItems: TerminalListEntry[] = rowDrafts.map(({ key, hostId, uri, hostLabel, cwd, status }, index) => ({
     key, hostId, uri, hostLabel, cwd, status, title: rowLabels[index]!,
   }));
+
+  const startRename = useCallback((hostId: string, uri: string) => {
+    const title = labelOf(hostId, uri) || rows.find(entry => entry.hostId === hostId && entry.uri === uri)?.title || 'Терминал';
+    // В редактор идёт имя без различителя « · хвост URI».
+    setRenameTarget({ hostId, uri, title });
+  }, [rows]);
+
+  /** Ручное имя PTY живёт в этом браузере: хост и другие устройства его не видят. */
+  const saveRename = useCallback(async (title: string) => {
+    const target = renameTarget;
+    if (!target) throw new Error('Терминал не выбран');
+    const key = rowKey(target.hostId, target.uri);
+    if (closingBusy.has(key) || closing.has(key)) throw new Error('Терминал закрывается');
+    if (!rows.some(entry => rowKey(entry.hostId, entry.uri) === key)) throw new Error('Терминал уже закрыт');
+    try {
+      rememberManualTerminalLabel(window.localStorage, target.hostId, target.uri, title);
+      refreshLabels();
+    } catch (failure) {
+      throw new Error(`Имя не сохранено в этом браузере: ${describeError(failure)}`);
+    }
+  }, [closing, closingBusy, refreshLabels, renameTarget, rows]);
 
   const formAvailable = connected && hosts.find(candidate => candidate.id === formHostId)?.status === 'connected';
 
@@ -408,6 +503,7 @@ export function TerminalView({ hosts, connected, overviewLoaded, onClose }: {
               activeKey={activeKey}
               onSelect={selectRow}
               onClose={(hostId, uri) => void closeTerminal(hostId, uri)}
+              onRename={startRename}
               closeInFlight={closingBusy}
             />
           )}
@@ -501,6 +597,15 @@ export function TerminalView({ hosts, connected, overviewLoaded, onClose }: {
             )}
           </div>
         </>
+      )}
+      {renameTarget && (
+        <RenameDialog
+          heading="Переименовать терминал"
+          initialTitle={renameTarget.title}
+          fieldLabel="Название терминала"
+          onSave={saveRename}
+          onClose={() => setRenameTarget(undefined)}
+        />
       )}
     </div>
   );

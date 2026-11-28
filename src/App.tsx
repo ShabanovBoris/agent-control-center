@@ -14,6 +14,7 @@ import { HOST_STATUS_LABEL, PHASE_LABEL, ellipsize, isArchived, pathOf, phaseOf,
 import { HealthView } from './HealthView';
 import { TerminalView } from './TerminalView';
 import { CommandPalette } from './ui/CommandPalette';
+import { RenameDialog } from './ui/RenameDialog';
 import { SessionView } from './SessionView';
 import { describeError, store, useAppState, usePresence } from './store';
 import { panelVisibility } from './panel-presence';
@@ -391,6 +392,7 @@ function SessionRow({ session, catalog, defaultChat, selected, connected, backen
   const { summary } = session;
   const [busy, setBusy] = useState(false);
   const [expanded, setExpanded] = useState(false);
+  const [renaming, setRenaming] = useState(false);
   const treeId = useId();
   const selectedChat = selected?.chatUri;
   const chats = (catalog ?? []).filter(chat => chat.interactivity !== ChatInteractivity.Hidden);
@@ -442,6 +444,16 @@ function SessionRow({ session, catalog, defaultChat, selected, connected, backen
         <div className="session-row-actions">
           <button
             type="button"
+            className="session-rename"
+            aria-label={`Переименовать: ${title}`}
+            title="Переименовать"
+            disabled={!backendConnected || busy}
+            onClick={() => setRenaming(true)}
+          >
+            <span aria-hidden="true">✎</span>
+          </button>
+          <button
+            type="button"
             className="session-pin"
             aria-pressed={pinned}
             aria-label={`${pinned ? 'Открепить' : 'Закрепить'}: ${title}`}
@@ -460,6 +472,17 @@ function SessionRow({ session, catalog, defaultChat, selected, connected, backen
         <div id={treeId} hidden={!expanded}>
           {expanded && <SessionChatTree chats={subchats} selectedChat={selectedChat} onSelect={onSelect} />}
         </div>
+      )}
+      {renaming && (
+        <RenameDialog
+          heading="Переименовать сессию"
+          initialTitle={title}
+          fieldLabel="Название сессии"
+          onSave={async next => {
+            await store.call({ op: 'renameSession', hostId: session.hostId, sessionUri: summary.resource, title: next });
+          }}
+          onClose={() => setRenaming(false)}
+        />
       )}
     </div>
   );

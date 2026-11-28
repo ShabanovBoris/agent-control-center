@@ -207,7 +207,7 @@ a { color: var(--accent); }
 }
 .session-archive { font-size: 12px; padding: 4px 6px; color: var(--muted); background: transparent; border-color: transparent; }
 .session-row-actions { display: flex; align-items: center; gap: 2px; }
-.session-pin { font-size: 12px; padding: 4px 6px; color: var(--muted); background: transparent; border-color: transparent; }
+.session-pin, .session-rename { font-size: 12px; padding: 4px 6px; color: var(--muted); background: transparent; border-color: transparent; }
 .session-pin[aria-pressed="true"] { color: var(--accent); }
 .session-title-line { display: flex; align-items: center; gap: 4px; min-width: 0; }
 .session-title-line > .session-title { min-width: 0; }
@@ -386,8 +386,8 @@ a { color: var(--accent); }
   gap: 2px;
   width: 100%;
   min-width: 0;
-  /* Справа оставлено место под `×` на самой строке: заголовок обрезается до неё. */
-  padding: 6px 34px 6px 8px;
+  /* Справа оставлено место под `✎` и `×` на самой строке: заголовок обрезается до них. */
+  padding: 6px 62px 6px 8px;
   text-align: left;
   /* Прозрачная рамка той же толщины: список не дёргается при смене выбора. */
   border: 2px solid transparent;
@@ -426,12 +426,11 @@ a { color: var(--accent); }
   white-space: nowrap;
   font-size: 11px;
 }
-/* Закрытие — на самой строке: отдельная кнопка поверх её правого края, всегда видима
-   (на телефоне hover нет). Внутрь `.terminal-row` её не вложить: там уже `<button>`. */
-.terminal-row-close {
+/* Действия строки — отдельные кнопки поверх её правого края, всегда видимы
+   (на телефоне hover нет). Внутрь `.terminal-row` их не вложить: там уже `<button>`. */
+.terminal-row-close, .terminal-row-rename {
   position: absolute;
   top: 50%;
-  right: 8px;
   transform: translateY(-50%);
   display: flex;
   align-items: center;
@@ -448,7 +447,9 @@ a { color: var(--accent); }
   line-height: 1;
   cursor: pointer;
 }
-.terminal-row-close:hover:not(:disabled) {
+.terminal-row-close { right: 8px; }
+.terminal-row-rename { right: 34px; font-size: 14px; }
+.terminal-row-close:hover:not(:disabled), .terminal-row-rename:hover:not(:disabled) {
   background: color-mix(in srgb, var(--text) 10%, transparent);
   color: var(--text);
 }
@@ -1085,9 +1086,10 @@ a { color: var(--accent); }
   .terminal-form { width: 100%; padding-bottom: 12px; }
   .terminal-screen { padding: 4px; }
   .terminal-actions button { min-height: 34px; }
-  /* Палец крупнее пикселя: `×` на телефоне растёт, текст строки сдвигается вместе с ней. */
-  .terminal-row { padding-right: 46px; }
+  /* Палец крупнее пикселя: `✎` и `×` на телефоне растут, текст строки сдвигается вместе с ними. */
+  .terminal-row { padding-right: 84px; }
   .terminal-row-close { width: 34px; height: 34px; right: 6px; font-size: 20px; }
+  .terminal-row-rename { width: 34px; height: 34px; right: 44px; font-size: 18px; }
   .icon-button, .composer-action { min-height: 40px; }
   .icon-button { min-width: 40px; }
   .composer-send { width: 40px; padding: 0; font-size: 20px; }

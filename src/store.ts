@@ -94,6 +94,11 @@ class Store {
    */
   private readonly channelDataListeners = new Map<string, Set<(data: string) => void>>();
   /**
+   * Подписчики метаданных команд PTY. Сюда попадает только живой принятый
+   * `terminal/commandExecuted`, без снимков: снимок не доказывает, что команда первая.
+   */
+  private readonly terminalCommandListeners = new Map<string, Set<(commandLine: string) => void>>();
+  /**
    * Кадры, пришедшие до подписки эмулятора (например, между приходом снимка и монтированием
    * xterm). Без буфера начало вывода терялось бы при каждом F5.
    */
@@ -160,6 +165,22 @@ class Store {
   /** Забывает буфер канала, чтобы выброшенный поток не всплыл при следующей подписке. */
   forgetChannelData(hostId: string, uri: string): void {
     this.channelDataBuffer.delete(channelKey(hostId, uri));
+  }
+
+  /**
+   * Подписка на строку первой команды наблюдаемого PTY. Регистрируется до `watch`,
+   * чтобы живое действие не потерялось между снимком и монтированием эмулятора.
+   */
+  subscribeTerminalCommands(hostId: string, uri: string, listener: (commandLine: string) => void): () => void {
+    const key = channelKey(hostId, uri);
+    const listeners = this.terminalCommandListeners.get(key) ?? new Set<(commandLine: string) => void>();
+    listeners.add(listener);
+    this.terminalCommandListeners.set(key, listeners);
+    return () => {
+      const current = this.terminalCommandListeners.get(key);
+      if (!current?.delete(listener)) return;
+      if (current.size === 0) this.terminalCommandListeners.delete(key);
+    };
   }
 
   call<T = void>(call: Call): Promise<T> {
@@ -317,6 +338,9 @@ class Store {
           // Снимок уже был (иначе action некуда применять), поэтому `epoch` всегда известен.
           epoch: cleared ? ++this.epoch : view.epoch,
         });
+        if (message.action.type === ActionType.TerminalCommandExecuted) {
+          for (const listener of this.terminalCommandListeners.get(key) ?? []) listener(message.action.commandLine);
+        }
         // Кадры до очистки уже не нужны: снимок содержимого теперь пустой.
         if (cleared) this.channelDataBuffer.delete(key);
         return;

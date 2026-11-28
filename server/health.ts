@@ -3,7 +3,7 @@ import type { HealthSnapshot, HostHealth, HostOverview, SdkVersions } from '../s
 import type { HostBuild } from './host-build.js';
 import type { HostDiagnostics } from './hub.js';
 import type { LogSource } from './logs.js';
-import { redactSecrets } from './redact.js';
+import { redactSecrets } from '../shared/redact.js';
 
 /** Читает версии SDK запущенного хоста; `undefined` — хост запущен не скриптами проекта. */
 export type SdkVersionInspector = (

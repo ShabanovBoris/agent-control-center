@@ -64,6 +64,15 @@ export async function openSession(page: Page, title: string): Promise<void> {
   await sessionRow(page, title).locator('.session-open').click();
 }
 
+/** Ручное имя агентной сессии из строки списка: диалог закрывается только после ответа хоста. */
+export async function renameSession(page: Page, currentTitle: string, nextTitle: string): Promise<void> {
+  await sessionRow(page, currentTitle).getByRole('button', { name: `Переименовать: ${currentTitle}`, exact: true }).click();
+  const dialog = page.getByRole('dialog', { name: 'Переименовать сессию' });
+  await dialog.getByRole('textbox', { name: 'Название сессии' }).fill(nextTitle);
+  await dialog.getByRole('button', { name: 'Сохранить' }).click();
+  await expect(dialog).toHaveCount(0);
+}
+
 /** Возврат из открытой сессии к списку на телефоне. */
 export async function backToSessionList(page: Page): Promise<void> {
   await page.locator('.mobile-back[aria-label="К списку сессий"]').click();

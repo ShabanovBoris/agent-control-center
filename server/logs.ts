@@ -4,7 +4,7 @@ import { resolve } from 'node:path';
 import { projectRoot } from '../scripts/agent-sdks.mjs';
 import type { LogTail } from '../shared/protocol.js';
 import type { LocalHost } from './local-hosts.js';
-import { redactSecrets } from './redact.js';
+import { redactSecrets } from '../shared/redact.js';
 
 export const MAX_LOG_BYTES = 64 * 1024;
 export const MAX_LOG_LINES = 300;

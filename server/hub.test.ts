@@ -48,7 +48,7 @@ function setup(
     provider: 'codex', displayName: 'Codex', models, capabilities: { multipleChats: { fork: true, sideChat: true } },
   }] };
   const multi = {
-    host: () => host,
+    host: (id: string) => (id === host.id ? host : undefined),
     client: () => ({
       dispatch: (uri: string, action: StateAction) => { targets.push(uri); return { clientSeq: actions.push(action) }; },
       request: async (method: string, params: unknown) => {
@@ -152,6 +152,104 @@ test('архивирование и восстановление передаю�
   ]);
   assert.deepEqual(targets, ['ahp-session:/one', 'ahp-session:/one']);
   await assert.rejects(hub.call({ op: 'archiveSession', hostId: 'h', sessionUri: 'ahp-chat:/one', archived: true }), /сессия/);
+});
+
+test('переименование неоткрытой сессии ждёт снимок строки и только своё подтверждение', async () => {
+  const uri = 'ahp-session:/rename';
+  const fixture = setup();
+  const { hub, actions, targets, host, echo, unsubscribed } = fixture;
+  fixture.states.set(uri, sessionState);
+  await hub.start([]);
+  try {
+    const renaming = hub.call({ op: 'renameSession', hostId: host.id, sessionUri: uri, title: 'Новое имя' });
+    await setImmediate();
+    const action = actions[0];
+    assert.deepEqual(action, { type: ActionType.SessionTitleChanged, title: 'Новое имя' });
+    assert.deepEqual(targets, [uri], 'action адресован сессии, а не чату');
+
+    let confirmed = false;
+    void renaming.then(() => { confirmed = true; });
+    echo(uri, action!, { clientId: 'other-client', clientSeq: 1 });
+    await setImmediate();
+    assert.equal(confirmed, false, 'чужое подтверждение не завершает ожидание');
+
+    echo(uri, action!, { clientId: host.clientId, clientSeq: 1 });
+    await renaming;
+    await setImmediate();
+    assert.ok(unsubscribed.includes(uri), 'временная подписка снята после успеха');
+
+    // Имя не обрезается молча: пробелы вокруг значимой части остаются в action.
+    const padded = hub.call({ op: 'renameSession', hostId: host.id, sessionUri: uri, title: '  с пробелами  ' });
+    await setImmediate();
+    assert.deepEqual(actions[1], { type: ActionType.SessionTitleChanged, title: '  с пробелами  ' });
+    echo(uri, actions[1]!, { clientId: host.clientId, clientSeq: 2 });
+    await padded;
+  } finally { await hub.stop(); }
+});
+
+test('отказ хоста и потеря снимка при переименовании не выглядят успехом', async () => {
+  const uri = 'ahp-session:/rename-rejected';
+  const fixture = setup();
+  const { hub, actions, host, echo, unsubscribed } = fixture;
+  fixture.states.set(uri, sessionState);
+  await hub.start([]);
+  try {
+    const renaming = hub.call({ op: 'renameSession', hostId: host.id, sessionUri: uri, title: 'Новое имя' });
+    await setImmediate();
+    echo(uri, actions[0]!, { clientId: host.clientId, clientSeq: 1 }, 'Read-only metadata');
+    await assert.rejects(renaming, /Хост отклонил переименование сессии: Read-only metadata/);
+    await setImmediate();
+    assert.ok(unsubscribed.includes(uri), 'подписка снята и после отказа');
+
+    // Хост не вернул снимок строки: action не отправляется, ошибка честная.
+    const missing = 'ahp-session:/rename-missing';
+    await assert.rejects(
+      hub.call({ op: 'renameSession', hostId: host.id, sessionUri: missing, title: 'Имя' }),
+      /Хост не вернул состояние канала/,
+    );
+    assert.equal(actions.length, 1, 'без снимка action не уходит');
+    await setImmediate();
+    assert.ok(unsubscribed.includes(missing), 'подписка снята после ошибки снимка');
+  } finally { await hub.stop(); }
+});
+
+test('переименование проверяет хост, URI и имя до обращения к хосту', async () => {
+  const fixture = setup();
+  const { hub, actions, host } = fixture;
+  await hub.start([]);
+  try {
+    const invalid = [
+      [{ hostId: host.id, sessionUri: 'ahp-session:/ok', title: '' }, /Название не может быть пустым/],
+      [{ hostId: host.id, sessionUri: 'ahp-session:/ok', title: '   ' }, /Название не может быть пустым/],
+      [{ hostId: host.id, sessionUri: 'ahp-session:/ok', title: 'первая\nвторая' }, /одной строкой/],
+      [{ hostId: host.id, sessionUri: 'ahp-session:/ok', title: 'я'.repeat(121) }, /длиннее 120/],
+      [{ hostId: host.id, sessionUri: 'ahp-session:/ok', title: 42 as unknown as string }, /строкой/],
+      [{ hostId: host.id, sessionUri: 'ahp-chat:/ok', title: 'Имя' }, /только сессию/],
+      [{ hostId: host.id, sessionUri: 'ahp-terminal:/ok', title: 'Имя' }, /только сессию/],
+      [{ hostId: host.id, sessionUri: 'ahp-session:/ok/changeset/turn/1', title: 'Имя' }, /только сессию/],
+      [{ hostId: 'unknown', sessionUri: 'ahp-session:/ok', title: 'Имя' }, /не подключён/],
+    ] as const;
+    for (const [call, expected] of invalid) {
+      await assert.rejects(hub.call({ op: 'renameSession', ...call }), expected);
+    }
+    assert.deepEqual(actions, [], 'невалидный вход не отправляет action');
+  } finally { await hub.stop(); }
+});
+
+test('отмена переименования освобождает временную подписку', async () => {
+  const uri = 'ahp-session:/rename-abort';
+  const fixture = setup();
+  const { hub, actions, host, unsubscribed } = fixture;
+  await hub.start([]);
+  try {
+    const controller = new AbortController();
+    const renaming = hub.call({ op: 'renameSession', hostId: host.id, sessionUri: uri, title: 'Имя' }, controller.signal);
+    controller.abort();
+    await assert.rejects(renaming);
+    await setImmediate();
+    assert.deepEqual(actions, [], 'отменённый вызов не дошёл до action');
+    assert.ok(unsubscribed.includes(uri), 'подписка снята при отмене');
+  } finally { await hub.stop(); }
 });
 
 test('страницы истории запрашиваются у хоста с исходным opaque cursor', async () => {
